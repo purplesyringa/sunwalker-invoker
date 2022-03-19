@@ -1,6 +1,6 @@
 use libc::{c_char, c_int, c_void, CLONE_NEWNS, CLONE_NEWUSER};
 use nix::fcntl;
-use sunwalker_runner::{image::mount, cgroups};
+use sunwalker_runner::{image::mount, cgroups, multiprocessing};
 
 
 macro_rules! cstr {
@@ -56,9 +56,17 @@ fn worker_main() {
 
 
     let mut mnt = mount::ImageMounter::new();
-    let _mounted_image = mnt.mount("/home/ivanq/Documents/sunwalker/image.sfs").expect("could not mount image.sfs");
+    // let _mounted_image = mnt.mount("/home/ivanq/Documents/sunwalker/image.sfs").expect("could not mount image.sfs");
+
+    let mut core2 = cgroups::AffineCPUSet::new(2).expect("Failed to create cpuset for core 2");
 
     println!("Hi");
+
+    multiprocessing::spawn(|| {
+        core2.add_task(multiprocessing::getpid()).unwrap();
+        println!("Hello, world!");
+    }).unwrap();
+
     std::thread::sleep_ms(1000);
     // start_worker();
 }
@@ -74,6 +82,7 @@ fn watchdog_main(worker_pid: libc::pid_t) {
 
     // Initialization
     cgroups::create_root_cpuset().expect("Creating root cpuset failed");
+    cgroups::isolate_cpus(&vec! [2, 3]).expect("Failed to isolate CPUs");
 
     // CONT worker
     if unsafe { libc::kill(worker_pid, libc::SIGCONT) } == -1 {
@@ -85,7 +94,10 @@ fn watchdog_main(worker_pid: libc::pid_t) {
         panic!("waitpid() failed when waiting for an event from worker");
     }
 
-    // TODO: handle exit status here and clean up garbage
+    // TODO: handle exit status here
+
+    // Garbage cleanup
+    cgroups::isolate_cpus(&vec! []).expect("Failed to revert CPU isolation");
 }
 
 
