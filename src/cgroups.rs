@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use libc::pid_t;
+use std::io::Write;
 
 
 pub fn create_root_cpuset() -> Result<()> {
@@ -33,14 +34,12 @@ pub fn create_root_cpuset() -> Result<()> {
 		}
 	}
 
-	let mut s = String::new();
+	let mut tasks_file = std::fs::OpenOptions::new().read(true).write(true).open("/sys/fs/cgroup/cpuset/sunwalker_root/tasks")
+		.with_context(|| "Cannot open /sys/fs/cgroup/cpuset/sunwalker_root/tasks for writing")?;
 	for pid in pids {
-		s.push_str(pid.to_string().as_ref());
-		s.push('\n');
+		tasks_file.write_all(pid.to_string().as_ref())
+			.with_context(|| format!("Cannot write PID {} to /sys/fs/cgroup/cpuset/sunwalker_root/tasks", pid))?;
 	}
-
-	std::fs::write("/sys/fs/cgroup/cpuset/sunwalker_root/tasks", s)
-		.with_context(|| "Cannot write to /sys/fs/cgroup/cpuset/sunwalker_root/tasks")?;
 
 	Ok(())
 }
