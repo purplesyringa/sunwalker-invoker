@@ -10,7 +10,7 @@ extern fn fn_runner<F: std::ops::Fn() -> ()>(ptr: *mut c_void) -> i32 {
 }
 
 
-pub fn spawn<F: std::ops::Fn() -> ()>(mut f: F) -> Result<pid_t> {
+pub fn spawn<F: std::ops::Fn() -> ()>(mut f: F) -> Result<pid_t> where F: 'static {
     let stack: &mut [u8] = &mut [0u8; 4096];  // 4 KiB ought to be enough for everyone
     let flags: c_int = 0; // todo: CLONE_VFORK
     let pid = unsafe {
@@ -19,6 +19,7 @@ pub fn spawn<F: std::ops::Fn() -> ()>(mut f: F) -> Result<pid_t> {
     if pid == -1 {
         bail!(std::io::Error::last_os_error())
     } else {
+        std::mem::forget(f);  // ownership is moved into process
         Ok(pid)
     }
 }

@@ -10,3 +10,9 @@ rand = "0.8.3"
 libc = "0.2.120"
 anyhow = "1.0"
 nix = "0.23.1"
+signal-hook = { version = "0.3", features = ["extended-siginfo"] }
+sys-mount = "1.5.1"
+crossbeam = "0.8.1"
+
+[profile.release]
+debug = true

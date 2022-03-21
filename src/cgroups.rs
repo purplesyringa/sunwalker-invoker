@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
-use libc::{pid_t, c_void, c_int};
-use std::io::Write;
+use libc::pid_t;
+use std::io::{Write, BufRead};
 use std::collections::HashSet;
 
 
@@ -17,6 +17,10 @@ pub fn create_root_cpuset() -> Result<()> {
             }
         })
         .with_context(|| format!("Unable to create {}/sunwalker_root directory", CPUSET_ROOT))?;
+
+    // Inherit mems
+    std::fs::write(format!("{}/sunwalker_root/cpuset.mems", CPUSET_ROOT), std::fs::read_to_string(format!("{}/cpuset.mems", CPUSET_ROOT))?)
+        .with_context(|| format!("Failed to write to {}/sunwalker_root/cpuset.mems", CPUSET_ROOT))?;
 
     // Move all tasks that don't yet belong to a cpuset to the root cpuset
     // FIXME: this is inherently racy, what can we do to avoid the race condition?
@@ -71,6 +75,7 @@ pub fn create_root_cpuset() -> Result<()> {
 }
 
 
+#[derive(Debug)]
 pub struct AffineCPUSet {
     core: u64,
 }
@@ -92,6 +97,9 @@ impl AffineCPUSet {
         std::fs::write(format!("{}/cpuset.cpus", dir), core.to_string())
             .with_context(|| format!("Failed to write to {}/cpuset.cpus", dir))?;
 
+        std::fs::write(format!("{}/cpuset.mems", dir), std::fs::read_to_string(format!("{}/cpuset.mems", CPUSET_ROOT))?)
+            .with_context(|| format!("Failed to write to {}/cpuset.mems", dir))?;
+
         std::fs::write(format!("{}/cpuset.cpu_exclusive", dir), "1")
             .with_context(|| format!("Failed to write to {}/cpuset.cpu_exclusive (is core {} in use?)", dir, core))?;
 
@@ -105,11 +113,31 @@ impl AffineCPUSet {
     }
 }
 
-impl Drop for AffineCPUSet {
-    fn drop(&mut self) {
-        let dir = format!("{}/sunwalker_cpu_{}", CPUSET_ROOT, self.core);
-        let _ = std::fs::remove_dir(dir);
+pub fn drop_existing_affine_cpusets() -> Result<()> {
+    let mut root_tasks_file = std::fs::OpenOptions::new().read(true).write(true).open(format!("{}/tasks", CPUSET_ROOT))
+        .with_context(|| format!("Cannot open {}/tasks for writing", CPUSET_ROOT))?;
+
+    for entry in std::fs::read_dir(CPUSET_ROOT).with_context(|| format!("Cannot read {}", CPUSET_ROOT))? {
+        let entry = entry?;
+        if let Ok(cpuset_name) = entry.file_name().into_string() {
+            if cpuset_name.starts_with("sunwalker_cpu_") {
+                // Move all tasks out from /sunwalker_cpu_*
+                // FIXME: we should also send them SIGKILL, but this has terrible consequences in case of race condition
+                let mut tasks_path = entry.path();
+                tasks_path.push("tasks");
+                let file = std::fs::File::open(&tasks_path).with_context(|| format!("Cannot open {:?} for reading", &tasks_path))?;
+                for line in std::io::BufReader::new(file).lines() {
+                    let tid: pid_t = line?.parse().with_context(|| format!("Invalid TID in {:?}", tasks_path))?;
+                    root_tasks_file.write_all(tid.to_string().as_ref())?;
+                }
+
+                // Remove cpuset
+                std::fs::remove_dir(entry.path())?;
+            }
+        }
     }
+
+    Ok(())
 }
 
 
@@ -134,7 +162,8 @@ fn parse_cpuset_list(s: &str) -> Result<Vec<u64>> {
 }
 
 
-fn format_cpuset_list(list: Vec<u64>) -> String {
+fn format_cpuset_list(mut list: Vec<u64>) -> String {
+    list.sort();
     list.iter().map(|x| x.to_string()).collect::<Vec<String>>().join(",")
 }
 
@@ -147,7 +176,7 @@ fn get_all_cores() -> Result<Vec<u64>> {
 }
 
 
-pub fn isolate_cpus(isolated_cores: &Vec<u64>) -> Result<()> {
+pub fn isolate_cores(isolated_cores: &Vec<u64>) -> Result<()> {
     let all_cores = get_all_cores()?;
 
     let mut not_isolated_cores: HashSet<u64> = HashSet::from_iter(all_cores.iter().cloned());
@@ -161,8 +190,8 @@ pub fn isolate_cpus(isolated_cores: &Vec<u64>) -> Result<()> {
         bail!("Cannot isolate all cores, at least one core should be devoted to general purpose tasks");
     }
 
-    let not_isolated_cores = Vec::from_iter(not_isolated_cores.iter().cloned());
+    let not_isolated_cores = format_cpuset_list(Vec::from_iter(not_isolated_cores.iter().cloned()));
 
-    std::fs::write(format!("{}/sunwalker_root/cpuset.cpus", CPUSET_ROOT), format_cpuset_list(not_isolated_cores))
-        .with_context(|| format!("Failed to write to {}/sunwalker_root/cpuset.cpus", CPUSET_ROOT))
+    std::fs::write(format!("{}/sunwalker_root/cpuset.cpus", CPUSET_ROOT), &not_isolated_cores)
+        .with_context(|| format!("Failed to write {} to {}/sunwalker_root/cpuset.cpus", not_isolated_cores, CPUSET_ROOT))
 }
