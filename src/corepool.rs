@@ -4,7 +4,6 @@ use libc::{c_int, pid_t, WNOHANG};
 use signal_hook::{
     consts::{SIGCHLD, SIGKILL},
     iterator::{exfiltrator::origin::WithOrigin, SignalsInfo},
-    low_level::siginfo::{Cause::Sent, Sent::TKill},
 };
 use std::collections::{HashMap, VecDeque};
 use std::ops::{DerefMut, FnOnce};
@@ -53,13 +52,18 @@ impl<'a> CorePool<'a> {
         {
             let info = info.clone();
             let thread_fn: Box<dyn FnOnce() -> () + Send + 'a> = Box::new(move || {
+                // This is a tight loop
+                // This locks when no child processes are running anymore (i.e. the queue is empty)
                 for _ in signals.forever() {
                     let mut info = info.lock().unwrap();
                     loop {
                         let mut wstatus: c_int = 0;
                         let pid;
                         unsafe {
-                            pid = libc::waitpid(-1, &mut wstatus as *mut c_int, WNOHANG);
+                            // This locks when at least one process is still running, which is a very common situation.
+                            // It would be more "correct" to use WNOHANG, but passing 0 allows us to wait for processes
+                            // here, in waitpid, rather than in signals.forever(), which is a huge performance gain.
+                            pid = libc::waitpid(-1, &mut wstatus as *mut c_int, 0);
                         }
                         if pid == -1 {
                             // TODO: ensure it's ECHILD and not something else
