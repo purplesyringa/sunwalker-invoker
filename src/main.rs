@@ -1,7 +1,10 @@
 use anyhow::{bail, Context, Result};
 use libc::{c_int, CLONE_NEWNS, CLONE_NEWUSER, MS_PRIVATE, MS_REC};
 use nix::{fcntl, unistd};
-use sunwalker_runner::{cgroups, corepool, image::mount};
+use sunwalker_runner::{
+    cgroups, corepool,
+    image::{mount, package},
+};
 
 fn worker_main() -> Result<()> {
     unsafe {
@@ -80,35 +83,45 @@ fn worker_main() -> Result<()> {
         .mount("/mnt/wwn-0x500000e041b68f2b-part1/sunwalker/image.sfs")
         .with_context(|| "Could not mount image.sfs")?;
 
-    let cores: Vec<u64> = vec![2, 3, 4, 5, 6, 7];
+    let cores: Vec<u64> = vec![4, 5, 6, 7];
     cgroups::isolate_cores(&cores).with_context(|| "Failed to isolate CPU cores")?;
 
     let mut pool = corepool::CorePool::new(cores).with_context(|| "Could not create core pool")?;
 
-    for i in 0..2000 {
+    std::fs::write(
+        "/tmp/hello-world.cpp",
+        "#include <iostream>\nint main() {\n\tstd::cout << \"Hello, world!\" << std::endl;\n}\n",
+    )?;
+
+    for i in 0..50 {
         let mounted_image = &mounted_image;
         pool.spawn_dedicated(corepool::Task {
             callback: Box::new(move || {
-                mounted_image
+                let package = mounted_image
+                    .get_package("gcc")
+                    .expect("Package gcc does not exist");
+
+                package
                     .enter(
-                        "gcc",
-                        &mount::SandboxDiskConfig {
+                        &package::SandboxDiskConfig {
                             max_size_in_bytes: 1024 * 1024,
                             max_inodes: 10 * 1024,
-                        },
+                        }
                     )
                     .expect("Entering the package failed");
+
                 std::fs::write(
-                    "/test.c",
-                    "#include <stdio.h>\nint main() {\n\tprintf(\"Hello, world!\\n\");\n}",
-                )
-                .expect("write failed");
-                std::process::Command::new("gcc")
-                    .arg("/test.c")
+                    "/test.cpp",
+                    "#include <iostream>\nint main() {\n\tstd::cout << \"Hello, world!\" << std::endl;\n}\n",
+                ).expect("write failed");
+
+                std::process::Command::new("g++")
+                    .arg("/test.cpp")
                     .arg("-o")
                     .arg("/test")
                     .output()
                     .expect("Spawning gcc failed");
+
                 // println!("Hello, world from #{}!", i);
             }),
             group: String::from("default"),

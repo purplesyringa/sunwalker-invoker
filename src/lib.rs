@@ -1,5 +1,6 @@
 pub mod image {
     pub mod mount;
+    pub mod package;
 }
 
 pub mod cgroups;

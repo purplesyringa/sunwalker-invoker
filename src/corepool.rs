@@ -1,6 +1,6 @@
 use crate::{cgroups, multiprocessing};
 use anyhow::{bail, Context, Result};
-use libc::{c_int, pid_t, WNOHANG};
+use libc::{c_int, pid_t};
 use signal_hook::{
     consts::{SIGCHLD, SIGKILL},
     iterator::{exfiltrator::origin::WithOrigin, SignalsInfo},
