@@ -3,7 +3,7 @@ use libc::{c_int, CLONE_NEWNS, CLONE_NEWUSER, MS_PRIVATE, MS_REC};
 use nix::{fcntl, unistd};
 use sunwalker_runner::{
     cgroups, corepool,
-    image::{mount, package},
+    image::{config, mount, package},
 };
 
 fn worker_main() -> Result<()> {
@@ -83,6 +83,13 @@ fn worker_main() -> Result<()> {
         .mount("/mnt/wwn-0x500000e041b68f2b-part1/sunwalker/image.sfs")
         .with_context(|| "Could not mount image.sfs")?;
 
+    let cfg = config::Config::load(
+        &std::fs::read_to_string("/mnt/wwn-0x500000e041b68f2b-part1/sunwalker/image.cfg")
+            .with_context(|| "Could not read image.cfg")?,
+    )
+    .with_context(|| "Could not load image.cfg")?;
+    println!("{:?}", cfg);
+
     let cores: Vec<u64> = vec![4, 5, 6, 7];
     cgroups::isolate_cores(&cores).with_context(|| "Failed to isolate CPU cores")?;
 
@@ -100,6 +107,8 @@ fn worker_main() -> Result<()> {
                 let package = mounted_image
                     .get_package("gcc")
                     .expect("Package gcc does not exist");
+
+                // package.build("/tmp/hello-world.cpp");
 
                 package
                     .enter(

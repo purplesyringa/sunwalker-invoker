@@ -1,4 +1,5 @@
 pub mod image {
+    pub mod config;
     pub mod mount;
     pub mod package;
 }

@@ -13,6 +13,7 @@ nix = "0.23.1"
 signal-hook = { version = "0.3", features = ["extended-siginfo"] }
 sys-mount = "1.5.1"
 crossbeam = "0.8.1"
+lisp = { path = "lisp" }
 
 [profile.release]
 debug = true
