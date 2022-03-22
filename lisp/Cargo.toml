@@ -1,0 +1,11 @@
+[package]
+name = "lisp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lisp-derive = { path = "lisp-derive" }
+anyhow = "1.0"
+itertools = "0.10.3"
+ctor = "0.1.22"
+lazy_static = "1.4.0"
