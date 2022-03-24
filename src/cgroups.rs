@@ -88,7 +88,7 @@ pub fn create_root_cpuset() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AffineCPUSet {
     core: u64,
 }

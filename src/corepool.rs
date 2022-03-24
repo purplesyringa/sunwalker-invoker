@@ -1,4 +1,4 @@
-use crate::cgroups;
+use crate::{cgroups, process};
 use anyhow::{bail, Context, Result};
 use libc::{c_int, pid_t};
 use signal_hook::{
@@ -73,7 +73,8 @@ impl<'a> CorePool<'a> {
                             // Start another task if the queue is not empty
                             if let Some(task) = info.queued_tasks.pop_front() {
                                 // TODO: handle failures gracefully
-                                let pid = Self::_spawn_in_cpuset(&cpuset, task.callback).unwrap();
+                                let pid =
+                                    Self::_spawn_in_cpuset(cpuset.clone(), task.callback).unwrap();
                                 info.pid_to_cpuset.insert(pid, cpuset);
                             } else {
                                 info.cpuset_pool.push(cpuset);
@@ -106,32 +107,26 @@ impl<'a> CorePool<'a> {
             info.queued_tasks.push_back(task);
         } else {
             let cpuset = info.cpuset_pool.last().unwrap();
-            let pid = Self::_spawn_in_cpuset(cpuset, task.callback)?;
+            let pid = Self::_spawn_in_cpuset(cpuset.clone(), task.callback)?;
             let cpuset = info.cpuset_pool.pop().unwrap(); // only pop on success
             info.pid_to_cpuset.insert(pid, cpuset);
         }
         Ok(())
     }
 
-    fn _spawn_in_cpuset<F: FnOnce() -> ()>(cpuset: &cgroups::AffineCPUSet, f: F) -> Result<pid_t>
+    fn _spawn_in_cpuset<F: FnOnce() -> ()>(cpuset: cgroups::AffineCPUSet, f: F) -> Result<pid_t>
     where
         F: Sync + Send + UnwindSafe + 'a,
     {
-        let child_pid = unsafe { libc::fork() };
-        if child_pid == -1 {
-            bail!("fork() failed");
-        } else if child_pid == 0 {
-            let panic = std::panic::catch_unwind(|| {
-                cpuset.add_task(unsafe { libc::getpid() }).unwrap();
-                f();
-            });
-            let exit_code = if panic.is_ok() { 0 } else { 1 };
-            unsafe {
-                libc::exit(exit_code);
-            }
-        } else {
-            Ok(child_pid)
-        }
+        // We guarantee that 'a will survive by the time the task is finished because we wait for
+        // all spawned processes in Drop.
+        let f: Box<dyn FnOnce() -> () + Sync + Send + UnwindSafe + 'a> = Box::new(move || {
+            cpuset.add_task(unsafe { libc::getpid() }).unwrap();
+            f();
+        });
+        let f: Box<dyn FnOnce() -> () + Sync + Send + UnwindSafe + 'static> =
+            unsafe { std::mem::transmute(f) };
+        process::spawn(f)
     }
 
     fn _join(&mut self) {

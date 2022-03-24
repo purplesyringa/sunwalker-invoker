@@ -8,4 +8,6 @@ pub mod cgroups;
 
 pub mod corepool;
 
+pub mod process;
+
 pub mod system;
