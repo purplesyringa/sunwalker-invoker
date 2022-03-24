@@ -1,6 +1,8 @@
+use crate::typed::{LispType, NativeType, TypedRef};
 use std::convert::Infallible;
 use std::fmt::Debug;
 
+#[derive(Clone)]
 pub struct CallTerm {
     pub name: String,
     pub params: Vec<Term>,
@@ -16,11 +18,24 @@ impl Debug for CallTerm {
     }
 }
 
+#[derive(Clone)]
 pub enum Term {
     Call(CallTerm),
     String(String),
     Number(i64),
     Nil,
+}
+
+impl LispType for Term {
+    fn get_type_name() -> String {
+        "quote".to_string()
+    }
+}
+
+impl NativeType for Term {
+    fn from_lisp_ref(value: &TypedRef) -> Result<Term, Error> {
+        value.to_concrete()
+    }
 }
 
 impl Debug for Term {

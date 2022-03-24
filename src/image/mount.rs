@@ -1,6 +1,9 @@
-use crate::image::package;
+use crate::{
+    image::{config::Config, package},
+    system,
+};
 use anyhow::{bail, Context, Result};
-use libc::{MS_BIND, MS_RDONLY, MS_REC};
+use libc::{MS_RDONLY, MS_REC};
 
 pub struct ImageMounter {
     inc: u64,
@@ -9,6 +12,7 @@ pub struct ImageMounter {
 #[derive(Debug)]
 pub struct MountedImage {
     pub mountpoint: std::path::PathBuf,
+    pub config: Config,
 }
 
 impl ImageMounter {
@@ -21,7 +25,11 @@ impl ImageMounter {
         std::path::PathBuf::from("/tmp/image-".to_owned() + &self.inc.to_string())
     }
 
-    pub fn mount<P: AsRef<std::path::Path>>(&mut self, source_path: P) -> Result<MountedImage> {
+    pub fn mount<P: AsRef<std::path::Path>>(
+        &mut self,
+        source_path: P,
+        config: Config,
+    ) -> Result<MountedImage> {
         let attr = std::fs::metadata(&source_path).with_context(|| {
             format!(
                 "Cannot get matadata of {:?} (does the file exist?)",
@@ -38,11 +46,7 @@ impl ImageMounter {
 
         if file_type.is_dir() {
             // Bind-mount
-            sys_mount::Mount::builder()
-                .flags(unsafe {
-                    sys_mount::MountFlags::from_bits_unchecked(MS_BIND | MS_RDONLY | MS_REC)
-                })
-                .mount(source_path, &mountpoint)
+            system::bind_mount_opt(source_path, &mountpoint, MS_RDONLY | MS_REC)
                 .with_context(|| "Bind-mounting image failed")?;
         } else if file_type.is_file() {
             // Mount as squashfs image
@@ -76,7 +80,18 @@ impl ImageMounter {
             bail!("Cannot mount image of unknown file type (neither file, nor directory)");
         }
 
-        Ok(MountedImage { mountpoint })
+        // Make sure that all the packages specified in the config are available
+        for (package_name, _) in &config.packages {
+            let mut package_path = mountpoint.clone();
+            package_path.push(package_name);
+            let meta = std::fs::metadata(package_path)
+                .with_context(|| format!("The image does not provide package {}", package_name))?;
+            if !meta.is_dir() {
+                bail!("Package {} requires the image to contain a subdirectory named {}, but it is not a directory", package_name, package_name);
+            }
+        }
+
+        Ok(MountedImage { mountpoint, config })
     }
 }
 
@@ -95,8 +110,8 @@ impl MountedImage {
 impl Drop for MountedImage {
     fn drop(&mut self) {
         // TODO: add logging
-        sys_mount::unmount(&self.mountpoint, sys_mount::UnmountFlags::empty())
-            .or_else(|_| sys_mount::unmount(&self.mountpoint, sys_mount::UnmountFlags::DETACH))
+        system::umount(&self.mountpoint)
+            .or_else(|_| system::umount_opt(&self.mountpoint, system::MNT_DETACH))
             .expect(&format!("Unmounting {:?} failed", self));
     }
 }

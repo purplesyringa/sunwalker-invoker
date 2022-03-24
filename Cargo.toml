@@ -14,6 +14,7 @@ signal-hook = { version = "0.3", features = ["extended-siginfo"] }
 sys-mount = "1.5.1"
 crossbeam = "0.8.1"
 lisp = { path = "lisp" }
+ctor = "0.1.22"
 
 [profile.release]
 debug = true

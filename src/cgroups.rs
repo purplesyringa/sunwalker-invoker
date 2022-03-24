@@ -1,11 +1,9 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use libc::pid_t;
-use std::io::{Write, BufRead};
 use std::collections::HashSet;
-
+use std::io::{BufRead, Write};
 
 const CPUSET_ROOT: &str = "/sys/fs/cgroup/cpuset";
-
 
 pub fn create_root_cpuset() -> Result<()> {
     std::fs::create_dir(format!("{}/sunwalker_root", CPUSET_ROOT))
@@ -19,8 +17,16 @@ pub fn create_root_cpuset() -> Result<()> {
         .with_context(|| format!("Unable to create {}/sunwalker_root directory", CPUSET_ROOT))?;
 
     // Inherit mems
-    std::fs::write(format!("{}/sunwalker_root/cpuset.mems", CPUSET_ROOT), std::fs::read_to_string(format!("{}/cpuset.mems", CPUSET_ROOT))?)
-        .with_context(|| format!("Failed to write to {}/sunwalker_root/cpuset.mems", CPUSET_ROOT))?;
+    std::fs::write(
+        format!("{}/sunwalker_root/cpuset.mems", CPUSET_ROOT),
+        std::fs::read_to_string(format!("{}/cpuset.mems", CPUSET_ROOT))?,
+    )
+    .with_context(|| {
+        format!(
+            "Failed to write to {}/sunwalker_root/cpuset.mems",
+            CPUSET_ROOT
+        )
+    })?;
 
     // Move all tasks that don't yet belong to a cpuset to the root cpuset
     // FIXME: this is inherently racy, what can we do to avoid the race condition?
@@ -63,8 +69,16 @@ pub fn create_root_cpuset() -> Result<()> {
         }
     }
 
-    let mut tasks_file = std::fs::OpenOptions::new().read(true).write(true).open(format!("{}/sunwalker_root/tasks", CPUSET_ROOT))
-        .with_context(|| format!("Cannot open {}/sunwalker_root/tasks for writing", CPUSET_ROOT))?;
+    let mut tasks_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!("{}/sunwalker_root/tasks", CPUSET_ROOT))
+        .with_context(|| {
+            format!(
+                "Cannot open {}/sunwalker_root/tasks for writing",
+                CPUSET_ROOT
+            )
+        })?;
 
     for tid in tids {
         // A failure most likely indicates a kernel thread, which cannot be rescheduled
@@ -73,7 +87,6 @@ pub fn create_root_cpuset() -> Result<()> {
 
     Ok(())
 }
-
 
 #[derive(Debug)]
 pub struct AffineCPUSet {
@@ -97,27 +110,47 @@ impl AffineCPUSet {
         std::fs::write(format!("{}/cpuset.cpus", dir), core.to_string())
             .with_context(|| format!("Failed to write to {}/cpuset.cpus", dir))?;
 
-        std::fs::write(format!("{}/cpuset.mems", dir), std::fs::read_to_string(format!("{}/cpuset.mems", CPUSET_ROOT))?)
-            .with_context(|| format!("Failed to write to {}/cpuset.mems", dir))?;
+        std::fs::write(
+            format!("{}/cpuset.mems", dir),
+            std::fs::read_to_string(format!("{}/cpuset.mems", CPUSET_ROOT))?,
+        )
+        .with_context(|| format!("Failed to write to {}/cpuset.mems", dir))?;
 
-        std::fs::write(format!("{}/cpuset.cpu_exclusive", dir), "1")
-            .with_context(|| format!("Failed to write to {}/cpuset.cpu_exclusive (is core {} in use?)", dir, core))?;
+        if let Err(e) =
+            std::fs::write(format!("{}/cpuset.cpu_exclusive", dir), "1").with_context(|| {
+                format!(
+                    "Failed to write to {}/cpuset.cpu_exclusive (is core {} in use?)",
+                    dir, core
+                )
+            })
+        {
+            println!("[!] Failed to acquire exclusive access to core {} from the kernel. This usually indicates the presence of tasks with explicit CPU affinity. Make sure you do not have any such services running, or their list of CPU cores is limited. Docker is a common cause of the problem.\n{:?}", core, e);
+        }
 
-        Ok(AffineCPUSet{core})
+        Ok(AffineCPUSet { core })
     }
 
     pub fn add_task(&self, tid: pid_t) -> Result<()> {
         let path = format!("{}/sunwalker_cpu_{}/tasks", CPUSET_ROOT, self.core);
-        std::fs::write(path, tid.to_string())
-            .with_context(|| format!("Could not set affinity of task {} to CPU {}", tid, self.core))
+        std::fs::write(path, tid.to_string()).with_context(|| {
+            format!(
+                "Could not set affinity of task {} to CPU {}",
+                tid, self.core
+            )
+        })
     }
 }
 
 pub fn drop_existing_affine_cpusets() -> Result<()> {
-    let mut root_tasks_file = std::fs::OpenOptions::new().read(true).write(true).open(format!("{}/tasks", CPUSET_ROOT))
+    let mut root_tasks_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!("{}/tasks", CPUSET_ROOT))
         .with_context(|| format!("Cannot open {}/tasks for writing", CPUSET_ROOT))?;
 
-    for entry in std::fs::read_dir(CPUSET_ROOT).with_context(|| format!("Cannot read {}", CPUSET_ROOT))? {
+    for entry in
+        std::fs::read_dir(CPUSET_ROOT).with_context(|| format!("Cannot read {}", CPUSET_ROOT))?
+    {
         let entry = entry?;
         if let Ok(cpuset_name) = entry.file_name().into_string() {
             if cpuset_name.starts_with("sunwalker_cpu_") {
@@ -125,9 +158,12 @@ pub fn drop_existing_affine_cpusets() -> Result<()> {
                 // FIXME: we should also send them SIGKILL, but this has terrible consequences in case of race condition
                 let mut tasks_path = entry.path();
                 tasks_path.push("tasks");
-                let file = std::fs::File::open(&tasks_path).with_context(|| format!("Cannot open {:?} for reading", &tasks_path))?;
+                let file = std::fs::File::open(&tasks_path)
+                    .with_context(|| format!("Cannot open {:?} for reading", &tasks_path))?;
                 for line in std::io::BufReader::new(file).lines() {
-                    let tid: pid_t = line?.parse().with_context(|| format!("Invalid TID in {:?}", tasks_path))?;
+                    let tid: pid_t = line?
+                        .parse()
+                        .with_context(|| format!("Invalid TID in {:?}", tasks_path))?;
                     root_tasks_file.write_all(tid.to_string().as_ref())?;
                 }
 
@@ -140,7 +176,6 @@ pub fn drop_existing_affine_cpusets() -> Result<()> {
     Ok(())
 }
 
-
 fn parse_cpuset_list(s: &str) -> Result<Vec<u64>> {
     let mut result: Vec<u64> = Vec::new();
     for part in s.trim().split(',') {
@@ -149,24 +184,32 @@ fn parse_cpuset_list(s: &str) -> Result<Vec<u64>> {
             if bounds.len() != 2 {
                 bail!("Invalid cpuset: {}", part);
             }
-            let first = bounds[0].parse().with_context(|| format!("Invalid cpuset: {}", part))?;
-            let last = bounds[1].parse().with_context(|| format!("Invalid cpuset: {}", part))?;
+            let first = bounds[0]
+                .parse()
+                .with_context(|| format!("Invalid cpuset: {}", part))?;
+            let last = bounds[1]
+                .parse()
+                .with_context(|| format!("Invalid cpuset: {}", part))?;
             for item in first..=last {
                 result.push(item);
             }
         } else {
-            result.push(part.parse().with_context(|| format!("Invalid cpuset: {}", part))?);
+            result.push(
+                part.parse()
+                    .with_context(|| format!("Invalid cpuset: {}", part))?,
+            );
         }
     }
     Ok(result)
 }
 
-
 fn format_cpuset_list(mut list: Vec<u64>) -> String {
     list.sort();
-    list.iter().map(|x| x.to_string()).collect::<Vec<String>>().join(",")
+    list.iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<String>>()
+        .join(",")
 }
-
 
 fn get_all_cores() -> Result<Vec<u64>> {
     let path = format!("{}/cpuset.cpus", CPUSET_ROOT);
@@ -175,14 +218,16 @@ fn get_all_cores() -> Result<Vec<u64>> {
     parse_cpuset_list(all_cores.as_ref())
 }
 
-
 pub fn isolate_cores(isolated_cores: &Vec<u64>) -> Result<()> {
     let all_cores = get_all_cores()?;
 
     let mut not_isolated_cores: HashSet<u64> = HashSet::from_iter(all_cores.iter().cloned());
     for core in isolated_cores {
         if !not_isolated_cores.remove(core) {
-            bail!("Core {} does not exist or was specified twice in the list of isolated cores", core);
+            bail!(
+                "Core {} does not exist or was specified twice in the list of isolated cores",
+                core
+            );
         }
     }
 
@@ -192,6 +237,14 @@ pub fn isolate_cores(isolated_cores: &Vec<u64>) -> Result<()> {
 
     let not_isolated_cores = format_cpuset_list(Vec::from_iter(not_isolated_cores.iter().cloned()));
 
-    std::fs::write(format!("{}/sunwalker_root/cpuset.cpus", CPUSET_ROOT), &not_isolated_cores)
-        .with_context(|| format!("Failed to write {} to {}/sunwalker_root/cpuset.cpus", not_isolated_cores, CPUSET_ROOT))
+    std::fs::write(
+        format!("{}/sunwalker_root/cpuset.cpus", CPUSET_ROOT),
+        &not_isolated_cores,
+    )
+    .with_context(|| {
+        format!(
+            "Failed to write {} to {}/sunwalker_root/cpuset.cpus",
+            not_isolated_cores, CPUSET_ROOT
+        )
+    })
 }

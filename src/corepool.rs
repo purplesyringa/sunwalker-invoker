@@ -1,4 +1,4 @@
-use crate::{cgroups, multiprocessing};
+use crate::cgroups;
 use anyhow::{bail, Context, Result};
 use libc::{c_int, pid_t};
 use signal_hook::{
@@ -122,7 +122,7 @@ impl<'a> CorePool<'a> {
             bail!("fork() failed");
         } else if child_pid == 0 {
             let panic = std::panic::catch_unwind(|| {
-                cpuset.add_task(multiprocessing::getpid()).unwrap();
+                cpuset.add_task(unsafe { libc::getpid() }).unwrap();
                 f();
             });
             let exit_code = if panic.is_ok() { 0 } else { 1 };

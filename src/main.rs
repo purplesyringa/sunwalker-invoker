@@ -4,6 +4,7 @@ use nix::{fcntl, unistd};
 use sunwalker_runner::{
     cgroups, corepool,
     image::{config, mount, package},
+    system,
 };
 
 fn worker_main() -> Result<()> {
@@ -17,12 +18,7 @@ fn worker_main() -> Result<()> {
         }
 
         // Do not propagate mounts
-        sys_mount::Mount::builder()
-            .fstype("none")
-            .flags(sys_mount::MountFlags::from_bits_unchecked(
-                MS_PRIVATE | MS_REC,
-            ))
-            .mount("none", "/")
+        system::change_propagation("/", system::MS_PRIVATE | system::MS_REC)
             .with_context(|| "Setting propagation of / to private recursively failed")?;
 
         // // Fill uid/gid maps
@@ -40,9 +36,7 @@ fn worker_main() -> Result<()> {
         // }
 
         // Mount tmpfs
-        sys_mount::Mount::builder()
-            .fstype("tmpfs")
-            .mount("tmpfs", "/tmp")
+        system::mount("none", "/tmp", "tmpfs", 0, None)
             .with_context(|| "Mounting tmpfs on /tmp failed")?;
 
         // Make various temporary directories
@@ -71,26 +65,23 @@ fn worker_main() -> Result<()> {
                 std::fs::File::create(&target)
                     .with_context(|| format!("Cannot touch {:?}", target))?;
             }
-            sys_mount::Mount::builder()
-                .flags(sys_mount::MountFlags::BIND)
-                .mount(&source, &target)
+            system::bind_mount(&source, &target)
                 .with_context(|| format!("Bind-mounting {} -> {} failed", target, source))?;
         }
     }
 
-    let mut mnt = mount::ImageMounter::new();
-    let mounted_image = mnt
-        .mount("/mnt/wwn-0x500000e041b68f2b-part1/sunwalker/image.sfs")
-        .with_context(|| "Could not mount image.sfs")?;
-
     let cfg = config::Config::load(
-        &std::fs::read_to_string("/mnt/wwn-0x500000e041b68f2b-part1/sunwalker/image.cfg")
+        &std::fs::read_to_string("/home/ivanq/Documents/sunwalker/image.cfg")
             .with_context(|| "Could not read image.cfg")?,
     )
     .with_context(|| "Could not load image.cfg")?;
-    println!("{:?}", cfg);
 
-    let cores: Vec<u64> = vec![4, 5, 6, 7];
+    let mut mnt = mount::ImageMounter::new();
+    let mounted_image = mnt
+        .mount("/home/ivanq/Documents/sunwalker/image.sfs", cfg)
+        .with_context(|| "Could not mount image.sfs")?;
+
+    let cores: Vec<u64> = vec![2, 3];
     cgroups::isolate_cores(&cores).with_context(|| "Failed to isolate CPU cores")?;
 
     let mut pool = corepool::CorePool::new(cores).with_context(|| "Could not create core pool")?;
@@ -108,28 +99,34 @@ fn worker_main() -> Result<()> {
                     .get_package("gcc")
                     .expect("Package gcc does not exist");
 
-                // package.build("/tmp/hello-world.cpp");
+                let sandbox_config = package::SandboxConfig {
+                    max_size_in_bytes: 1024 * 1024,
+                    max_inodes: 10 * 1024,
+                    bound_files: Vec::new(),
+                };
 
-                package
-                    .enter(
-                        &package::SandboxDiskConfig {
-                            max_size_in_bytes: 1024 * 1024,
-                            max_inodes: 10 * 1024,
-                        }
-                    )
-                    .expect("Entering the package failed");
+                let lang = package
+                    .get_language("c++.17.gcc")
+                    .expect("Failed to get language c++.17.gcc");
 
-                std::fs::write(
-                    "/test.cpp",
-                    "#include <iostream>\nint main() {\n\tstd::cout << \"Hello, world!\" << std::endl;\n}\n",
-                ).expect("write failed");
+                lang.build(vec!["/tmp/hello-world.cpp"], sandbox_config.clone())
+                    .expect("Failed to build /tmp/hello-world.cpp as c++.17.gcc");
 
-                std::process::Command::new("g++")
-                    .arg("/test.cpp")
-                    .arg("-o")
-                    .arg("/test")
-                    .output()
-                    .expect("Spawning gcc failed");
+                // package
+                //     .enter(&sandbox_config)
+                //     .expect("Entering the package failed");
+
+                // std::fs::write(
+                //     "/test.cpp",
+                //     "#include <iostream>\nint main() {\n\tstd::cout << \"Hello, world!\" << std::endl;\n}\n",
+                // ).expect("write failed");
+
+                // std::process::Command::new("g++")
+                //     .arg("/test.cpp")
+                //     .arg("-o")
+                //     .arg("/test")
+                //     .output()
+                //     .expect("Spawning gcc failed");
 
                 // println!("Hello, world from #{}!", i);
             }),
@@ -184,6 +181,8 @@ fn watchdog_main(worker_pid: libc::pid_t) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    lisp::initialize();
+
     // Acquire a lock
     let lock_fd = fcntl::open(
         "/var/run/sunwalker_runner.lock",
