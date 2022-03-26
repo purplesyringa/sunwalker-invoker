@@ -9,31 +9,14 @@ use sunwalker_runner::{
 
 fn worker_main() -> Result<()> {
     unsafe {
-        // let euid = libc::geteuid();
-        // let egid = libc::getegid();
-
         // Unshare namespaces
-        if libc::unshare(CLONE_NEWNS /*| CLONE_NEWUSER*/) != 0 {
+        if libc::unshare(CLONE_NEWNS) != 0 {
             bail!("Initial unshare() failed, unable to continue safely");
         }
 
         // Do not propagate mounts
         system::change_propagation("/", system::MS_PRIVATE | system::MS_REC)
             .with_context(|| "Setting propagation of / to private recursively failed")?;
-
-        // // Fill uid/gid maps
-        // std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", euid))
-        //     .expect("Failed to write to uid_map");
-        // std::fs::write("/proc/self/setgroups", "deny\n").expect("Failed to write to setgroups");
-        // std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", egid))
-        //     .expect("Failed to write to gid_map");
-
-        // if libc::seteuid(0) != 0 {
-        //     panic!("Unable to seteuid to 0");
-        // }
-        // if libc::setegid(0) != 0 {
-        //     panic!("Unable to setegid to 0");
-        // }
 
         // Mount tmpfs
         system::mount("none", "/tmp", "tmpfs", 0, None)
@@ -102,8 +85,6 @@ fn worker_main() -> Result<()> {
                 let sandbox_config = package::SandboxConfig {
                     max_size_in_bytes: 1024 * 1024,
                     max_inodes: 10 * 1024,
-                    user_uid: 1000,
-                    user_gid: 1000,
                     bound_files: Vec::new(),
                 };
 

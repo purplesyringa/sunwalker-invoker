@@ -4,8 +4,8 @@ use crate::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use libc::{
-    c_int, gid_t, uid_t, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER,
-    CLONE_NEWUTS, CLONE_SYSVSEM, SIGCONT, SIGSTOP, WUNTRACED,
+    c_int, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, CLONE_NEWUTS,
+    CLONE_SYSVSEM, SIGCONT, SIGSTOP, WUNTRACED,
 };
 use rand::{thread_rng, Rng};
 use std::io::BufRead;
@@ -17,8 +17,6 @@ use std::process::{Command, Stdio};
 pub struct SandboxConfig {
     pub max_size_in_bytes: u64,
     pub max_inodes: u64,
-    pub user_uid: uid_t,
-    pub user_gid: gid_t,
     pub bound_files: Vec<(PathBuf, String)>,
 }
 
@@ -109,11 +107,7 @@ impl<'a> Package<'a> {
             .with_context(|| "Failed to mount /dev on overlay")?;
 
         // Allow the sandbox user to access data
-        std::os::unix::fs::chown(
-            "/tmp/worker/overlay/space",
-            Some(sandbox_config.user_uid),
-            Some(sandbox_config.user_gid),
-        )?;
+        std::os::unix::fs::chown("/tmp/worker/overlay/space", Some(65534), Some(65534))?;
 
         Ok(())
     }
@@ -275,14 +269,14 @@ impl<'a> Package<'a> {
             // Fill uid/gid maps and switch to
             std::fs::write(
                 format!("/proc/{}/uid_map", child_pid),
-                format!("0 {} 1\n", sandbox_config.user_uid),
+                format!("0 65534 1\n"),
             )
             .with_context(|| "Failed to write to child's uid_map")?;
             std::fs::write(format!("/proc/{}/setgroups", child_pid), "deny\n")
                 .with_context(|| "Failed to write to child's setgroups")?;
             std::fs::write(
                 format!("/proc/{}/gid_map", child_pid),
-                format!("0 {} 1\n", sandbox_config.user_gid),
+                format!("0 65534 1\n"),
             )
             .with_context(|| "Failed to write to child's gid_map")?;
 
@@ -393,11 +387,7 @@ impl Language<'_> {
         system::bind_mount("/tmp/worker/artifacts", "/tmp/worker/overlay/artifacts")?;
 
         // Allow the sandbox user to access data
-        std::os::unix::fs::chown(
-            "/tmp/worker/overlay/artifacts",
-            Some(sandbox_config.user_uid),
-            Some(sandbox_config.user_gid),
-        )?;
+        std::os::unix::fs::chown("/tmp/worker/overlay/artifacts", Some(65534), Some(65534))?;
 
         // Enter the sandbox in another process
         self.package
