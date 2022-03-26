@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use libc::{c_int, CLONE_NEWNS, CLONE_NEWUSER, MS_PRIVATE, MS_REC};
+use libc::{c_int, CLONE_NEWNS};
 use nix::{fcntl, unistd};
 use sunwalker_runner::{
     cgroups, corepool,
@@ -88,7 +88,7 @@ fn worker_main() -> Result<()> {
 
     std::fs::write(
         "/tmp/hello-world.cpp",
-        "#include <iostream>\nint main() {\n\tstd::cout << \"Hello, world!\" << std::endl;\n}\n",
+        "#include <bits/stdc++.h>\nint main() {\n\tstd::cout << \"Hello, world!\" << std::endl;\n}\n",
     )?;
 
     for i in 0..50 {
@@ -102,6 +102,8 @@ fn worker_main() -> Result<()> {
                 let sandbox_config = package::SandboxConfig {
                     max_size_in_bytes: 1024 * 1024,
                     max_inodes: 10 * 1024,
+                    user_uid: 1000,
+                    user_gid: 1000,
                     bound_files: Vec::new(),
                 };
 
@@ -198,14 +200,14 @@ fn main() -> Result<()> {
 
     // Acquire a lock
     let lock_fd = fcntl::open(
-        "/var/run/sunwalker_runner.lock",
+        "/tmp/sunwalker_runner.lock",
         fcntl::OFlag::O_CREAT | fcntl::OFlag::O_RDWR,
         nix::sys::stat::Mode::from_bits(0o600).unwrap(),
     )
-    .expect("Failed to open /var/run/sunwalker_runner.lock");
+    .expect("Failed to open /tmp/sunwalker_runner.lock");
 
     fcntl::flock(lock_fd, fcntl::FlockArg::LockExclusiveNonblock)
-        .expect("/var/run/sunwalker_runner.lock is already locked by another process (is sunwalker already running?)");
+        .expect("/tmp/sunwalker_runner.lock is already locked by another process (is sunwalker already running?)");
 
     // Spawn a watchdog
     let child_pid = unsafe { libc::fork() };
@@ -213,14 +215,16 @@ fn main() -> Result<()> {
         panic!("Starting a watchdog via fork() failed");
     } else if child_pid == 0 {
         unistd::close(lock_fd).expect("Failed to close lock fd");
+
         // Pause ourselves; watchdog will CONT us when it's ready
         unsafe {
             libc::raise(libc::SIGSTOP);
         }
+
         worker_main()
     } else {
         watchdog_main(child_pid)?;
         fcntl::flock(lock_fd, fcntl::FlockArg::Unlock)
-            .with_context(|| "/var/run/sunwalker_runner.lock could not be unlocked")
+            .with_context(|| "/tmp/sunwalker_runner.lock could not be unlocked")
     }
 }

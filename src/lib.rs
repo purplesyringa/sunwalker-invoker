@@ -1,3 +1,5 @@
+#![feature(unix_chown)]
+
 pub mod image {
     pub mod config;
     pub mod mount;

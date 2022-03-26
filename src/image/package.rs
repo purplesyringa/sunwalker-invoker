@@ -1,11 +1,15 @@
 use crate::{
     image::{config, mount},
-    process, system,
+    system,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use libc::{CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS};
+use libc::{
+    c_int, gid_t, uid_t, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWUSER, SIGCONT, SIGSTOP,
+    WUNTRACED,
+};
 use rand::{thread_rng, Rng};
 use std::io::BufRead;
+use std::panic::UnwindSafe;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -13,6 +17,8 @@ use std::process::{Command, Stdio};
 pub struct SandboxConfig {
     pub max_size_in_bytes: u64,
     pub max_inodes: u64,
+    pub user_uid: uid_t,
+    pub user_gid: gid_t,
     pub bound_files: Vec<(PathBuf, String)>,
 }
 
@@ -102,6 +108,13 @@ impl<'a> Package<'a> {
         system::bind_mount_opt("/tmp/dev", "/tmp/worker/overlay/dev", system::MS_RDONLY)
             .with_context(|| "Failed to mount /dev on overlay")?;
 
+        // Allow the sandbox user to access data
+        std::os::unix::fs::chown(
+            "/tmp/worker/overlay/space",
+            Some(sandbox_config.user_uid),
+            Some(sandbox_config.user_gid),
+        )?;
+
         Ok(())
     }
 
@@ -134,58 +147,153 @@ impl<'a> Package<'a> {
         Ok(())
     }
 
-    pub fn enter_sandbox(&self, sandbox_config: &SandboxConfig) -> Result<()> {
-        // Unshare namespaces
-        unsafe {
-            // TODO: CLONE_NEWPID, CLONE_NEWUSER?, CLONE_NEWUTS, CLONE_SYSVSEM
-            if libc::unshare(CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWNET) != 0 {
-                bail!("Could not unshare mount namespace");
+    pub fn run_in_sandbox<F: FnOnce() -> () + Send + UnwindSafe>(
+        &self,
+        sandbox_config: &SandboxConfig,
+        f: F,
+    ) -> Result<()> {
+        let child_pid = unsafe { libc::fork() };
+        if child_pid == -1 {
+            bail!("fork() failed");
+        } else if child_pid == 0 {
+            let panic = std::panic::catch_unwind(|| {
+                // Unshare namespaces
+                // TODO: CLONE_NEWPID, CLONE_NEWUTS, CLONE_SYSVSEM
+                if unsafe {
+                    libc::unshare(CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWUSER)
+                } != 0
+                {
+                    panic!("Could not unshare mount namespace");
+                }
+
+                // Stop ourselves
+                if unsafe { libc::raise(SIGSTOP) } != 0 {
+                    panic!("raise(SIGSTOP) failed");
+                }
+
+                // Switch to fake root user
+                if unsafe { libc::setuid(0) } != 0 {
+                    let e: Result<(), std::io::Error> = Err(std::io::Error::last_os_error());
+                    e.with_context(|| "setuid(0) failed while entering sandbox")
+                        .unwrap();
+                }
+                if unsafe { libc::setgid(0) } != 0 {
+                    let e: Result<(), std::io::Error> = Err(std::io::Error::last_os_error());
+                    e.with_context(|| "setgid(0) failed while entering sandbox")
+                        .unwrap();
+                }
+
+                // The kernel marks /tmp/worker/overlay as MNT_LOCKED as a safety restriction due to
+                // the use of user namespaces. pivot_root requires the new root not to be MNT_LOCKED
+                // (the reason for which I don't quite understand), and the simplest way to fix that
+                // is to bind-mount /tmp/worker/overlay onto itself.
+                system::bind_mount_opt(
+                    "/tmp/worker/overlay",
+                    "/tmp/worker/overlay",
+                    system::MS_REC,
+                )
+                .with_context(|| "Failed to bind-mount /tmp/worker/overlay onto itself")
+                .unwrap();
+
+                // Change root
+                std::env::set_current_dir("/tmp/worker/overlay")
+                    .with_context(|| "Failed to chdir to new root at /tmp/worker/overlay")
+                    .unwrap();
+                nix::unistd::pivot_root(".", ".")
+                    .with_context(|| "Failed to pivot_root")
+                    .unwrap();
+                system::umount_opt(".", system::MNT_DETACH)
+                    .with_context(|| "Failed to unmount self")
+                    .unwrap();
+                std::env::set_current_dir("/")
+                    .with_context(|| "Failed to chdir to new root at /")
+                    .unwrap();
+
+                // Expose defaults for environment variables
+                std::env::set_var(
+                    "LD_LIBRARY_PATH",
+                    "/usr/local/lib64:/usr/local/lib:/usr/lib64:/usr/lib:/lib64:/lib",
+                );
+                std::env::set_var("LANGUAGE", "en_US");
+                std::env::set_var("LC_ALL", "en_US.UTF-8");
+                std::env::set_var("LC_ADDRESS", "en_US.UTF-8");
+                std::env::set_var("LC_NAME", "en_US.UTF-8");
+                std::env::set_var("LC_MONETARY", "en_US.UTF-8");
+                std::env::set_var("LC_PAPER", "en_US.UTF-8");
+                std::env::set_var("LC_IDENTIFIER", "en_US.UTF-8");
+                std::env::set_var("LC_TELEPHONE", "en_US.UTF-8");
+                std::env::set_var("LC_MEASUREMENT", "en_US.UTF-8");
+                std::env::set_var("LC_TIME", "en_US.UTF-8");
+                std::env::set_var("LC_NUMERIC", "en_US.UTF-8");
+                std::env::set_var("LANG", "en_US.UTF-8");
+
+                // Use environment from the package
+                let file = std::fs::File::open("/.sunwalker/env")
+                    .with_context(|| "Could not open /.sunwalker/env for reading")
+                    .unwrap();
+                for line in std::io::BufReader::new(file).lines() {
+                    let line = line
+                        .with_context(|| "Could not read from /.sunwalker/env")
+                        .unwrap();
+                    let idx = line
+                        .find('=')
+                        .with_context(|| {
+                            format!("'=' not found in a line of /.sunwalker/env: {}", line)
+                        })
+                        .unwrap();
+                    let (name, value) = line.split_at(idx);
+                    let value = &value[1..];
+                    std::env::set_var(name, value);
+                }
+
+                f();
+            });
+            let exit_code = if panic.is_ok() { 0 } else { 1 };
+            unsafe {
+                libc::_exit(exit_code);
+            }
+        } else {
+            let mut wstatus: c_int = 0;
+            let mut ret;
+
+            ret = unsafe { libc::waitpid(child_pid, &mut wstatus as *mut c_int, WUNTRACED) };
+            if ret == -1 {
+                Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("waitpid() failed"))?;
+            }
+            if !libc::WIFSTOPPED(wstatus) {
+                bail!("Child process wasn't stopped by SIGSTOP, as expected");
+            }
+
+            // Fill uid/gid maps and switch to
+            std::fs::write(
+                format!("/proc/{}/uid_map", child_pid),
+                format!("0 {} 1\n", sandbox_config.user_uid),
+            )
+            .with_context(|| "Failed to write to child's uid_map")?;
+            std::fs::write(format!("/proc/{}/setgroups", child_pid), "deny\n")
+                .with_context(|| "Failed to write to child's setgroups")?;
+            std::fs::write(
+                format!("/proc/{}/gid_map", child_pid),
+                format!("0 {} 1\n", sandbox_config.user_gid),
+            )
+            .with_context(|| "Failed to write to child's gid_map")?;
+
+            if unsafe { libc::kill(child_pid, SIGCONT) } != 0 {
+                bail!("Failed to SIGCONT child process");
+            }
+
+            ret = unsafe { libc::waitpid(child_pid, &mut wstatus as *mut c_int, 0) };
+            if ret == -1 {
+                Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("waitpid() failed"))?;
+            }
+            if libc::WIFEXITED(wstatus) {
+                Ok(())
+            } else {
+                bail!("Process returned exit code {}", libc::WEXITSTATUS(wstatus));
             }
         }
-
-        // Change root
-        std::fs::create_dir("/tmp/worker/overlay/old-root")
-            .with_context(|| "Failed to create .../old-root")?;
-        std::env::set_current_dir("/tmp/worker/overlay")
-            .with_context(|| "Failed to chdir to new root")?;
-        nix::unistd::pivot_root("/tmp/worker/overlay", "/tmp/worker/overlay/old-root")
-            .with_context(|| "Failed to pivot_root")?;
-        system::umount_opt("/old-root", system::MNT_DETACH)
-            .with_context(|| "Failed to unmount /old-root")?;
-        std::fs::remove_dir("/old-root").with_context(|| "Failed to remove .../old-root")?;
-
-        // Expose defaults for environment variables
-        std::env::set_var(
-            "LD_LIBRARY_PATH",
-            "/usr/local/lib64:/usr/local/lib:/usr/lib64:/usr/lib:/lib64:/lib",
-        );
-        std::env::set_var("LANGUAGE", "en_US");
-        std::env::set_var("LC_ALL", "en_US.UTF-8");
-        std::env::set_var("LC_ADDRESS", "en_US.UTF-8");
-        std::env::set_var("LC_NAME", "en_US.UTF-8");
-        std::env::set_var("LC_MONETARY", "en_US.UTF-8");
-        std::env::set_var("LC_PAPER", "en_US.UTF-8");
-        std::env::set_var("LC_IDENTIFIER", "en_US.UTF-8");
-        std::env::set_var("LC_TELEPHONE", "en_US.UTF-8");
-        std::env::set_var("LC_MEASUREMENT", "en_US.UTF-8");
-        std::env::set_var("LC_TIME", "en_US.UTF-8");
-        std::env::set_var("LC_NUMERIC", "en_US.UTF-8");
-        std::env::set_var("LANG", "en_US.UTF-8");
-
-        // Use environment from the package
-        let file = std::fs::File::open("/.sunwalker/env")
-            .with_context(|| "Could not open /.sunwalker/env for reading")?;
-        for line in std::io::BufReader::new(file).lines() {
-            let line = line.with_context(|| "Could not read from /.sunwalker/env")?;
-            let idx = line
-                .find('=')
-                .with_context(|| format!("'=' not found in a line of /.sunwalker/env: {}", line))?;
-            let (name, value) = line.split_at(idx);
-            let value = &value[1..];
-            std::env::set_var(name, value);
-        }
-
-        Ok(())
     }
 
     pub fn get_language(&'a self, language_name: &'a str) -> Result<Language<'a>> {
@@ -264,7 +372,7 @@ impl Language<'_> {
 
         // Make sandbox
         self.package
-            .make_worker_tmp(&sandbox_config)
+            .make_worker_tmp(&build_sandbox_config)
             .with_context(|| format!("Failed to make /tmp/worker for build"))?;
         self.package
             .make_sandbox(&build_sandbox_config)
@@ -276,101 +384,102 @@ impl Language<'_> {
         std::fs::create_dir("/tmp/worker/overlay/artifacts")
             .with_context(|| "Could not create /tmp/worker/overlay/artifacts")?;
         system::bind_mount("/tmp/worker/artifacts", "/tmp/worker/overlay/artifacts")?;
-        build_sandbox_config
-            .bound_files
-            .push(("/tmp/worker/artifacts".into(), "/artifacts".into()));
+
+        // Allow the sandbox user to access data
+        std::os::unix::fs::chown(
+            "/tmp/worker/overlay/artifacts",
+            Some(sandbox_config.user_uid),
+            Some(sandbox_config.user_gid),
+        )?;
 
         // Enter the sandbox in another process
-        process::scoped(|| {
-            self.package
-                .enter_sandbox(&build_sandbox_config)
-                .with_context(|| format!("Failed to enter sandbox for build"))
+        self.package
+            .run_in_sandbox(&build_sandbox_config, || {
+                // Evaluate correct pattern
+                let pattern: String = lisp::evaluate(
+                    self.config.base_rule.clone(),
+                    &lisp::State::new().var("$base".to_string(), pre_pattern.clone()),
+                )
+                .unwrap()
+                .to_native()
                 .unwrap();
 
-            // Evaluate correct pattern
-            let pattern: String = lisp::evaluate(
-                self.config.base_rule.clone(),
-                &lisp::State::new().var("$base".to_string(), pre_pattern.clone()),
-            )
-            .unwrap()
-            .to_native()
-            .unwrap();
+                if pre_pattern != pattern {
+                    // Rename files according to new pattern
+                    for (_, input_pattern) in files_and_patterns {
+                        let mut old_path = PathBuf::new();
+                        old_path.push("/space");
+                        old_path.push(input_pattern.replace("%", &pre_pattern));
 
-            if pre_pattern != pattern {
-                // Rename files according to new pattern
-                for (_, input_pattern) in files_and_patterns {
-                    let mut old_path = PathBuf::new();
-                    old_path.push("/space");
-                    old_path.push(input_pattern.replace("%", &pre_pattern));
+                        let mut new_path = PathBuf::new();
+                        new_path.push("/space");
+                        new_path.push(input_pattern.replace("%", &pattern));
 
-                    let mut new_path = PathBuf::new();
-                    new_path.push("/space");
-                    new_path.push(input_pattern.replace("%", &pattern));
+                        std::fs::write(&new_path, "")
+                            .with_context(|| {
+                                format!("Failed to create file {:?} on overlay", new_path)
+                            })
+                            .unwrap();
+                        system::move_mount(&old_path, &new_path)
+                            .with_context(|| {
+                                format!(
+                                    "Failed to move mount {:?} -> {:?} on overlay",
+                                    &old_path, new_path
+                                )
+                            })
+                            .unwrap();
+                        std::fs::remove_file(&old_path)
+                            .with_context(|| {
+                                format!("Failed to remove old file {:?} on overlay", old_path)
+                            })
+                            .unwrap();
+                    }
+                }
 
-                    std::fs::write(&new_path, "")
-                        .with_context(|| format!("Failed to create file {:?} on overlay", new_path))
+                // Run build process
+                let state = lisp::State::new().var("$base".to_string(), pattern.clone());
+                let build_output: String = lisp::evaluate(self.config.build.clone(), &state)
+                    .with_context(|| "Failed to evaluate build schema")
+                    .unwrap()
+                    .to_native()
+                    .with_context(|| "Build schema didn't return string, as was expected")
+                    .unwrap();
+
+                let run_prerequisites: Vec<String> =
+                    lisp::evaluate(self.config.run.prerequisites.clone(), &state)
+                        .with_context(|| "Failed to evaluate prerequisites for running")
+                        .unwrap()
+                        .to_native()
+                        .with_context(|| {
+                            "Prerequisite schema didn't return a list of strings, as was expected"
+                        })
                         .unwrap();
-                    system::move_mount(&old_path, &new_path)
+
+                // Copy run prerequisites to artifacts.
+                // TODO: this can be optimized further. If a prerequisite is an artifact of the build
+                // process, the file can simply be moved. If it is an input file, it can be bind-mounted
+                // from its original source.
+                for rel_path in run_prerequisites.into_iter() {
+                    let mut from = std::path::PathBuf::from("/space");
+                    from.push(&rel_path);
+                    let mut to = std::path::PathBuf::from("/artifacts");
+                    to.push(&rel_path);
+                    std::fs::copy(&from, &to)
                         .with_context(|| {
                             format!(
-                                "Failed to move mount {:?} -> {:?} on overlay",
-                                &old_path, new_path
+                                "Could not copy artifact {} from {:?} to {:?}",
+                                rel_path, from, to
                             )
                         })
                         .unwrap();
-                    std::fs::remove_file(&old_path)
-                        .with_context(|| {
-                            format!("Failed to remove old file {:?} on overlay", old_path)
-                        })
-                        .unwrap();
                 }
-            }
 
-            // Run build process
-            let state = lisp::State::new().var("$base".to_string(), pattern.clone());
-            let build_output: String = lisp::evaluate(self.config.build.clone(), &state)
-                .with_context(|| "Failed to evaluate build schema")
-                .unwrap()
-                .to_native()
-                .with_context(|| "Build schema didn't return string, as was expected")
-                .unwrap();
-
-            let run_prerequisites: Vec<String> =
-                lisp::evaluate(self.config.run.prerequisites.clone(), &state)
-                    .with_context(|| "Failed to evaluate prerequisites for running")
-                    .unwrap()
-                    .to_native()
-                    .with_context(|| {
-                        "Prerequisite schema didn't return a list of strings, as was expected"
-                    })
+                // Output the pattern to /artifacts/pattern.txt
+                std::fs::write("/artifacts/pattern.txt", pattern)
+                    .with_context(|| "Failed to write pattern to /artifacts/pattern.txt")
                     .unwrap();
-
-            // Copy run prerequisites to artifacts.
-            // TODO: this can be optimized further. If a prerequisite is an artifact of the build
-            // process, the file can simply be moved. If it is an input file, it can be bind-mounted
-            // from its original source.
-            for rel_path in run_prerequisites.into_iter() {
-                let mut from = std::path::PathBuf::from("/space");
-                from.push(&rel_path);
-                let mut to = std::path::PathBuf::from("/artifacts");
-                to.push(&rel_path);
-                std::fs::copy(&from, &to)
-                    .with_context(|| {
-                        format!(
-                            "Could not copy artifact {} from {:?} to {:?}",
-                            rel_path, from, to
-                        )
-                    })
-                    .unwrap();
-            }
-
-            // Output the pattern to /artifacts/pattern.txt
-            std::fs::write("/artifacts/pattern.txt", pattern)
-                .with_context(|| "Failed to write pattern to /artifacts/pattern.txt")
-                .unwrap();
-        })
-        .with_context(|| "In-process build failed")?
-        .join()?;
+            })
+            .with_context(|| "In-process build failed")?;
 
         self.package.remove_sandbox()?;
 
@@ -437,24 +546,19 @@ impl Language<'_> {
         }
 
         // Enter the sandbox in another process
-        process::scoped(|| {
-            self.package
-                .enter_sandbox(&run_sandbox_config)
-                .with_context(|| "Failed to enter sandbox for running")
-                .unwrap();
+        self.package
+            .run_in_sandbox(&sandbox_config, || {
+                std::env::set_current_dir("/space")
+                    .with_context(|| "Failed to chdir to /space")
+                    .unwrap();
 
-            std::env::set_current_dir("/space")
-                .with_context(|| "Failed to chdir to /space")
-                .unwrap();
-
-            (Err(exec::Command::new(&program.argv[0])
-                .args(&program.argv[1..])
-                .exec()) as Result<i64, exec::Error>)
-                .with_context(|| format!("Failed to start {:?}", program.argv))
-                .unwrap();
-        })
-        .with_context(|| "In-process running failed")?
-        .join()?;
+                (Err(exec::Command::new(&program.argv[0])
+                    .args(&program.argv[1..])
+                    .exec()) as Result<i64, exec::Error>)
+                    .with_context(|| format!("Failed to start {:?}", program.argv))
+                    .unwrap();
+            })
+            .with_context(|| "In-process running failed")?;
 
         Ok(())
     }
