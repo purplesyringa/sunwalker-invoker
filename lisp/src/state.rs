@@ -14,7 +14,7 @@ impl State {
         }
     }
 
-    pub fn set_var<T: LispType + 'static>(&mut self, name: String, value: T) -> &mut State {
+    pub fn var<T: LispType + 'static>(mut self, name: String, value: T) -> Self {
         self.vars.insert(name, TypedRef::new(value));
         self
     }

@@ -24,7 +24,7 @@ struct QueueInfo<'a> {
 }
 
 pub struct Task<'a> {
-    pub callback: Box<dyn FnOnce() -> () + Sync + Send + UnwindSafe + 'a>,
+    pub callback: Box<dyn FnOnce() -> () + Send + UnwindSafe + 'a>,
     pub group: String,
 }
 
@@ -116,15 +116,15 @@ impl<'a> CorePool<'a> {
 
     fn _spawn_in_cpuset<F: FnOnce() -> ()>(cpuset: cgroups::AffineCPUSet, f: F) -> Result<pid_t>
     where
-        F: Sync + Send + UnwindSafe + 'a,
+        F: Send + UnwindSafe + 'a,
     {
         // We guarantee that 'a will survive by the time the task is finished because we wait for
         // all spawned processes in Drop.
-        let f: Box<dyn FnOnce() -> () + Sync + Send + UnwindSafe + 'a> = Box::new(move || {
+        let f: Box<dyn FnOnce() -> () + Send + UnwindSafe + 'a> = Box::new(move || {
             cpuset.add_task(unsafe { libc::getpid() }).unwrap();
             f();
         });
-        let f: Box<dyn FnOnce() -> () + Sync + Send + UnwindSafe + 'static> =
+        let f: Box<dyn FnOnce() -> () + Send + UnwindSafe + 'static> =
             unsafe { std::mem::transmute(f) };
         process::spawn(f)
     }

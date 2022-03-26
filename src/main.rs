@@ -109,8 +109,21 @@ fn worker_main() -> Result<()> {
                     .get_language("c++.17.gcc")
                     .expect("Failed to get language c++.17.gcc");
 
-                lang.build(vec!["/tmp/hello-world.cpp"], sandbox_config.clone())
+                let program = lang
+                    .build(vec!["/tmp/hello-world.cpp"], &sandbox_config)
                     .expect("Failed to build /tmp/hello-world.cpp as c++.17.gcc");
+
+                lang.get_ready_to_run(&sandbox_config)
+                    .expect("Failed to get ready for running /tmp/hello-world.cpp as c++.17.gcc");
+
+                lang.run(&sandbox_config, &program)
+                    .expect("Failed to run /tmp/hello-world.cpp as c++.17.gcc");
+
+                lang.run(&sandbox_config, &program)
+                    .expect("Failed to run /tmp/hello-world.cpp as c++.17.gcc");
+
+                lang.run(&sandbox_config, &program)
+                    .expect("Failed to run /tmp/hello-world.cpp as c++.17.gcc");
 
                 // package
                 //     .enter(&sandbox_config)

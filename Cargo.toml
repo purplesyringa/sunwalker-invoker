@@ -15,6 +15,7 @@ sys-mount = "1.5.1"
 crossbeam = "0.8.1"
 lisp = { path = "lisp" }
 ctor = "0.1.22"
+exec = "0.3.1"
 
 [profile.release]
 debug = true

@@ -13,7 +13,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::null;
 
-fn to_cstring(data: &[u8]) -> Result<CString> {
+pub fn to_cstring(data: &[u8]) -> Result<CString> {
     CString::new(data).map_err(|e| {
         Error::new(
             ErrorKind::InvalidData,
