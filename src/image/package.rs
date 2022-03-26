@@ -74,21 +74,21 @@ impl<'a> Package<'a> {
         std::fs::create_dir("/tmp/worker/overlay")?;
 
         // Mount overlay
-        sys_mount::Mount::builder()
-            .fstype("overlay")
-            .data(
-                format!(
-                    "lowerdir={}/{},upperdir=/tmp/worker/user-area,workdir=/tmp/worker/work",
-                    self.image
-                        .mountpoint
-                        .to_str()
-                        .expect("Mountpoint must be a string"),
-                    self.name
-                )
-                .as_ref(),
-            )
-            .mount("overlay", "/tmp/worker/overlay")
-            .with_context(|| "Failed to mount overlay")?;
+        system::mount(
+            "overlay",
+            "/tmp/worker/overlay",
+            "overlay",
+            0,
+            Some(&format!(
+                "lowerdir={}/{},upperdir=/tmp/worker/user-area,workdir=/tmp/worker/work",
+                self.image
+                    .mountpoint
+                    .to_str()
+                    .expect("Mountpoint must be a string"),
+                self.name
+            )),
+        )
+        .with_context(|| "Failed to mount overlay")?;
 
         // Initialize user directory
         std::fs::create_dir("/tmp/worker/overlay/space")
@@ -452,6 +452,9 @@ impl Language<'_> {
                     .with_context(|| "Build schema didn't return string, as was expected")
                     .unwrap();
 
+                // TODO: log?
+                // println!("build output: {}", build_output);
+
                 let run_prerequisites: Vec<String> =
                     lisp::evaluate(self.config.run.prerequisites.clone(), &state)
                         .with_context(|| "Failed to evaluate prerequisites for running")
@@ -491,11 +494,7 @@ impl Language<'_> {
         self.package.remove_sandbox()?;
 
         let pattern = std::fs::read_to_string("/tmp/worker/artifacts/pattern.txt")
-            .with_context(|| "Failed to read pattern from /artifacts/pattern.txt")
-            .unwrap();
-
-        // TODO: log?
-        // println!("build output: {}", build_output);
+            .with_context(|| "Failed to read pattern from /artifacts/pattern.txt")?;
 
         let prerequisites: Vec<String> = lisp::evaluate(
             self.config.run.prerequisites.clone(),
@@ -592,7 +591,8 @@ fn exec(call: lisp::CallTerm, state: &lisp::State) -> Result<lisp::TypedRef, lis
         })?;
     if output.status.success() {
         Ok(lisp::TypedRef::new(
-            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stdout).into_owned()
+                + &String::from_utf8_lossy(&output.stderr), // TODO: interleave
         ))
     } else {
         Err(lisp::Error {
