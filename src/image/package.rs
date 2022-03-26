@@ -596,3 +596,16 @@ fn exec(call: lisp::CallTerm, state: &lisp::State) -> Result<lisp::TypedRef, lis
         })
     }
 }
+
+#[lisp::function]
+fn mv(call: lisp::CallTerm, state: &lisp::State) -> Result<lisp::TypedRef, lisp::Error> {
+    let argv = lisp::builtins::as_tuple2(call)?;
+    let from: String = lisp::evaluate(argv.0, state)?.to_native()?;
+    let to: String = lisp::evaluate(argv.1, state)?.to_native()?;
+    match std::fs::rename(&from, &to) {
+        Ok(()) => Ok(lisp::TypedRef::new(())),
+        Err(e) => Err(lisp::Error {
+            message: format!("Failed to move file {:?} to {:?}: {}", from, to, e),
+        }),
+    }
+}
