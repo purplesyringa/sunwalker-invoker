@@ -4,8 +4,8 @@ use crate::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use libc::{
-    c_int, gid_t, uid_t, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWUSER, SIGCONT, SIGSTOP,
-    WUNTRACED,
+    c_int, gid_t, uid_t, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER,
+    CLONE_NEWUTS, CLONE_SYSVSEM, SIGCONT, SIGSTOP, WUNTRACED,
 };
 use rand::{thread_rng, Rng};
 use std::io::BufRead;
@@ -158,9 +158,16 @@ impl<'a> Package<'a> {
         } else if child_pid == 0 {
             let panic = std::panic::catch_unwind(|| {
                 // Unshare namespaces
-                // TODO: CLONE_NEWPID, CLONE_NEWUTS, CLONE_SYSVSEM
                 if unsafe {
-                    libc::unshare(CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWUSER)
+                    libc::unshare(
+                        CLONE_NEWNS
+                            | CLONE_NEWIPC
+                            | CLONE_NEWNET
+                            | CLONE_NEWUSER
+                            | CLONE_NEWUTS
+                            | CLONE_SYSVSEM
+                            | CLONE_NEWPID,
+                    )
                 } != 0
                 {
                     panic!("Could not unshare mount namespace");
@@ -552,10 +559,13 @@ impl Language<'_> {
                     .with_context(|| "Failed to chdir to /space")
                     .unwrap();
 
-                (Err(exec::Command::new(&program.argv[0])
+                std::process::Command::new(&program.argv[0])
                     .args(&program.argv[1..])
-                    .exec()) as Result<i64, exec::Error>)
-                    .with_context(|| format!("Failed to start {:?}", program.argv))
+                    .spawn()
+                    .with_context(|| format!("Failed to spawn {:?}", program.argv))
+                    .unwrap()
+                    .wait()
+                    .with_context(|| format!("Failed to get exit code of {:?}", program.argv))
                     .unwrap();
             })
             .with_context(|| "In-process running failed")?;
