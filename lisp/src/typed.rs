@@ -96,6 +96,11 @@ impl LispType for i64 {
         "int".to_string()
     }
 }
+impl LispType for () {
+    fn get_type_name() -> String {
+        "nil".to_string()
+    }
+}
 
 pub struct Type {
     ty_id: std::any::TypeId,
@@ -268,6 +273,12 @@ impl NativeType for String {
 impl NativeType for i64 {
     fn from_lisp_ref(value: &TypedRef) -> Result<Self, Error> {
         value.to_concrete::<i64>()
+    }
+}
+
+impl NativeType for () {
+    fn from_lisp_ref(value: &TypedRef) -> Result<Self, Error> {
+        value.to_concrete::<()>()
     }
 }
 
