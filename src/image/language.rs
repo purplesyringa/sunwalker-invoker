@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 pub struct Language<'a> {
-    pub package: &'a package::Package<'a>,
+    pub package: package::Package<'a>,
     pub config: &'a config::Language,
     pub name: &'a str,
 }

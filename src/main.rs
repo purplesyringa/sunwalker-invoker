@@ -78,17 +78,13 @@ fn worker_main() -> Result<()> {
         let mounted_image = &mounted_image;
         pool.spawn_dedicated(corepool::Task {
             callback: Box::new(move || {
-                let package = mounted_image
-                    .get_package("gcc")
-                    .expect("Package gcc does not exist");
-
                 let sandbox_config = package::SandboxConfig {
                     max_size_in_bytes: 1024 * 1024,
                     max_inodes: 10 * 1024,
                     bound_files: Vec::new(),
                 };
 
-                let lang = package
+                let lang = mounted_image
                     .get_language("c++.20.gcc")
                     .expect("Failed to get language c++.20.gcc");
 

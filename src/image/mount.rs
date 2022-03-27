@@ -1,9 +1,10 @@
 use crate::{
-    image::{config::Config, package},
+    image::{config::Config, language, package},
     system,
 };
 use anyhow::{bail, Context, Result};
 use libc::{MS_RDONLY, MS_REC};
+use std::collections::HashMap;
 
 pub struct ImageMounter {
     inc: u64,
@@ -13,6 +14,7 @@ pub struct ImageMounter {
 pub struct MountedImage {
     pub mountpoint: std::path::PathBuf,
     pub config: Config,
+    pub language_to_package_name: HashMap<String, String>,
 }
 
 impl ImageMounter {
@@ -50,6 +52,7 @@ impl ImageMounter {
                 .with_context(|| "Bind-mounting image failed")?;
         } else if file_type.is_file() {
             // Mount as squashfs image
+            // TODO: unmount loop device on exit
             sys_mount::Mount::builder()
                 .flags(sys_mount::MountFlags::RDONLY)
                 .fstype("squashfs")
@@ -81,17 +84,35 @@ impl ImageMounter {
         }
 
         // Make sure that all the packages specified in the config are available
-        for (package_name, _) in &config.packages {
-            let mut package_path = mountpoint.clone();
-            package_path.push(package_name);
-            let meta = std::fs::metadata(package_path)
-                .with_context(|| format!("The image does not provide package {}", package_name))?;
-            if !meta.is_dir() {
-                bail!("Package {} requires the image to contain a subdirectory named {}, but it is not a directory", package_name, package_name);
+        let mut language_to_package_name = HashMap::new();
+        for (package_name, package) in &config.packages {
+            // TODO: uncomment this
+            // let mut package_path = mountpoint.clone();
+            // package_path.push(package_name);
+            // let meta = std::fs::metadata(package_path)
+            //     .with_context(|| format!("The image does not provide package {}", package_name))?;
+            // if !meta.is_dir() {
+            //     bail!("Package {} requires the image to contain a subdirectory named {}, but it is not a directory", package_name, package_name);
+            // }
+            for (lang_name, _) in &package.languages {
+                if let Some(old_package_name) =
+                    language_to_package_name.insert(lang_name.clone(), package_name.clone())
+                {
+                    bail!(
+                        "Collision detected: language {} is provided by two packages: {} and {}",
+                        lang_name,
+                        old_package_name,
+                        package_name
+                    );
+                }
             }
         }
 
-        Ok(MountedImage { mountpoint, config })
+        Ok(MountedImage {
+            mountpoint,
+            config,
+            language_to_package_name,
+        })
     }
 }
 
@@ -104,6 +125,14 @@ impl MountedImage {
 
     pub fn get_package<'a>(&'a self, name: &'a str) -> Result<package::Package<'a>> {
         package::Package::new(self, name)
+    }
+
+    pub fn get_language<'a>(&'a self, name: &'a str) -> Result<language::Language<'a>> {
+        let package_name = self
+            .language_to_package_name
+            .get(name)
+            .with_context(|| format!("The image does not provide language {}", name))?;
+        self.get_package(package_name)?.get_language(name)
     }
 }
 

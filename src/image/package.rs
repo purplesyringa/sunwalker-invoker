@@ -18,6 +18,7 @@ pub struct SandboxConfig {
     pub bound_files: Vec<(PathBuf, String)>,
 }
 
+#[derive(Clone)]
 pub struct Package<'a> {
     pub image: &'a mount::MountedImage,
     pub name: &'a str,
@@ -289,7 +290,7 @@ impl<'a> Package<'a> {
         }
     }
 
-    pub fn get_language(&'a self, language_name: &'a str) -> Result<language::Language<'a>> {
+    pub fn get_language(&self, language_name: &'a str) -> Result<language::Language<'a>> {
         let package = self
             .image
             .config
@@ -297,7 +298,7 @@ impl<'a> Package<'a> {
             .get(self.name)
             .with_context(|| format!("Package {} not found in the image", self.name))?;
         Ok(language::Language {
-            package: &self,
+            package: self.clone(),
             config: package.languages.get(language_name).with_context(|| {
                 format!(
                     "Packages {} does not provide language {}",
