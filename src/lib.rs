@@ -2,6 +2,7 @@
 
 pub mod image {
     pub mod config;
+    pub mod language;
     pub mod mount;
     pub mod package;
 }
