@@ -89,42 +89,30 @@ fn worker_main() -> Result<()> {
                 };
 
                 let lang = package
-                    .get_language("c++.17.gcc")
-                    .expect("Failed to get language c++.17.gcc");
+                    .get_language("c++.20.gcc")
+                    .expect("Failed to get language c++.20.gcc");
 
-                let program = lang
-                    .build(vec!["/tmp/hello-world.cpp"], &sandbox_config)
-                    .expect("Failed to build /tmp/hello-world.cpp as c++.17.gcc");
+                println!(
+                    "{}",
+                    lang.identify(&sandbox_config)
+                        .expect("Failed to identify lang")
+                );
 
-                lang.get_ready_to_run(&sandbox_config)
-                    .expect("Failed to get ready for running /tmp/hello-world.cpp as c++.17.gcc");
+                // let program = lang
+                //     .build(vec!["/tmp/hello-world.cpp"], &sandbox_config)
+                //     .expect("Failed to build /tmp/hello-world.cpp as c++.20.gcc");
 
-                lang.run(&sandbox_config, &program)
-                    .expect("Failed to run /tmp/hello-world.cpp as c++.17.gcc");
+                // lang.get_ready_to_run(&sandbox_config)
+                //     .expect("Failed to get ready for running /tmp/hello-world.cpp as c++.20.gcc");
 
-                lang.run(&sandbox_config, &program)
-                    .expect("Failed to run /tmp/hello-world.cpp as c++.17.gcc");
+                // lang.run(&sandbox_config, &program)
+                //     .expect("Failed to run /tmp/hello-world.cpp as c++.20.gcc");
 
-                lang.run(&sandbox_config, &program)
-                    .expect("Failed to run /tmp/hello-world.cpp as c++.17.gcc");
+                // lang.run(&sandbox_config, &program)
+                //     .expect("Failed to run /tmp/hello-world.cpp as c++.20.gcc");
 
-                // package
-                //     .enter(&sandbox_config)
-                //     .expect("Entering the package failed");
-
-                // std::fs::write(
-                //     "/test.cpp",
-                //     "#include <iostream>\nint main() {\n\tstd::cout << \"Hello, world!\" << std::endl;\n}\n",
-                // ).expect("write failed");
-
-                // std::process::Command::new("g++")
-                //     .arg("/test.cpp")
-                //     .arg("-o")
-                //     .arg("/test")
-                //     .output()
-                //     .expect("Spawning gcc failed");
-
-                // println!("Hello, world from #{}!", i);
+                // lang.run(&sandbox_config, &program)
+                //     .expect("Failed to run /tmp/hello-world.cpp as c++.20.gcc");
             }),
             group: String::from("default"),
         })

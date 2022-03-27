@@ -318,6 +318,43 @@ impl<'a> Package<'a> {
 }
 
 impl Language<'_> {
+    pub fn identify(&self, sandbox_config: &SandboxConfig) -> Result<String> {
+        // Make sandbox
+        self.package
+            .make_worker_tmp(&sandbox_config)
+            .with_context(|| format!("Failed to make /tmp/worker for identification"))?;
+        self.package
+            .make_sandbox(&sandbox_config)
+            .with_context(|| format!("Failed to make sandbox for identification"))?;
+
+        std::fs::write("/tmp/worker/overlay/identify.txt", "")?;
+        std::os::unix::fs::chown("/tmp/worker/overlay/identify.txt", Some(65534), Some(65534))?;
+
+        // Enter the sandbox in another process
+        self.package
+            .run_in_sandbox(&sandbox_config, || {
+                // Evaluate correct pattern
+                let identify: String =
+                    lisp::evaluate(self.config.identify.clone(), &lisp::State::new())
+                        .unwrap()
+                        .to_native()
+                        .unwrap();
+
+                // Output the pattern to /identify.txt
+                std::fs::write("/identify.txt", identify)
+                    .with_context(|| "Failed to write pattern to /identify.txt")
+                    .unwrap();
+            })
+            .with_context(|| "In-process build failed")?;
+
+        let identify = std::fs::read_to_string("/tmp/worker/overlay/identify.txt")
+            .with_context(|| "Failed to read pattern from /tmp/worker/overlay/identify.txt")?;
+
+        self.package.remove_sandbox()?;
+
+        Ok(identify)
+    }
+
     pub fn build(
         &self,
         mut input_files: Vec<&str>,
