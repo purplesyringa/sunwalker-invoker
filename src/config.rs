@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 pub struct Config {
-    pub runner: RunnerConfig,
+    pub invoker: InvokerConfig,
     pub image: ImageConfig,
     pub environment: EnvironmentConfig,
     pub conductor: ConductorConfig,
@@ -10,7 +10,7 @@ pub struct Config {
 }
 
 #[derive(Deserialize)]
-pub struct RunnerConfig {
+pub struct InvokerConfig {
     pub name: String,
 }
 

@@ -87,9 +87,9 @@ async fn main_loop(client: Arc<Client>) -> Result<()> {
         client.config.conductor.address
     );
 
-    let handshake: message::w2c::Message =
-        message::w2c::Message::Handshake(message::w2c::Handshake {
-            worker_name: client.config.runner.name.clone(),
+    let handshake: message::i2c::Message =
+        message::i2c::Message::Handshake(message::i2c::Handshake {
+            invoker_name: client.config.invoker.name.clone(),
         });
     conductor_ws
         .send(tungstenite::Message::Binary(rmp_serde::to_vec(&handshake)?))
@@ -100,7 +100,7 @@ async fn main_loop(client: Arc<Client>) -> Result<()> {
         match message {
             tungstenite::Message::Close(_) => break,
             tungstenite::Message::Binary(buf) => {
-                let message: message::c2w::Message = rmp_serde::from_slice(&buf)
+                let message: message::c2i::Message = rmp_serde::from_slice(&buf)
                     .with_context(|| "Failed to parse buffer as msgpack format")?;
                 handle_message(message, client.clone()).await?;
             }
@@ -172,8 +172,8 @@ async fn main_loop(client: Arc<Client>) -> Result<()> {
     // Ok(())
 }
 
-async fn handle_message(message: message::c2w::Message, client: Arc<Client>) -> Result<()> {
-    use message::c2w::*;
+async fn handle_message(message: message::c2i::Message, client: Arc<Client>) -> Result<()> {
+    use message::c2i::*;
 
     println!("{:?}", message);
 
@@ -190,7 +190,7 @@ async fn handle_message(message: message::c2w::Message, client: Arc<Client>) -> 
     Ok(())
 }
 
-async fn add_submission(message: message::c2w::AddSubmission, client: Arc<Client>) -> Result<()> {
+async fn add_submission(message: message::c2i::AddSubmission, client: Arc<Client>) -> Result<()> {
     if !client
         .config
         .environment
@@ -198,7 +198,7 @@ async fn add_submission(message: message::c2w::AddSubmission, client: Arc<Client
         .contains(&message.compilation_core)
     {
         bail!(
-            "Core {} is not dedicated to the runner and cannot be scheduled for compilation of a new submission",
+            "Core {} is not dedicated to the invoker and cannot be scheduled for compilation of a new submission",
             message.compilation_core
         );
     }
@@ -285,7 +285,7 @@ async fn add_submission(message: message::c2w::AddSubmission, client: Arc<Client
 }
 
 async fn push_to_judgment_queue(
-    message: message::c2w::PushToJudgementQueue,
+    message: message::c2i::PushToJudgementQueue,
     client: Arc<Client>,
 ) -> Result<()> {
     let mut core_workers = client.core_workers.write().await;
@@ -341,7 +341,7 @@ async fn push_to_judgment_queue(
 }
 
 async fn cancel_judgement_on_tests(
-    message: message::c2w::CancelJudgementOnTests,
+    message: message::c2i::CancelJudgementOnTests,
     client: Arc<Client>,
 ) -> Result<()> {
     let lock = client.core_workers.read().await;
@@ -373,7 +373,7 @@ async fn cancel_judgement_on_tests(
     Ok(())
 }
 
-async fn stop_cores(message: message::c2w::StopCores, client: Arc<Client>) -> Result<()> {
+async fn stop_cores(message: message::c2i::StopCores, client: Arc<Client>) -> Result<()> {
     let submissions = client.submissions.read().await;
 
     let submission_info = submissions.get(&message.submission_id).ok_or_else(|| {
@@ -405,7 +405,7 @@ async fn stop_cores(message: message::c2w::StopCores, client: Arc<Client>) -> Re
 }
 
 async fn finalize_submission(
-    message: message::c2w::FinalizeSubmission,
+    message: message::c2i::FinalizeSubmission,
     client: Arc<Client>,
 ) -> Result<()> {
     let mut submissions = client.submissions.write().await;

@@ -11,14 +11,14 @@ pub struct CLIArgs {
     pub config: String,
 }
 
-fn watchdog_main(worker_pid: libc::pid_t) -> Result<()> {
-    println!("Watchdog started for {}", worker_pid);
+fn watchdog_main(invoker_pid: libc::pid_t) -> Result<()> {
+    println!("Watchdog started for {}", invoker_pid);
 
     let mut status: c_int = 0;
-    if unsafe { libc::waitpid(worker_pid, &mut status as *mut c_int, libc::WUNTRACED) }
-        != worker_pid
+    if unsafe { libc::waitpid(invoker_pid, &mut status as *mut c_int, libc::WUNTRACED) }
+        != invoker_pid
     {
-        bail!("waitpid() failed when waiting for the worker to stop at bootstrap");
+        bail!("waitpid() failed when waiting for the invoker to stop at bootstrap");
     }
 
     // Initialization
@@ -26,14 +26,14 @@ fn watchdog_main(worker_pid: libc::pid_t) -> Result<()> {
         .with_context(|| "Failed to remove dangling cpusets at boot")?;
     cgroups::create_root_cpuset().with_context(|| "Failed to create root cpuset")?;
 
-    // CONT worker
-    if unsafe { libc::kill(worker_pid, libc::SIGCONT) } == -1 {
-        bail!("Failed to send SIGCONT to the worker at bootstrap");
+    // CONT invoker
+    if unsafe { libc::kill(invoker_pid, libc::SIGCONT) } == -1 {
+        bail!("Failed to send SIGCONT to the invoker at bootstrap");
     }
 
-    // Wait for the worker to stop
-    if unsafe { libc::waitpid(worker_pid, &mut status as *mut c_int, 0) } != worker_pid {
-        bail!("waitpid() failed when waiting for an event from worker");
+    // Wait for the invoker to stop
+    if unsafe { libc::waitpid(invoker_pid, &mut status as *mut c_int, 0) } != invoker_pid {
+        bail!("waitpid() failed when waiting for an event from invoker");
     }
 
     // TODO: handle exit status here
@@ -53,14 +53,14 @@ pub fn main() -> Result<()> {
 
     // Acquire a lock
     let lock_fd = fcntl::open(
-        "/tmp/sunwalker_runner.lock",
+        "/tmp/sunwalker_invoker.lock",
         fcntl::OFlag::O_CREAT | fcntl::OFlag::O_RDWR,
         nix::sys::stat::Mode::from_bits(0o600).unwrap(),
     )
-    .expect("Failed to open /tmp/sunwalker_runner.lock");
+    .expect("Failed to open /tmp/sunwalker_invoker.lock");
 
     fcntl::flock(lock_fd, fcntl::FlockArg::LockExclusiveNonblock)
-        .expect("/tmp/sunwalker_runner.lock is already locked by another process (is sunwalker already running?)");
+        .expect("/tmp/sunwalker_invoker.lock is already locked by another process (is sunwalker already running?)");
 
     // Spawn a watchdog
     let child_pid = unsafe { libc::fork() };
@@ -78,6 +78,6 @@ pub fn main() -> Result<()> {
     } else {
         watchdog_main(child_pid)?;
         fcntl::flock(lock_fd, fcntl::FlockArg::Unlock)
-            .with_context(|| "/tmp/sunwalker_runner.lock could not be unlocked")
+            .with_context(|| "/tmp/sunwalker_invoker.lock could not be unlocked")
     }
 }

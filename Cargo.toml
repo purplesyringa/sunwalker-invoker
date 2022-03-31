@@ -1,5 +1,5 @@
 [package]
-name = "sunwalker_runner"
+name = "sunwalker_invoker"
 version = "0.1.0"
 edition = "2021"
 authors = ["Ivanq <imachug@gmail.com>"]

@@ -10,7 +10,7 @@ pub enum Message {
 
 #[derive(Debug, Serialize)]
 pub struct Handshake {
-    pub worker_name: String,
+    pub invoker_name: String,
 }
 
 #[derive(Debug, Serialize)]

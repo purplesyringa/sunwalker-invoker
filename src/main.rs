@@ -1,5 +1,5 @@
 use anyhow::Result;
 
 fn main() -> Result<()> {
-    sunwalker_runner::init::main()
+    sunwalker_invoker::init::main()
 }

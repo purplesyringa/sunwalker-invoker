@@ -19,8 +19,8 @@ mod corepool;
 pub mod init;
 
 mod message {
-    pub(crate) mod c2w;
-    pub(crate) mod w2c;
+    pub(crate) mod c2i;
+    pub(crate) mod i2c;
 }
 
 mod problem {
