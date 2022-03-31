@@ -48,6 +48,15 @@ pub fn enter_worker_space(sandbox_config: SandboxConfig) -> Result<WorkerSpace> 
     )
     .with_context(|| "Mounting tmpfs on /tmp/worker failed")?;
 
+    // Switch to core
+    let pid = unsafe { libc::getpid() };
+    cgroups::add_task_to_core(pid, sandbox_config.core).with_context(|| {
+        format!(
+            "Failed to move current process (PID {}) to core {}",
+            pid, sandbox_config.core
+        )
+    })?;
+
     Ok(WorkerSpace { sandbox_config })
 }
 
@@ -110,17 +119,6 @@ impl WorkerSpace {
 impl RootFS<'_> {
     pub async fn run_isolated<F: FnOnce() -> () + Send + UnwindSafe>(&self, f: F) -> Result<()> {
         let child = process::scoped_async(|| {
-            // Switch to core
-            let pid = unsafe { libc::getpid() };
-            cgroups::add_task_to_core(pid, self.worker_space.sandbox_config.core)
-                .with_context(|| {
-                    format!(
-                        "Failed to move current process (PID {}) to core {}",
-                        pid, self.worker_space.sandbox_config.core
-                    )
-                })
-                .unwrap();
-
             // Unshare namespaces
             if unsafe {
                 libc::unshare(
