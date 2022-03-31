@@ -1,37 +1,39 @@
 use crate::{
-    image::{config, package},
+    image::{config, package, sandbox},
     system,
 };
 use anyhow::{anyhow, Context, Result};
+use ouroboros::self_referencing;
 use rand::{thread_rng, Rng};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-pub struct Language<'a> {
-    pub package: package::Package<'a>,
-    pub config: &'a config::Language,
-    pub name: &'a str,
+#[self_referencing(pub_extras)]
+pub struct LanguageImpl {
+    pub(crate) package: package::Package,
+    #[borrows(package)]
+    pub(crate) config: &'this config::Language,
+    pub(crate) name: String,
 }
 
-impl Language<'_> {
-    pub fn identify(&self, sandbox_config: &package::SandboxConfig) -> Result<String> {
+impl LanguageImpl {
+    pub async fn identify(&self, worker_space: &sandbox::WorkerSpace) -> Result<String> {
+        let package = self.borrow_package();
+
         // Make sandbox
-        self.package
-            .make_worker_tmp(&sandbox_config)
-            .with_context(|| format!("Failed to make /tmp/worker for identification"))?;
-        self.package
-            .make_sandbox(&sandbox_config)
+        let rootfs = worker_space
+            .make_rootfs(package, Vec::new())
             .with_context(|| format!("Failed to make sandbox for identification"))?;
 
         std::fs::write("/tmp/worker/overlay/identify.txt", "")?;
         std::os::unix::fs::chown("/tmp/worker/overlay/identify.txt", Some(65534), Some(65534))?;
 
         // Enter the sandbox in another process
-        self.package
-            .run_in_sandbox(&sandbox_config, || {
+        rootfs
+            .run_isolated(|| {
                 // Evaluate correct pattern
                 let identify: String =
-                    lisp::evaluate(self.config.identify.clone(), &lisp::State::new())
+                    lisp::evaluate(self.borrow_config().identify.clone(), &lisp::State::new())
                         .unwrap()
                         .to_native()
                         .unwrap();
@@ -41,28 +43,33 @@ impl Language<'_> {
                     .with_context(|| "Failed to write pattern to /identify.txt")
                     .unwrap();
             })
+            .await
             .with_context(|| "In-process build failed")?;
 
         let identify = std::fs::read_to_string("/tmp/worker/overlay/identify.txt")
             .with_context(|| "Failed to read pattern from /tmp/worker/overlay/identify.txt")?;
 
-        self.package.remove_sandbox()?;
+        rootfs.remove()?;
 
         Ok(identify)
     }
 
-    pub fn build(
+    pub async fn build(
         &self,
         mut input_files: Vec<&str>,
-        sandbox_config: &package::SandboxConfig,
+        worker_space: &sandbox::WorkerSpace,
     ) -> Result<Program> {
+        let package = self.borrow_package();
+        let config = self.borrow_config();
+        let name = self.borrow_name();
+
         // Map input files to patterned filenames based on extension
         let mut patterns_by_extension = Vec::new();
-        for input_pattern in &self.config.inputs {
+        for input_pattern in &config.inputs {
             let suffix = input_pattern.rsplit_once("%").ok_or_else(|| {
                 anyhow!(
                     "Input file pattern {} (derived from Makefile of package {}, language {}) does not contain glob character %",
-                    input_pattern, self.package.name, self.name
+                    input_pattern, package.name, name
                 )
             })?.1;
             patterns_by_extension.push((input_pattern, suffix));
@@ -83,7 +90,7 @@ impl Language<'_> {
                         "No input file ends with {} (derived from pattern {}). This requirement is because language {} accepts multiple input files.",
                         suffix,
                         input_pattern,
-                        self.name
+                        name
                     )
                 })?.0;
             let input_file = input_files.remove(i);
@@ -96,20 +103,17 @@ impl Language<'_> {
         let pre_pattern = pre_pattern.map(|x| format!("{:02x}", x)).join("");
 
         // Mount input files into sandbox
-        let mut build_sandbox_config = sandbox_config.clone();
+        let mut bound_files = Vec::new();
         for (input_file, input_pattern) in &files_and_patterns {
-            build_sandbox_config.bound_files.push((
+            bound_files.push((
                 input_file.into(),
                 "/space/".to_string() + &input_pattern.replace("%", &pre_pattern),
             ));
         }
 
         // Make sandbox
-        self.package
-            .make_worker_tmp(&build_sandbox_config)
-            .with_context(|| format!("Failed to make /tmp/worker for build"))?;
-        self.package
-            .make_sandbox(&build_sandbox_config)
+        let rootfs = worker_space
+            .make_rootfs(package, bound_files)
             .with_context(|| format!("Failed to make sandbox for build"))?;
 
         // Add /artifacts -> /tmp/worker/artifacts
@@ -123,11 +127,11 @@ impl Language<'_> {
         std::os::unix::fs::chown("/tmp/worker/overlay/artifacts", Some(65534), Some(65534))?;
 
         // Enter the sandbox in another process
-        self.package
-            .run_in_sandbox(&build_sandbox_config, || {
+        rootfs
+            .run_isolated(|| {
                 // Evaluate correct pattern
                 let pattern: String = lisp::evaluate(
-                    self.config.base_rule.clone(),
+                    config.base_rule.clone(),
                     &lisp::State::new().var("$base".to_string(), pre_pattern.clone()),
                 )
                 .unwrap()
@@ -168,7 +172,7 @@ impl Language<'_> {
 
                 // Run build process
                 let state = lisp::State::new().var("$base".to_string(), pattern.clone());
-                let build_output: String = lisp::evaluate(self.config.build.clone(), &state)
+                let build_output: String = lisp::evaluate(config.build.clone(), &state)
                     .with_context(|| "Failed to evaluate build schema")
                     .unwrap()
                     .to_native()
@@ -179,7 +183,7 @@ impl Language<'_> {
                 // println!("build output: {}", build_output);
 
                 let run_prerequisites: Vec<String> =
-                    lisp::evaluate(self.config.run.prerequisites.clone(), &state)
+                    lisp::evaluate(config.run.prerequisites.clone(), &state)
                         .with_context(|| "Failed to evaluate prerequisites for running")
                         .unwrap()
                         .to_native()
@@ -212,15 +216,16 @@ impl Language<'_> {
                     .with_context(|| "Failed to write pattern to /artifacts/pattern.txt")
                     .unwrap();
             })
+            .await
             .with_context(|| "In-process build failed")?;
 
-        self.package.remove_sandbox()?;
+        rootfs.remove()?;
 
         let pattern = std::fs::read_to_string("/tmp/worker/artifacts/pattern.txt")
             .with_context(|| "Failed to read pattern from /artifacts/pattern.txt")?;
 
         let prerequisites: Vec<String> = lisp::evaluate(
-            self.config.run.prerequisites.clone(),
+            config.run.prerequisites.clone(),
             &lisp::State::new().var("$base".to_string(), pattern.clone()),
         )
         .with_context(|| "Failed to evaluate run.prerequisites")?
@@ -230,7 +235,7 @@ impl Language<'_> {
         })?;
 
         let argv: Vec<String> = lisp::evaluate(
-            self.config.run.argv.clone(),
+            config.run.argv.clone(),
             &lisp::State::new().var("$base".to_string(), pattern.clone()),
         )
         .with_context(|| "Failed to evaluate run.argv")?
@@ -243,40 +248,22 @@ impl Language<'_> {
         })
     }
 
-    pub fn get_ready_to_run(&self, sandbox_config: &package::SandboxConfig) -> Result<()> {
-        let mut run_sandbox_config = sandbox_config.clone();
-
-        for artifact_entry in std::fs::read_dir("/tmp/worker/artifacts")? {
-            let artifact_entry = artifact_entry?;
-            let artifact_name = artifact_entry
-                .file_name()
-                .into_string()
-                .map_err(|e| anyhow!("Failed to parse artifact name {:?} as UTF-8 string", e))?;
-            run_sandbox_config.bound_files.push((
-                format!("/tmp/worker/artifacts/{}", artifact_name).into(),
-                format!("/space/{}", artifact_name).into(),
-            ));
-        }
-
-        self.package
-            .make_sandbox(&run_sandbox_config)
-            .with_context(|| "Failed to make sandbox for running")?;
-
-        Ok(())
-    }
-
-    pub fn run(&self, sandbox_config: &package::SandboxConfig, program: &Program) -> Result<()> {
-        let mut run_sandbox_config = sandbox_config.clone();
+    pub async fn run(&self, worker_space: &sandbox::WorkerSpace, program: &Program) -> Result<()> {
+        let mut bound_files = Vec::new();
         for prerequisite in &program.prerequisites {
-            run_sandbox_config.bound_files.push((
+            bound_files.push((
                 format!("/tmp/worker/artifacts/{}", prerequisite).into(),
                 format!("/space/{}", prerequisite),
             ));
         }
 
+        let rootfs = worker_space
+            .make_rootfs(self.borrow_package(), bound_files)
+            .with_context(|| format!("Failed to make sandbox for running"))?;
+
         // Enter the sandbox in another process
-        self.package
-            .run_in_sandbox(&sandbox_config, || {
+        rootfs
+            .run_isolated(|| {
                 std::env::set_current_dir("/space")
                     .with_context(|| "Failed to chdir to /space")
                     .unwrap();
@@ -290,9 +277,69 @@ impl Language<'_> {
                     .with_context(|| format!("Failed to get exit code of {:?}", program.argv))
                     .unwrap();
             })
+            .await
             .with_context(|| "In-process running failed")?;
 
+        rootfs.remove()?;
+
         Ok(())
+    }
+}
+
+pub struct Language {
+    nested: LanguageImpl,
+}
+
+impl Language {
+    pub fn new(package: package::Package, name: &str) -> Result<Language> {
+        package
+            .image
+            .config
+            .packages
+            .get(&package.name)
+            .with_context(|| format!("Package {} not found in the image", package.name))?
+            .languages
+            .get(name)
+            .with_context(|| {
+                format!(
+                    "Packages {} does not provide language {}",
+                    package.name, name
+                )
+            })?;
+
+        Ok(Language {
+            nested: LanguageImpl::new(
+                package,
+                |package| {
+                    package
+                        .image
+                        .config
+                        .packages
+                        .get(&package.name)
+                        .unwrap()
+                        .languages
+                        .get(name)
+                        .unwrap()
+                },
+                name.to_string(),
+            ),
+        })
+    }
+
+    pub async fn identify(&self, worker_space: &sandbox::WorkerSpace) -> Result<String> {
+        self.nested.identify(worker_space).await
+    }
+
+    pub async fn build(
+        &self,
+        input_files: Vec<&str>,
+        worker_space: &sandbox::WorkerSpace,
+    ) -> Result<Program> {
+        self.nested.build(input_files, worker_space).await
+    }
+
+    pub async fn run(&self, worker_space: &sandbox::WorkerSpace, program: &Program) -> Result<()> {
+        self.nested.run(worker_space, program).await
     }
 }
 

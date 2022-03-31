@@ -1,10 +1,11 @@
 use crate::{
-    image::{config::Config, language, package},
+    image::{config, language, package},
     system,
 };
 use anyhow::{bail, Context, Result};
 use libc::{MS_RDONLY, MS_REC};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub struct ImageMounter {
     inc: u64,
@@ -13,7 +14,7 @@ pub struct ImageMounter {
 #[derive(Debug)]
 pub struct MountedImage {
     pub mountpoint: std::path::PathBuf,
-    pub config: Config,
+    pub config: config::Config,
     pub language_to_package_name: HashMap<String, String>,
 }
 
@@ -27,10 +28,10 @@ impl ImageMounter {
         std::path::PathBuf::from("/tmp/image-".to_owned() + &self.inc.to_string())
     }
 
-    pub fn mount<P: AsRef<std::path::Path>>(
+    pub fn mount<'a, P: AsRef<std::path::Path>>(
         &mut self,
         source_path: P,
-        config: Config,
+        config: config::Config,
     ) -> Result<MountedImage> {
         let attr = std::fs::metadata(&source_path).with_context(|| {
             format!(
@@ -123,16 +124,13 @@ impl MountedImage {
         path.exists()
     }
 
-    pub fn get_package<'a>(&'a self, name: &'a str) -> Result<package::Package<'a>> {
-        package::Package::new(self, name)
-    }
-
-    pub fn get_language<'a>(&'a self, name: &'a str) -> Result<language::Language<'a>> {
-        let package_name = self
+    pub fn get_language(image: Arc<MountedImage>, name: String) -> Result<language::Language> {
+        let package_name = image
             .language_to_package_name
-            .get(name)
-            .with_context(|| format!("The image does not provide language {}", name))?;
-        self.get_package(package_name)?.get_language(name)
+            .get(&name)
+            .with_context(|| format!("The image does not provide language {}", name))?
+            .clone();
+        package::Package::new(image, package_name)?.get_language(&name)
     }
 }
 

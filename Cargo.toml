@@ -2,6 +2,9 @@
 name = "sunwalker_runner"
 version = "0.1.0"
 edition = "2021"
+authors = ["Ivanq <imachug@gmail.com>"]
+license = "GPL-3.0-or-later"
+description = "Invoker for sunwalker judge system"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -16,6 +19,18 @@ crossbeam = "0.8.1"
 lisp = { path = "lisp" }
 ctor = "0.1.22"
 exec = "0.3.1"
+tokio-tungstenite = { version = "0.17.1", features = ["native-tls"] }
+tungstenite = { version = "0.17.1", features = ["native-tls"] }
+clap = { version = "3.1.6", features = ["derive"] }
+toml = "0.5.8"
+serde = { version = "1.0", features = ["derive"] }
+parse-size = "1.0.0"
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3.21"
+rmp-serde = "1.0.0"
+tokio-fork = "0.2.1"
+ouroboros = "0.15.0"
+futures = "0.3.21"
 
 [profile.release]
 debug = true

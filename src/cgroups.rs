@@ -131,14 +131,14 @@ impl AffineCPUSet {
     }
 
     pub fn add_task(&self, tid: pid_t) -> Result<()> {
-        let path = format!("{}/sunwalker_cpu_{}/tasks", CPUSET_ROOT, self.core);
-        std::fs::write(path, tid.to_string()).with_context(|| {
-            format!(
-                "Could not set affinity of task {} to CPU {}",
-                tid, self.core
-            )
-        })
+        add_task_to_core(tid, self.core)
     }
+}
+
+pub fn add_task_to_core(tid: pid_t, core: u64) -> Result<()> {
+    let path = format!("{}/sunwalker_cpu_{}/tasks", CPUSET_ROOT, core);
+    std::fs::write(path, tid.to_string())
+        .with_context(|| format!("Could not set affinity of task {} to CPU {}", tid, core))
 }
 
 pub fn drop_existing_affine_cpusets() -> Result<()> {
