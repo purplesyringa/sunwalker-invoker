@@ -23,26 +23,37 @@ pub fn client_main(cli_args: init::CLIArgs) -> Result<()> {
 
     enter_sandbox()?;
 
-    let image_cfg = std::fs::read_to_string(&config.image.config)
-        .with_context(|| {
-            format!("Could not read file image.cfg from path {} (this path is from field image.config of the configuration file)", config.image.config)
-        })?;
-    let image_cfg = image::config::Config::load(&image_cfg)
-        .with_context(|| {
-            format!("Could not load image.cfg as a script from path {} (this path is from field image.config of the configuration file)", config.image.config)
-        })?;
+    let image_cfg = std::fs::read_to_string(&config.image.config).with_context(|| {
+        format!(
+            "Could not read file image.cfg from path {} (this path is from field image.config of \
+             the configuration file)",
+            config.image.config
+        )
+    })?;
+    let image_cfg = image::config::Config::load(&image_cfg).with_context(|| {
+        format!(
+            "Could not load image.cfg as a script from path {} (this path is from field \
+             image.config of the configuration file)",
+            config.image.config
+        )
+    })?;
 
     let mut mnt = image::mount::ImageMounter::new();
-    let mounted_image = Arc::new(mnt
-        .mount(&config.image.path, image_cfg)
-        .with_context(|| {
-            format!("Could not mount image.sfs from path {} (this path is from field image.path of the configuration file)", config.image.path)
-        })?);
+    let mounted_image = Arc::new(mnt.mount(&config.image.path, image_cfg).with_context(|| {
+        format!(
+            "Could not mount image.sfs from path {} (this path is from field image.path of the \
+             configuration file)",
+            config.image.path
+        )
+    })?);
 
-    cgroups::isolate_cores(&config.environment.cpu_cores)
-        .with_context(|| {
-            format!("Failed to isolate CPU cores {:?} (this list is from field environment.cpu_cores of the configuration file)", config.environment.cpu_cores)
-        })?;
+    cgroups::isolate_cores(&config.environment.cpu_cores).with_context(|| {
+        format!(
+            "Failed to isolate CPU cores {:?} (this list is from field environment.cpu_cores of \
+             the configuration file)",
+            config.environment.cpu_cores
+        )
+    })?;
 
     let mut cpusets = Vec::new();
     for core in &config.environment.cpu_cores {
@@ -52,9 +63,14 @@ pub fn client_main(cli_args: init::CLIArgs) -> Result<()> {
         );
     }
 
-    let problem_store = problem::store::ProblemStore::new(std::path::PathBuf::from(&config.cache.problems))
+    let problem_store =
+        problem::store::ProblemStore::new(std::path::PathBuf::from(&config.cache.problems))
             .with_context(|| {
-                format!("Failed to create problem store with cache at {} (this path if from field cache.problems of the configuration file)", config.cache.problems)
+                format!(
+                    "Failed to create problem store with cache at {} (this path if from field \
+                     cache.problems of the configuration file)",
+                    config.cache.problems
+                )
             })?;
 
     let ephemeral_disk_space: u64 = config
@@ -77,9 +93,14 @@ pub fn client_main(cli_args: init::CLIArgs) -> Result<()> {
 
 #[tokio::main]
 async fn main_loop(client: Arc<Client>) -> Result<()> {
-    let (mut conductor_ws, _) = tokio_tungstenite::connect_async(&client.config.conductor.address).await
+    let (mut conductor_ws, _) = tokio_tungstenite::connect_async(&client.config.conductor.address)
+        .await
         .with_context(|| {
-            format!("Failed to connect to the conductor via a websocket at {:?} (this address if from field conductor.address of the configuration file)", client.config.conductor.address)
+            format!(
+                "Failed to connect to the conductor via a websocket at {:?} (this address if from \
+                 field conductor.address of the configuration file)",
+                client.config.conductor.address
+            )
         })?;
 
     println!(
@@ -198,7 +219,8 @@ async fn add_submission(message: message::c2i::AddSubmission, client: Arc<Client
         .contains(&message.compilation_core)
     {
         bail!(
-            "Core {} is not dedicated to the invoker and cannot be scheduled for compilation of a new submission",
+            "Core {} is not dedicated to the invoker and cannot be scheduled for compilation of a \
+             new submission",
             message.compilation_core
         );
     }
@@ -270,7 +292,8 @@ async fn add_submission(message: message::c2i::AddSubmission, client: Arc<Client
             let mut lock = client.core_workers.write().await;
             if let Some(_) = lock.insert(message.compilation_core, core_worker.clone()) {
                 bail!(
-                    "Core {} is already in use and cannot be scheduled for compilation of a new submission",
+                    "Core {} is already in use and cannot be scheduled for compilation of a new \
+                     submission",
                     message.compilation_core
                 );
             }
@@ -294,8 +317,11 @@ async fn push_to_judgment_queue(
         Some(core_worker) => {
             if core_worker.submission_info.id != message.submission_id {
                 bail!(
-                    "Core {} is working on submission {} at the moment, cannot schedule judgement of the submission {} on the same core",
-                    message.core, core_worker.submission_info.id, message.submission_id
+                    "Core {} is working on submission {} at the moment, cannot schedule judgement \
+                     of the submission {} on the same core",
+                    message.core,
+                    core_worker.submission_info.id,
+                    message.submission_id
                 );
             }
 
@@ -308,7 +334,11 @@ async fn push_to_judgment_queue(
                 .await
                 .get(&message.submission_id)
                 .ok_or_else(|| {
-                    anyhow!("PushToJudgementQueue called for an unknown (or already finalized) submission {}", message.submission_id)
+                    anyhow!(
+                        "PushToJudgementQueue called for an unknown (or already finalized) \
+                         submission {}",
+                        message.submission_id
+                    )
                 })?
                 .clone();
 
@@ -345,19 +375,21 @@ async fn cancel_judgement_on_tests(
     client: Arc<Client>,
 ) -> Result<()> {
     let lock = client.core_workers.read().await;
-    let core_worker = lock
-        .get(&message.core)
-        .ok_or_else(|| {
-            anyhow!(
-                "Core {} was not initialized by the conductor beforehand (or has already been deinitialized)",
-                message.core
-            )
-        })?;
+    let core_worker = lock.get(&message.core).ok_or_else(|| {
+        anyhow!(
+            "Core {} was not initialized by the conductor beforehand (or has already been \
+             deinitialized)",
+            message.core
+        )
+    })?;
 
     if core_worker.submission_info.id != message.submission_id {
         bail!(
-            "Core {} is working on submission {} at the moment, cannot schedule judgement of the submission {} on the same core",
-            message.core, core_worker.submission_info.id, message.submission_id
+            "Core {} is working on submission {} at the moment, cannot schedule judgement of the \
+             submission {} on the same core",
+            message.core,
+            core_worker.submission_info.id,
+            message.submission_id
         );
     }
 

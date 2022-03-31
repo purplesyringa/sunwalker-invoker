@@ -59,8 +59,10 @@ pub fn main() -> Result<()> {
     )
     .expect("Failed to open /tmp/sunwalker_invoker.lock");
 
-    fcntl::flock(lock_fd, fcntl::FlockArg::LockExclusiveNonblock)
-        .expect("/tmp/sunwalker_invoker.lock is already locked by another process (is sunwalker already running?)");
+    fcntl::flock(lock_fd, fcntl::FlockArg::LockExclusiveNonblock).expect(
+        "/tmp/sunwalker_invoker.lock is already locked by another process (is sunwalker already \
+         running?)",
+    );
 
     // Spawn a watchdog
     let child_pid = unsafe { libc::fork() };

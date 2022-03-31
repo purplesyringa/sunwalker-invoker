@@ -124,7 +124,13 @@ impl AffineCPUSet {
                 )
             })
         {
-            println!("[!] Failed to acquire exclusive access to core {} from the kernel. This usually indicates the presence of tasks with explicit CPU affinity. Make sure you do not have any such services running, or their list of CPU cores is limited. Docker is a common cause of the problem.\n{:?}", core, e);
+            println!(
+                "[!] Failed to acquire exclusive access to core {} from the kernel. This usually \
+                 indicates the presence of tasks with explicit CPU affinity. Make sure you do not \
+                 have any such services running, or their list of CPU cores is limited. Docker is \
+                 a common cause of the problem.\n{:?}",
+                core, e
+            );
         }
 
         Ok(AffineCPUSet { core })
@@ -232,7 +238,10 @@ pub fn isolate_cores(isolated_cores: &Vec<u64>) -> Result<()> {
     }
 
     if not_isolated_cores.is_empty() {
-        bail!("Cannot isolate all cores, at least one core should be devoted to general purpose tasks");
+        bail!(
+            "Cannot isolate all cores, at least one core should be devoted to general purpose \
+             tasks"
+        );
     }
 
     let not_isolated_cores = format_cpuset_list(Vec::from_iter(not_isolated_cores.iter().cloned()));

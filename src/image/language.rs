@@ -66,12 +66,18 @@ impl LanguageImpl {
         // Map input files to patterned filenames based on extension
         let mut patterns_by_extension = Vec::new();
         for input_pattern in &config.inputs {
-            let suffix = input_pattern.rsplit_once("%").ok_or_else(|| {
-                anyhow!(
-                    "Input file pattern {} (derived from Makefile of package {}, language {}) does not contain glob character %",
-                    input_pattern, package.name, name
-                )
-            })?.1;
+            let suffix = input_pattern
+                .rsplit_once("%")
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Input file pattern {} (derived from Makefile of package {}, language {}) \
+                         does not contain glob character %",
+                        input_pattern,
+                        package.name,
+                        name
+                    )
+                })?
+                .1;
             patterns_by_extension.push((input_pattern, suffix));
         }
 
@@ -87,12 +93,14 @@ impl LanguageImpl {
                 .find(|(_, input_file)| input_file.ends_with(suffix))
                 .ok_or_else(|| {
                     anyhow!(
-                        "No input file ends with {} (derived from pattern {}). This requirement is because language {} accepts multiple input files.",
+                        "No input file ends with {} (derived from pattern {}). This requirement \
+                         is because language {} accepts multiple input files.",
                         suffix,
                         input_pattern,
                         name
                     )
-                })?.0;
+                })?
+                .0;
             let input_file = input_files.remove(i);
             files_and_patterns.push((input_file, input_pattern));
         }
