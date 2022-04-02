@@ -80,6 +80,6 @@ pub fn main() -> Result<()> {
     } else {
         watchdog_main(child_pid)?;
         fcntl::flock(lock_fd, fcntl::FlockArg::Unlock)
-            .with_context(|| "/tmp/sunwalker_invoker.lock could not be unlocked")
+            .with_context(|| "Failed to unlock /tmp/sunwalker_invoker.lock")
     }
 }

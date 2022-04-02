@@ -2,7 +2,6 @@ use anyhow::{bail, Context, Result};
 use libc::{c_int, pid_t};
 use std::marker::PhantomData;
 use std::panic::UnwindSafe;
-pub use tokio_fork::Child;
 
 pub fn spawn<F: FnOnce() -> () + Send + UnwindSafe + 'static>(f: F) -> Result<pid_t> {
     let child_pid = unsafe { libc::fork() };

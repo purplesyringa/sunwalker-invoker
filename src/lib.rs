@@ -2,9 +2,11 @@
 
 mod image {
     pub(crate) mod config;
+    pub(crate) mod image;
     pub(crate) mod language;
     pub(crate) mod mount;
     pub(crate) mod package;
+    pub(crate) mod program;
     pub(crate) mod sandbox;
 }
 
@@ -16,7 +18,11 @@ mod config;
 
 mod corepool;
 
+mod errors;
+
 pub mod init;
+
+mod ipc;
 
 mod message {
     pub(crate) mod c2i;
@@ -30,6 +36,8 @@ mod problem {
 }
 
 mod process;
+
+mod submission;
 
 mod system;
 

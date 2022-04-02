@@ -4,8 +4,8 @@ use serde::Serialize;
 pub enum Message {
     Handshake(Handshake),
     UpdateMode(UpdateMode),
-    PushCompilationStatus(PushCompilationStatus),
-    PushTestStatus(PushTestStatus),
+    NotifyCompilationStatus(NotifyCompilationStatus),
+    NotifyTestStatus(NotifyTestStatus),
 }
 
 #[derive(Debug, Serialize)]
@@ -21,14 +21,14 @@ pub struct UpdateMode {
 }
 
 #[derive(Debug, Serialize)]
-pub struct PushCompilationStatus {
+pub struct NotifyCompilationStatus {
     pub submission_id: String,
     pub success: bool,
-    pub status: String,
+    pub log: String,
 }
 
 #[derive(Debug, Serialize)]
-pub struct PushTestStatus {
+pub struct NotifyTestStatus {
     pub submission_id: String,
     pub test: u64,
     pub verdict: String,

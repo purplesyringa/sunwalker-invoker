@@ -6,7 +6,6 @@ pub enum Message {
     AddSubmission(AddSubmission),
     PushToJudgementQueue(PushToJudgementQueue),
     CancelJudgementOnTests(CancelJudgementOnTests),
-    StopCores(StopCores),
     FinalizeSubmission(FinalizeSubmission),
 }
 
@@ -28,15 +27,8 @@ pub struct PushToJudgementQueue {
 
 #[derive(Debug, Deserialize)]
 pub struct CancelJudgementOnTests {
-    pub core: u64,
     pub submission_id: String,
     pub failed_tests: Vec<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct StopCores {
-    pub cores: Vec<u64>,
-    pub submission_id: String,
 }
 
 #[derive(Debug, Deserialize)]

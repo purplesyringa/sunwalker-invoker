@@ -1,21 +1,13 @@
 use crate::{
-    image::{config, language, package},
+    image::{config, image},
     system,
 };
 use anyhow::{bail, Context, Result};
 use libc::{MS_RDONLY, MS_REC};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 pub struct ImageMounter {
     inc: u64,
-}
-
-#[derive(Debug)]
-pub struct MountedImage {
-    pub mountpoint: std::path::PathBuf,
-    pub config: config::Config,
-    pub language_to_package_name: HashMap<String, String>,
 }
 
 impl ImageMounter {
@@ -32,7 +24,7 @@ impl ImageMounter {
         &mut self,
         source_path: P,
         config: config::Config,
-    ) -> Result<MountedImage> {
+    ) -> Result<image::Image> {
         let attr = std::fs::metadata(&source_path).with_context(|| {
             format!(
                 "Cannot get matadata of {:?} (does the file exist?)",
@@ -109,36 +101,11 @@ impl ImageMounter {
             }
         }
 
-        Ok(MountedImage {
+        Ok(image::Image {
             mountpoint,
             config,
             language_to_package_name,
+            // owned: true,
         })
-    }
-}
-
-impl MountedImage {
-    pub fn has_package(&self, package: &str) -> bool {
-        let mut path = self.mountpoint.clone();
-        path.push(package);
-        path.exists()
-    }
-
-    pub fn get_language(image: Arc<MountedImage>, name: String) -> Result<language::Language> {
-        let package_name = image
-            .language_to_package_name
-            .get(&name)
-            .with_context(|| format!("The image does not provide language {}", name))?
-            .clone();
-        package::Package::new(image, package_name)?.get_language(&name)
-    }
-}
-
-impl Drop for MountedImage {
-    fn drop(&mut self) {
-        // TODO: add logging
-        system::umount(&self.mountpoint)
-            .or_else(|_| system::umount_opt(&self.mountpoint, system::MNT_DETACH))
-            .expect(&format!("Unmounting {:?} failed", self));
     }
 }

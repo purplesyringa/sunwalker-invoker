@@ -1,14 +1,15 @@
-use crate::{cgroups, image::package, process, system};
-use anyhow::{anyhow, bail, Context, Result};
+use crate::{cgroups, errors, image::package, process, system};
+use anyhow::{anyhow, bail, Context};
 use libc::{
     c_int, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, CLONE_NEWUTS,
     CLONE_SYSVSEM, SIGCONT, SIGSTOP, WUNTRACED,
 };
+use serde::{Deserialize, Serialize};
 use std::io::BufRead;
 use std::panic::UnwindSafe;
 use std::path::PathBuf;
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct SandboxConfig {
     pub max_size_in_bytes: u64,
     pub max_inodes: u64,
@@ -24,11 +25,11 @@ pub struct RootFS<'a> {
     removed: bool,
 }
 
-pub fn enter_worker_space(sandbox_config: SandboxConfig) -> Result<WorkerSpace> {
+pub fn enter_worker_space(sandbox_config: SandboxConfig) -> anyhow::Result<WorkerSpace> {
     // Unshare namespaces
     unsafe {
         if libc::unshare(CLONE_NEWNS) != 0 {
-            bail!("Could not unshare mount namespace");
+            bail!("Failed to unshare mount namespace");
         }
     }
 
@@ -65,7 +66,7 @@ impl WorkerSpace {
         &self,
         package: &package::Package,
         bound_files: Vec<(PathBuf, String)>,
-    ) -> Result<RootFS> {
+    ) -> anyhow::Result<RootFS> {
         std::fs::create_dir("/tmp/worker/user-area")?;
         std::fs::create_dir("/tmp/worker/work")?;
         std::fs::create_dir("/tmp/worker/overlay")?;
@@ -117,101 +118,108 @@ impl WorkerSpace {
 }
 
 impl RootFS<'_> {
-    pub async fn run_isolated<F: FnOnce() -> () + Send + UnwindSafe>(&self, f: F) -> Result<()> {
+    fn _isolate_self() {
+        // Unshare namespaces
+        if unsafe {
+            libc::unshare(
+                CLONE_NEWNS
+                    | CLONE_NEWIPC
+                    | CLONE_NEWNET
+                    | CLONE_NEWUSER
+                    | CLONE_NEWUTS
+                    | CLONE_SYSVSEM
+                    | CLONE_NEWPID,
+            )
+        } != 0
+        {
+            panic!("Failed to unshare mount namespace");
+        }
+
+        // Stop ourselves
+        if unsafe { libc::raise(SIGSTOP) } != 0 {
+            panic!("raise(SIGSTOP) failed");
+        }
+
+        // Switch to fake root user
+        if unsafe { libc::setuid(0) } != 0 {
+            let e: Result<(), std::io::Error> = Err(std::io::Error::last_os_error());
+            e.with_context(|| "setuid(0) failed while entering sandbox")
+                .unwrap();
+        }
+        if unsafe { libc::setgid(0) } != 0 {
+            let e: Result<(), std::io::Error> = Err(std::io::Error::last_os_error());
+            e.with_context(|| "setgid(0) failed while entering sandbox")
+                .unwrap();
+        }
+
+        // The kernel marks /tmp/worker/overlay as MNT_LOCKED as a safety restriction due to
+        // the use of user namespaces. pivot_root requires the new root not to be MNT_LOCKED
+        // (the reason for which I don't quite understand), and the simplest way to fix that
+        // is to bind-mount /tmp/worker/overlay onto itself.
+        system::bind_mount_opt("/tmp/worker/overlay", "/tmp/worker/overlay", system::MS_REC)
+            .with_context(|| "Failed to bind-mount /tmp/worker/overlay onto itself")
+            .unwrap();
+
+        // Change root
+        std::env::set_current_dir("/tmp/worker/overlay")
+            .with_context(|| "Failed to chdir to new root at /tmp/worker/overlay")
+            .unwrap();
+        nix::unistd::pivot_root(".", ".")
+            .with_context(|| "Failed to pivot_root")
+            .unwrap();
+        system::umount_opt(".", system::MNT_DETACH)
+            .with_context(|| "Failed to unmount self")
+            .unwrap();
+        std::env::set_current_dir("/")
+            .with_context(|| "Failed to chdir to new root at /")
+            .unwrap();
+
+        // Expose defaults for environment variables
+        std::env::set_var(
+            "LD_LIBRARY_PATH",
+            "/usr/local/lib64:/usr/local/lib:/usr/lib64:/usr/lib:/lib64:/lib",
+        );
+        std::env::set_var("LANGUAGE", "en_US");
+        std::env::set_var("LC_ALL", "en_US.UTF-8");
+        std::env::set_var("LC_ADDRESS", "en_US.UTF-8");
+        std::env::set_var("LC_NAME", "en_US.UTF-8");
+        std::env::set_var("LC_MONETARY", "en_US.UTF-8");
+        std::env::set_var("LC_PAPER", "en_US.UTF-8");
+        std::env::set_var("LC_IDENTIFIER", "en_US.UTF-8");
+        std::env::set_var("LC_TELEPHONE", "en_US.UTF-8");
+        std::env::set_var("LC_MEASUREMENT", "en_US.UTF-8");
+        std::env::set_var("LC_TIME", "en_US.UTF-8");
+        std::env::set_var("LC_NUMERIC", "en_US.UTF-8");
+        std::env::set_var("LANG", "en_US.UTF-8");
+
+        // Use environment from the package
+        let file = std::fs::File::open("/.sunwalker/env")
+            .with_context(|| "Failed to open /.sunwalker/env for reading")
+            .unwrap();
+        for line in std::io::BufReader::new(file).lines() {
+            let line = line
+                .with_context(|| "Failed to read from /.sunwalker/env")
+                .unwrap();
+            let idx = line
+                .find('=')
+                .with_context(|| format!("'=' not found in a line of /.sunwalker/env: {}", line))
+                .unwrap();
+            let (name, value) = line.split_at(idx);
+            let value = &value[1..];
+            std::env::set_var(name, value);
+        }
+    }
+
+    pub async fn run_isolated<F: FnOnce() -> () + Send + UnwindSafe>(
+        &self,
+        f: F,
+    ) -> Result<(), errors::Error> {
         let child = process::scoped_async(|| {
-            // Unshare namespaces
-            if unsafe {
-                libc::unshare(
-                    CLONE_NEWNS
-                        | CLONE_NEWIPC
-                        | CLONE_NEWNET
-                        | CLONE_NEWUSER
-                        | CLONE_NEWUTS
-                        | CLONE_SYSVSEM
-                        | CLONE_NEWPID,
-                )
-            } != 0
-            {
-                panic!("Could not unshare mount namespace");
-            }
-
-            // Stop ourselves
-            if unsafe { libc::raise(SIGSTOP) } != 0 {
-                panic!("raise(SIGSTOP) failed");
-            }
-
-            // Switch to fake root user
-            if unsafe { libc::setuid(0) } != 0 {
-                let e: Result<(), std::io::Error> = Err(std::io::Error::last_os_error());
-                e.with_context(|| "setuid(0) failed while entering sandbox")
-                    .unwrap();
-            }
-            if unsafe { libc::setgid(0) } != 0 {
-                let e: Result<(), std::io::Error> = Err(std::io::Error::last_os_error());
-                e.with_context(|| "setgid(0) failed while entering sandbox")
-                    .unwrap();
-            }
-
-            // The kernel marks /tmp/worker/overlay as MNT_LOCKED as a safety restriction due to
-            // the use of user namespaces. pivot_root requires the new root not to be MNT_LOCKED
-            // (the reason for which I don't quite understand), and the simplest way to fix that
-            // is to bind-mount /tmp/worker/overlay onto itself.
-            system::bind_mount_opt("/tmp/worker/overlay", "/tmp/worker/overlay", system::MS_REC)
-                .with_context(|| "Failed to bind-mount /tmp/worker/overlay onto itself")
-                .unwrap();
-
-            // Change root
-            std::env::set_current_dir("/tmp/worker/overlay")
-                .with_context(|| "Failed to chdir to new root at /tmp/worker/overlay")
-                .unwrap();
-            nix::unistd::pivot_root(".", ".")
-                .with_context(|| "Failed to pivot_root")
-                .unwrap();
-            system::umount_opt(".", system::MNT_DETACH)
-                .with_context(|| "Failed to unmount self")
-                .unwrap();
-            std::env::set_current_dir("/")
-                .with_context(|| "Failed to chdir to new root at /")
-                .unwrap();
-
-            // Expose defaults for environment variables
-            std::env::set_var(
-                "LD_LIBRARY_PATH",
-                "/usr/local/lib64:/usr/local/lib:/usr/lib64:/usr/lib:/lib64:/lib",
-            );
-            std::env::set_var("LANGUAGE", "en_US");
-            std::env::set_var("LC_ALL", "en_US.UTF-8");
-            std::env::set_var("LC_ADDRESS", "en_US.UTF-8");
-            std::env::set_var("LC_NAME", "en_US.UTF-8");
-            std::env::set_var("LC_MONETARY", "en_US.UTF-8");
-            std::env::set_var("LC_PAPER", "en_US.UTF-8");
-            std::env::set_var("LC_IDENTIFIER", "en_US.UTF-8");
-            std::env::set_var("LC_TELEPHONE", "en_US.UTF-8");
-            std::env::set_var("LC_MEASUREMENT", "en_US.UTF-8");
-            std::env::set_var("LC_TIME", "en_US.UTF-8");
-            std::env::set_var("LC_NUMERIC", "en_US.UTF-8");
-            std::env::set_var("LANG", "en_US.UTF-8");
-
-            // Use environment from the package
-            let file = std::fs::File::open("/.sunwalker/env")
-                .with_context(|| "Could not open /.sunwalker/env for reading")
-                .unwrap();
-            for line in std::io::BufReader::new(file).lines() {
-                let line = line
-                    .with_context(|| "Could not read from /.sunwalker/env")
-                    .unwrap();
-                let idx = line
-                    .find('=')
-                    .with_context(|| {
-                        format!("'=' not found in a line of /.sunwalker/env: {}", line)
-                    })
-                    .unwrap();
-                let (name, value) = line.split_at(idx);
-                let value = &value[1..];
-                std::env::set_var(name, value);
-            }
-
+            RootFS::_isolate_self();
             f();
+        })
+        .map_err(|e| {
+            errors::InvokerFailure(format!("Failed to start an isolated subprocess: {:?}", e))
         })?;
 
         let child_pid = child.get_pid();
@@ -219,11 +227,18 @@ impl RootFS<'_> {
         let mut wstatus: c_int = 0;
         let ret = unsafe { libc::waitpid(child_pid, &mut wstatus as *mut c_int, WUNTRACED) };
         if ret == -1 {
-            Err(std::io::Error::last_os_error()).with_context(|| format!("waitpid() failed"))?;
+            return Err(errors::InvokerFailure(format!(
+                "waitpid() on an isolated subprocess failed unexpectedly: {:?}",
+                std::io::Error::last_os_error()
+            )));
         }
         if !libc::WIFSTOPPED(wstatus) {
             std::mem::forget(child); // we don't want to accidentally kill another process with the same PID
-            bail!("Child process wasn't stopped by SIGSTOP, as expected");
+            return Err(errors::InvokerFailure(format!(
+                "Isolated subprocess was expected to raise SIGSTOP, but waitpid() unexpectedly \
+                 didn't yield SIGSTOP: {:?}",
+                std::io::Error::last_os_error()
+            )));
         }
 
         // Fill uid/gid maps and switch to
@@ -231,23 +246,47 @@ impl RootFS<'_> {
             format!("/proc/{}/uid_map", child_pid),
             format!("0 65534 1\n"),
         )
-        .with_context(|| "Failed to write to child's uid_map")?;
-        std::fs::write(format!("/proc/{}/setgroups", child_pid), "deny\n")
-            .with_context(|| "Failed to write to child's setgroups")?;
+        .map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to create uid_map for the isolated subprocess: {:?}",
+                e
+            ))
+        })?;
+        std::fs::write(format!("/proc/{}/setgroups", child_pid), "deny\n").map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to create setgroups for the isolated subprocess: {:?}",
+                e
+            ))
+        })?;
         std::fs::write(
             format!("/proc/{}/gid_map", child_pid),
             format!("0 65534 1\n"),
         )
-        .with_context(|| "Failed to write to child's gid_map")?;
+        .map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to create gid_map for the isolated subprocess: {:?}",
+                e
+            ))
+        })?;
 
         if unsafe { libc::kill(child_pid, SIGCONT) } != 0 {
-            bail!("Failed to SIGCONT child process");
+            return Err(errors::InvokerFailure(format!(
+                "Failed to SIGCONT isolated process: {:?}",
+                std::io::Error::last_os_error()
+            )));
         }
 
-        child.join().await
+        child.join().await.map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Isolated process didn't terminate gracefully: {:?}",
+                e
+            ))
+        })?;
+
+        Ok(())
     }
 
-    fn _remove(&mut self) -> Result<()> {
+    fn _remove(&mut self) -> anyhow::Result<()> {
         if self.removed {
             return Ok(());
         }
@@ -256,7 +295,7 @@ impl RootFS<'_> {
 
         // Unmount overlay recursively
         let file = std::fs::File::open("/proc/self/mounts")
-            .with_context(|| "Could not open /proc/self/mounts for reading")?;
+            .with_context(|| "Failed to open /proc/self/mounts for reading")?;
         let mut vec = Vec::new();
         for line in std::io::BufReader::new(file).lines() {
             let line = line?;
@@ -282,7 +321,7 @@ impl RootFS<'_> {
         Ok(())
     }
 
-    pub fn remove(mut self) -> Result<()> {
+    pub fn remove(mut self) -> anyhow::Result<()> {
         self._remove()
     }
 }

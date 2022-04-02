@@ -1,7 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct DependencyDAG {
     pub dependents_of: Arc<HashMap<u64, Vec<u64>>>,
     pub disabled_tests: HashSet<u64>,

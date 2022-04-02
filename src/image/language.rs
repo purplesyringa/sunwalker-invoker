@@ -1,32 +1,51 @@
 use crate::{
-    image::{config, package, sandbox},
+    errors,
+    image::{config, package, program, sandbox},
     system,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::Context;
 use ouroboros::self_referencing;
 use rand::{thread_rng, Rng};
+use serde::{ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 #[self_referencing(pub_extras)]
 pub struct LanguageImpl {
-    pub(crate) package: package::Package,
+    package: package::Package,
     #[borrows(package)]
-    pub(crate) config: &'this config::Language,
-    pub(crate) name: String,
+    config: &'this config::Language,
+    name: String,
 }
 
 impl LanguageImpl {
-    pub async fn identify(&self, worker_space: &sandbox::WorkerSpace) -> Result<String> {
+    pub async fn identify(
+        &self,
+        worker_space: &sandbox::WorkerSpace,
+    ) -> Result<String, errors::Error> {
         let package = self.borrow_package();
 
         // Make sandbox
-        let rootfs = worker_space
-            .make_rootfs(package, Vec::new())
-            .with_context(|| format!("Failed to make sandbox for identification"))?;
+        let rootfs = worker_space.make_rootfs(package, Vec::new()).map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to make sandbox for identification: {:?}",
+                e
+            ))
+        })?;
 
-        std::fs::write("/tmp/worker/overlay/identify.txt", "")?;
-        std::os::unix::fs::chown("/tmp/worker/overlay/identify.txt", Some(65534), Some(65534))?;
+        std::fs::write("/tmp/worker/overlay/identify.txt", "").map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to create /tmp/worker/overlay/identify.txt: {:?}",
+                e
+            ))
+        })?;
+        std::os::unix::fs::chown("/tmp/worker/overlay/identify.txt", Some(65534), Some(65534))
+            .map_err(|e| {
+                errors::InvokerFailure(format!(
+                    "Failed to chown /tmp/worker/overlay/identify.txt: {:?}",
+                    e
+                ))
+            })?;
 
         // Enter the sandbox in another process
         rootfs
@@ -43,13 +62,28 @@ impl LanguageImpl {
                     .with_context(|| "Failed to write pattern to /identify.txt")
                     .unwrap();
             })
-            .await
-            .with_context(|| "In-process build failed")?;
+            .await?;
 
-        let identify = std::fs::read_to_string("/tmp/worker/overlay/identify.txt")
-            .with_context(|| "Failed to read pattern from /tmp/worker/overlay/identify.txt")?;
+        let identify =
+            std::fs::read_to_string("/tmp/worker/overlay/identify.txt").map_err(|e| {
+                errors::InvokerFailure(format!(
+                    "Identification succeeded, but did not generate a readable file at \
+                     /tmp/worker/overlay/identify.txt: {:?}",
+                    e
+                ))
+            })?;
 
-        rootfs.remove()?;
+        if identify == "" {
+            return Err(errors::InvokerFailure(
+                "Identification succeeded, but did not write anything to
+                 /tmp/worker/overlay/identify.txt"
+                    .to_string(),
+            ));
+        }
+
+        rootfs
+            .remove()
+            .map_err(|e| errors::InvokerFailure(format!("Failed to remove rootfs: {:?}", e)))?;
 
         Ok(identify)
     }
@@ -58,7 +92,7 @@ impl LanguageImpl {
         &self,
         mut input_files: Vec<&str>,
         worker_space: &sandbox::WorkerSpace,
-    ) -> Result<Program> {
+    ) -> Result<program::Program, errors::Error> {
         let package = self.borrow_package();
         let config = self.borrow_config();
         let name = self.borrow_name();
@@ -69,13 +103,11 @@ impl LanguageImpl {
             let suffix = input_pattern
                 .rsplit_once("%")
                 .ok_or_else(|| {
-                    anyhow!(
+                    errors::InvokerFailure(format!(
                         "Input file pattern {} (derived from Makefile of package {}, language {}) \
                          does not contain glob character %",
-                        input_pattern,
-                        package.name,
-                        name
-                    )
+                        input_pattern, package.name, name
+                    ))
                 })?
                 .1;
             patterns_by_extension.push((input_pattern, suffix));
@@ -92,13 +124,11 @@ impl LanguageImpl {
                 .enumerate()
                 .find(|(_, input_file)| input_file.ends_with(suffix))
                 .ok_or_else(|| {
-                    anyhow!(
+                    errors::UserFailure(format!(
                         "No input file ends with {} (derived from pattern {}). This requirement \
                          is because language {} accepts multiple input files.",
-                        suffix,
-                        input_pattern,
-                        name
-                    )
+                        suffix, input_pattern, name
+                    ))
                 })?
                 .0;
             let input_file = input_files.remove(i);
@@ -122,17 +152,37 @@ impl LanguageImpl {
         // Make sandbox
         let rootfs = worker_space
             .make_rootfs(package, bound_files)
-            .with_context(|| format!("Failed to make sandbox for build"))?;
+            .map_err(|e| {
+                errors::InvokerFailure(format!("Failed to make sandbox for build: {:?}", e))
+            })?;
 
         // Add /artifacts -> /tmp/worker/artifacts
-        std::fs::create_dir("/tmp/worker/artifacts")
-            .with_context(|| "Could not create /tmp/worker/artifacts")?;
-        std::fs::create_dir("/tmp/worker/overlay/artifacts")
-            .with_context(|| "Could not create /tmp/worker/overlay/artifacts")?;
-        system::bind_mount("/tmp/worker/artifacts", "/tmp/worker/overlay/artifacts")?;
+        std::fs::create_dir("/tmp/worker/artifacts").map_err(|e| {
+            errors::InvokerFailure(format!("Failed to create /tmp/worker/artifacts: {:?}", e))
+        })?;
+        std::fs::create_dir("/tmp/worker/overlay/artifacts").map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to create /tmp/worker/overlay/artifacts: {:?}",
+                e
+            ))
+        })?;
+        system::bind_mount("/tmp/worker/artifacts", "/tmp/worker/overlay/artifacts").map_err(
+            |e| {
+                errors::InvokerFailure(format!(
+                    "Failed to bind-mount /tmp/worker/overlay/artifacts: {:?}",
+                    e
+                ))
+            },
+        )?;
 
         // Allow the sandbox user to access data
-        std::os::unix::fs::chown("/tmp/worker/overlay/artifacts", Some(65534), Some(65534))?;
+        std::os::unix::fs::chown("/tmp/worker/overlay/artifacts", Some(65534), Some(65534))
+            .map_err(|e| {
+                errors::InvokerFailure(format!(
+                    "Failed to chown /tmp/worker/overlay/artifacts: {:?}",
+                    e
+                ))
+            })?;
 
         // Enter the sandbox in another process
         rootfs
@@ -212,7 +262,7 @@ impl LanguageImpl {
                     std::fs::copy(&from, &to)
                         .with_context(|| {
                             format!(
-                                "Could not copy artifact {} from {:?} to {:?}",
+                                "Failed to copy artifact {} from {:?} to {:?}",
                                 rel_path, from, to
                             )
                         })
@@ -224,73 +274,61 @@ impl LanguageImpl {
                     .with_context(|| "Failed to write pattern to /artifacts/pattern.txt")
                     .unwrap();
             })
-            .await
-            .with_context(|| "In-process build failed")?;
+            .await?;
 
-        rootfs.remove()?;
+        rootfs
+            .remove()
+            .map_err(|e| errors::InvokerFailure(format!("Failed to remove rootfs: {:?}", e)))?;
 
-        let pattern = std::fs::read_to_string("/tmp/worker/artifacts/pattern.txt")
-            .with_context(|| "Failed to read pattern from /artifacts/pattern.txt")?;
+        let pattern =
+            std::fs::read_to_string("/tmp/worker/artifacts/pattern.txt").map_err(|e| {
+                errors::InvokerFailure(format!(
+                    "Failed to read pattern from /artifacts/pattern.txt: {:?}",
+                    e
+                ))
+            })?;
 
         let prerequisites: Vec<String> = lisp::evaluate(
             config.run.prerequisites.clone(),
             &lisp::State::new().var("$base".to_string(), pattern.clone()),
         )
-        .with_context(|| "Failed to evaluate run.prerequisites")?
+        .map_err(|e| {
+            errors::InvokerFailure(format!("Failed to evaluate run.prerequisites: {:?}", e))
+        })?
         .to_native()
-        .with_context(|| {
-            "Failed to parse prerequisites generated by the schema as vector of strings"
+        .map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to parse prerequisites generated by the schema as vector of strings: {:?}",
+                e
+            ))
         })?;
 
         let argv: Vec<String> = lisp::evaluate(
             config.run.argv.clone(),
             &lisp::State::new().var("$base".to_string(), pattern.clone()),
         )
-        .with_context(|| "Failed to evaluate run.argv")?
+        .map_err(|e| errors::InvokerFailure(format!("Failed to evaluate run.argv: {:?}", e)))?
         .to_native()
-        .with_context(|| "Failed to parse argv generated by the schema as vector of strings")?;
+        .map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to parse argv generated by the schema as vector of strings: {:?}",
+                e
+            ))
+        })?;
 
-        Ok(Program {
+        Ok(program::Program {
+            package: self.borrow_package().clone(),
             prerequisites,
             argv,
         })
     }
 
-    pub async fn run(&self, worker_space: &sandbox::WorkerSpace, program: &Program) -> Result<()> {
-        let mut bound_files = Vec::new();
-        for prerequisite in &program.prerequisites {
-            bound_files.push((
-                format!("/tmp/worker/artifacts/{}", prerequisite).into(),
-                format!("/space/{}", prerequisite),
-            ));
-        }
-
-        let rootfs = worker_space
-            .make_rootfs(self.borrow_package(), bound_files)
-            .with_context(|| format!("Failed to make sandbox for running"))?;
-
-        // Enter the sandbox in another process
-        rootfs
-            .run_isolated(|| {
-                std::env::set_current_dir("/space")
-                    .with_context(|| "Failed to chdir to /space")
-                    .unwrap();
-
-                std::process::Command::new(&program.argv[0])
-                    .args(&program.argv[1..])
-                    .spawn()
-                    .with_context(|| format!("Failed to spawn {:?}", program.argv))
-                    .unwrap()
-                    .wait()
-                    .with_context(|| format!("Failed to get exit code of {:?}", program.argv))
-                    .unwrap();
-            })
-            .await
-            .with_context(|| "In-process running failed")?;
-
-        rootfs.remove()?;
-
-        Ok(())
+    pub async fn run(
+        &self,
+        worker_space: &sandbox::WorkerSpace,
+        program: &program::Program,
+    ) -> Result<(), errors::Error> {
+        program.run(worker_space).await
     }
 }
 
@@ -299,7 +337,7 @@ pub struct Language {
 }
 
 impl Language {
-    pub fn new(package: package::Package, name: &str) -> Result<Language> {
+    pub fn new(package: package::Package, name: &str) -> anyhow::Result<Language> {
         package
             .image
             .config
@@ -334,7 +372,10 @@ impl Language {
         })
     }
 
-    pub async fn identify(&self, worker_space: &sandbox::WorkerSpace) -> Result<String> {
+    pub async fn identify(
+        &self,
+        worker_space: &sandbox::WorkerSpace,
+    ) -> Result<String, errors::Error> {
         self.nested.identify(worker_space).await
     }
 
@@ -342,18 +383,51 @@ impl Language {
         &self,
         input_files: Vec<&str>,
         worker_space: &sandbox::WorkerSpace,
-    ) -> Result<Program> {
+    ) -> Result<program::Program, errors::Error> {
         self.nested.build(input_files, worker_space).await
     }
 
-    pub async fn run(&self, worker_space: &sandbox::WorkerSpace, program: &Program) -> Result<()> {
+    pub async fn run(
+        &self,
+        worker_space: &sandbox::WorkerSpace,
+        program: &program::Program,
+    ) -> Result<(), errors::Error> {
         self.nested.run(worker_space, program).await
     }
 }
 
-pub struct Program {
-    prerequisites: Vec<String>,
-    argv: Vec<String>,
+impl Clone for Language {
+    fn clone(&self) -> Language {
+        Language::new(
+            self.nested.borrow_package().clone(),
+            self.nested.borrow_name(),
+        )
+        .expect("Failed to clone a language")
+    }
+}
+
+impl Serialize for Language {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("Language", 2)?;
+        state.serialize_field("package", self.nested.borrow_package())?;
+        state.serialize_field("name", self.nested.borrow_name())?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Language {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Language, D::Error> {
+        let (package, name) = {
+            #[derive(Deserialize)]
+            struct Language {
+                package: package::Package,
+                name: String,
+            }
+            let language = <Language as Deserialize<'de>>::deserialize(deserializer)?;
+            (language.package, language.name)
+        };
+        Ok(Language::new(package, &name).expect("Failed to deserialize a language"))
+    }
 }
 
 #[lisp::function]

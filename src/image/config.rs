@@ -1,21 +1,22 @@
 use anyhow::Result;
 use lisp;
 use lisp::{evaluate, parse, LispType, State, Term};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(LispType, Debug, Clone)]
+#[derive(Clone, Debug, Deserialize, LispType, Serialize)]
 #[lisp(name = "config")]
 pub struct Config {
     pub packages: HashMap<String, Package>,
 }
 
-#[derive(LispType, Debug, Clone)]
+#[derive(Clone, Debug, Deserialize, LispType, Serialize)]
 #[lisp(name = "package")]
 pub struct Package {
     pub languages: HashMap<String, Language>,
 }
 
-#[derive(LispType, Debug, Clone)]
+#[derive(Clone, Debug, Deserialize, LispType, Serialize)]
 #[lisp(name = "language")]
 pub struct Language {
     pub identify: Term,
@@ -25,7 +26,7 @@ pub struct Language {
     pub run: RunStatement,
 }
 
-#[derive(LispType, Debug, Clone)]
+#[derive(Clone, Debug, Deserialize, LispType, Serialize)]
 #[lisp(name = "run")]
 pub struct RunStatement {
     pub prerequisites: Term,
