@@ -1,0 +1,17 @@
+[package]
+name = "multiprocessing"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+multiprocessing-derive = { path = "multiprocessing-derive" }
+ctor = "0.1.22"
+lazy_static = "1.4.0"
+nix = "0.23.1"
+
+[[test]]
+name = "tests"
+path = "tests/main.rs"
+harness = false
