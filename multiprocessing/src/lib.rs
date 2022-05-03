@@ -3,6 +3,7 @@
 // safe
 #![feature(auto_traits)]
 #![feature(negative_impls)]
+#![feature(unix_socket_ancillary_data)]
 
 extern crate self as multiprocessing;
 
@@ -20,6 +21,8 @@ pub use crate::serde::*;
 
 pub mod ipc;
 pub use ipc::{channel, duplex, Duplex, Receiver, Sender};
+
+pub mod tokio;
 
 pub mod subprocess;
 pub use subprocess::Child;

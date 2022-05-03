@@ -1,20 +1,21 @@
 use crate::{Deserializer, SerializeSafe, Serializer};
-use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Read, Result, Write};
+use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Result};
 use std::marker::PhantomData;
-use std::os::unix::{
-    io::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    net::{AncillaryData, SocketAncillary, UnixStream},
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use tokio_seqpacket::{
+    ancillary::{AncillaryData, SocketAncillary},
+    UnixSeqpacket,
 };
 
 #[derive(SerializeSafe)]
 pub struct Sender<T: SerializeSafe> {
-    fd: UnixStream,
+    fd: UnixSeqpacket,
     marker: PhantomData<T>,
 }
 
 #[derive(SerializeSafe)]
 pub struct Receiver<T: SerializeSafe> {
-    fd: UnixStream,
+    fd: UnixSeqpacket,
     marker: PhantomData<T>,
 }
 
@@ -25,8 +26,11 @@ pub struct Duplex<S: SerializeSafe, R: SerializeSafe> {
 }
 
 pub fn channel<T: SerializeSafe>() -> Result<(Sender<T>, Receiver<T>)> {
-    let (tx, rx) = UnixStream::pair()?;
-    Ok((Sender::from_unix_stream(tx), Receiver::from_unix_stream(rx)))
+    let (tx, rx) = UnixSeqpacket::pair()?;
+    Ok((
+        Sender::from_unix_seqpacket(tx),
+        Receiver::from_unix_seqpacket(rx),
+    ))
 }
 
 pub fn duplex<A: SerializeSafe, B: SerializeSafe>() -> Result<(Duplex<A, B>, Duplex<B, A>)> {
@@ -45,14 +49,14 @@ pub fn duplex<A: SerializeSafe, B: SerializeSafe>() -> Result<(Duplex<A, B>, Dup
 }
 
 impl<T: SerializeSafe> Sender<T> {
-    pub fn from_unix_stream(fd: UnixStream) -> Self {
+    pub fn from_unix_seqpacket(fd: UnixSeqpacket) -> Self {
         Sender {
             fd,
             marker: PhantomData,
         }
     }
 
-    pub fn send(&mut self, value: &T) -> Result<()> {
+    pub async fn send(&mut self, value: &T) -> Result<()> {
         let mut s = Serializer::new();
         s.serialize(value);
 
@@ -67,11 +71,28 @@ impl<T: SerializeSafe> Sender<T> {
         if !ancillary.add_fds(&fds) {
             return Err(Error::new(ErrorKind::Other, "Too many fds to pass"));
         }
-        self.fd
-            .send_vectored_with_ancillary(&[IoSlice::new(&sz)], &mut ancillary)?;
+
+        let size = self
+            .fd
+            .send_vectored_with_ancillary(&[IoSlice::new(&sz)], &mut ancillary)
+            .await?;
+        if size != sz.len() {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("Expected to send {} bytes, sent {} bytes", sz.len(), size),
+            ));
+        }
 
         // Send data itself
-        self.fd.write_all(&serialized)?;
+        let mut serialized = &serialized[..];
+        while !serialized.is_empty() {
+            let n = self.fd.send(serialized).await?;
+            if n == 0 {
+                break;
+            }
+            serialized = &serialized[n..];
+        }
+
         Ok(())
     }
 }
@@ -84,19 +105,19 @@ impl<T: SerializeSafe> AsRawFd for Sender<T> {
 
 impl<T: SerializeSafe> FromRawFd for Sender<T> {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        Self::from_unix_stream(UnixStream::from_raw_fd(fd))
+        Self::from_unix_seqpacket(UnixSeqpacket::from_raw_fd(fd).unwrap())
     }
 }
 
 impl<T: SerializeSafe> Receiver<T> {
-    pub fn from_unix_stream(fd: UnixStream) -> Self {
+    pub fn from_unix_seqpacket(fd: UnixSeqpacket) -> Self {
         Receiver {
             fd,
             marker: PhantomData,
         }
     }
 
-    pub fn recv(&mut self) -> Result<Option<T>> {
+    pub async fn recv(&mut self) -> Result<Option<T>> {
         // Read size of data and the passed file descriptors
         let mut sz = [0u8; std::mem::size_of::<usize>()];
 
@@ -105,7 +126,8 @@ impl<T: SerializeSafe> Receiver<T> {
 
         let size = self
             .fd
-            .recv_vectored_with_ancillary(&mut [IoSliceMut::new(&mut sz)], &mut ancillary)?;
+            .recv_vectored_with_ancillary(&mut [IoSliceMut::new(&mut sz)], &mut ancillary)
+            .await?;
         if size == 0 {
             return Ok(None);
         }
@@ -132,7 +154,15 @@ impl<T: SerializeSafe> Receiver<T> {
         }
 
         let mut serialized = vec![0u8; usize::from_ne_bytes(sz)];
-        self.fd.read_exact(&mut serialized[..])?;
+
+        let mut buf = &mut serialized[..];
+        while !buf.is_empty() {
+            let n = self.fd.recv(buf).await?;
+            if n == 0 {
+                return Err(Error::new(ErrorKind::Other, format!("Unexpected EOF")));
+            }
+            buf = &mut buf[n..];
+        }
 
         let mut d = Deserializer::from(serialized, received_fds);
         Ok(Some(d.deserialize()))
@@ -147,15 +177,15 @@ impl<T: SerializeSafe> AsRawFd for Receiver<T> {
 
 impl<T: SerializeSafe> FromRawFd for Receiver<T> {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        Self::from_unix_stream(UnixStream::from_raw_fd(fd))
+        Self::from_unix_seqpacket(UnixSeqpacket::from_raw_fd(fd).unwrap())
     }
 }
 
 impl<S: SerializeSafe, R: SerializeSafe> Duplex<S, R> {
-    pub fn send(&mut self, value: &S) -> Result<()> {
-        self.sender.send(value)
+    pub async fn send(&mut self, value: &S) -> Result<()> {
+        self.sender.send(value).await
     }
-    pub fn recv(&mut self) -> Result<Option<R>> {
-        self.receiver.recv()
+    pub async fn recv(&mut self) -> Result<Option<R>> {
+        self.receiver.recv().await
     }
 }

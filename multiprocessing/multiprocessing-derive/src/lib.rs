@@ -10,6 +10,12 @@ use syn::DeriveInput;
 pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
     let mut input = parse_macro_input!(input as syn::ItemFn);
 
+    let tokio_attr_index = input.attrs.iter().position(|attr| {
+        let path = &attr.path;
+        (quote! {#path}).to_string().contains("tokio :: main")
+    });
+    let tokio_attr = tokio_attr_index.map(|i| input.attrs.remove(i));
+
     let return_type = match input.sig.output {
         syn::ReturnType::Default => quote! { () },
         syn::ReturnType::Type(_, ref ty) => quote! { #ty },
@@ -22,6 +28,7 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
         &input as *const syn::ItemFn
     );
     let fn_name_ident = format_ident!("f_{}", link_name);
+    let real_entry_ident = format_ident!("e_{}", link_name);
     let args_struct_name_ident = format_ident!("S_{}", link_name);
 
     let ident = input.sig.ident;
@@ -53,15 +60,28 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
         }
     }
 
-    let expanded = quote! {
-        #[derive(::multiprocessing::SerializeSafe)]
-        struct #args_struct_name_ident {
-            #(#fn_args,)*
-        }
+    let entrypoint;
 
-        #[::multiprocessing::imp::ctor]
-        fn #fn_name_ident() {
-            ::multiprocessing::imp::ENTRY_POINTS.write().unwrap().insert(#link_name, |input_rx_fd, output_tx_fd| {
+    if let Some(tokio_attr) = tokio_attr {
+        entrypoint = quote! {
+            #tokio_attr
+            async fn #real_entry_ident(input_rx_fd: ::std::os::unix::io::RawFd, output_tx_fd: ::std::os::unix::io::RawFd) -> i32 {
+                use ::std::os::unix::io::FromRawFd;
+                let mut input_rx = unsafe {
+                    ::multiprocessing::tokio::Receiver::<#args_struct_name_ident>::from_raw_fd(input_rx_fd)
+                };
+                let mut output_tx = unsafe {
+                    ::multiprocessing::tokio::Sender::<#return_type>::from_raw_fd(output_tx_fd)
+                };
+                let multiprocessing_args = input_rx.recv().await.unwrap().unwrap();
+                output_tx.send(&#ident::call( #(#extracted_args,)* ).await).await.unwrap();
+                0
+            }
+        };
+    } else {
+        entrypoint = quote! {
+            fn #real_entry_ident(input_rx_fd: ::std::os::unix::io::RawFd, output_tx_fd: ::std::os::unix::io::RawFd) -> i32 {
+                use ::std::os::unix::io::FromRawFd;
                 let mut input_rx = unsafe {
                     ::multiprocessing::Receiver::<#args_struct_name_ident>::from_raw_fd(input_rx_fd)
                 };
@@ -69,9 +89,23 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
                     ::multiprocessing::Sender::<#return_type>::from_raw_fd(output_tx_fd)
                 };
                 let multiprocessing_args = input_rx.recv().unwrap().unwrap();
-                output_tx.send(#ident::call( #(#extracted_args,)* )).unwrap();
+                output_tx.send(&#ident::call( #(#extracted_args,)* )).unwrap();
                 0
-            });
+            }
+        };
+    }
+
+    let expanded = quote! {
+        #[derive(::multiprocessing::SerializeSafe)]
+        struct #args_struct_name_ident {
+            #(#fn_args,)*
+        }
+
+        #entrypoint
+
+        #[::multiprocessing::imp::ctor]
+        fn #fn_name_ident() {
+            ::multiprocessing::imp::ENTRY_POINTS.write().unwrap().insert(#link_name, #real_entry_ident);
         }
 
         #[allow(non_camel_case_types)]
@@ -106,7 +140,7 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
                 };
 
                 input_tx.send(
-                    #args_struct_name_ident {
+                    &#args_struct_name_ident {
                         #(#arg_names,)*
                     }
                 )?;
@@ -134,8 +168,7 @@ pub fn main(_meta: TokenStream, input: TokenStream) -> TokenStream {
         #[::multiprocessing::imp::ctor]
         fn multiprocessing_add_main() {
             *::multiprocessing::imp::MAIN_ENTRY.write().unwrap() = Some(|| {
-                use ::multiprocessing::imp::Report;
-                multiprocessing_old_main().report()
+                ::multiprocessing::imp::Report::report(multiprocessing_old_main())
             });
         }
 

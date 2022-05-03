@@ -1,4 +1,8 @@
 use crate::{Deserializer, SerializeSafe, Serializer};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, LinkedList, VecDeque};
+use std::hash::{BuildHasher, Hash};
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::io::{AsRawFd, IntoRawFd};
 
 impl SerializeSafe for bool {
     fn serialize_self(&self, s: &mut Serializer) {
@@ -45,11 +49,9 @@ impl SerializeSafe for std::ffi::CString {
 impl SerializeSafe for std::ffi::OsString {
     fn serialize_self(&self, s: &mut Serializer) {
         // XXX: unnecessary heap usage
-        use std::os::unix::ffi::OsStringExt;
         s.serialize(&self.clone().into_vec())
     }
     fn deserialize_self(d: &mut Deserializer) -> Self {
-        use std::os::unix::ffi::OsStringExt;
         Self::from_vec(d.deserialize())
     }
 }
@@ -224,8 +226,6 @@ macro_rules! impl_serializesafe_for_map {
     }
 }
 
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, LinkedList, VecDeque};
-use std::hash::{BuildHasher, Hash};
 impl_serializesafe_for_sequence!(Vec<T>, seq, size, Vec::with_capacity(size), Vec::push);
 impl_serializesafe_for_sequence!(
     BinaryHeap<T: Ord>,
@@ -289,12 +289,43 @@ impl<T: SerializeSafe, E: SerializeSafe> SerializeSafe for Result<T, E> {
 
 impl SerializeSafe for std::fs::File {
     fn serialize_self(&self, s: &mut Serializer) {
-        use std::os::unix::io::AsRawFd;
         let fd = s.add_fd(self.as_raw_fd());
         s.serialize(&fd)
     }
     fn deserialize_self(d: &mut Deserializer) -> Self {
         let fd = d.deserialize();
         <Self as From<std::os::unix::io::OwnedFd>>::from(d.drain_fd(fd))
+    }
+}
+
+impl SerializeSafe for std::os::unix::net::UnixStream {
+    fn serialize_self(&self, s: &mut Serializer) {
+        let fd = s.add_fd(self.as_raw_fd());
+        s.serialize(&fd)
+    }
+    fn deserialize_self(d: &mut Deserializer) -> Self {
+        let fd = d.deserialize();
+        <Self as From<std::os::unix::io::OwnedFd>>::from(d.drain_fd(fd))
+    }
+}
+
+impl SerializeSafe for tokio::net::UnixStream {
+    fn serialize_self(&self, s: &mut Serializer) {
+        let fd = s.add_fd(self.as_raw_fd());
+        s.serialize(&fd)
+    }
+    fn deserialize_self(d: &mut Deserializer) -> Self {
+        Self::from_std(d.deserialize()).unwrap()
+    }
+}
+
+impl SerializeSafe for tokio_seqpacket::UnixSeqpacket {
+    fn serialize_self(&self, s: &mut Serializer) {
+        let fd = s.add_fd(self.as_raw_fd());
+        s.serialize(&fd)
+    }
+    fn deserialize_self(d: &mut Deserializer) -> Self {
+        let fd = d.deserialize();
+        unsafe { Self::from_raw_fd(d.drain_fd(fd).into_raw_fd()).unwrap() }
     }
 }
