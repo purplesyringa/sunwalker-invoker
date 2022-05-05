@@ -1,7 +1,7 @@
 use multiprocessing::tokio::{channel, duplex, Duplex, Receiver, Sender};
-use multiprocessing::SerializeSafe;
+use multiprocessing::Object;
 
-#[derive(Debug, PartialEq, SerializeSafe)]
+#[derive(Debug, PartialEq, Object)]
 struct SimplePair {
     x: i32,
     y: i32,
@@ -55,24 +55,39 @@ async fn with_passed_duplex(mut chan: Duplex<i32, (i32, i32)>) -> () {
 #[tokio::main]
 async fn main() {
     assert_eq!(
-        simple::spawn().unwrap().join().expect("simple failed"),
+        simple
+            .spawn_tokio()
+            .await
+            .unwrap()
+            .join()
+            .await
+            .expect("simple failed"),
         0x123456789abcdef
     );
     println!("simple OK");
 
     assert_eq!(
-        add_with_arguments::spawn(5, 7)
+        add_with_arguments
+            .spawn_tokio(5, 7)
+            .await
             .unwrap()
             .join()
+            .await
             .expect("add_with_arguments failed"),
         12
     );
     println!("add_with_arguments OK");
 
+    assert_eq!(add_with_arguments(5, 7).await, 12);
+    println!("add_with_arguments call OK");
+
     assert_eq!(
-        swap_complex_argument::spawn(SimplePair { x: 5, y: 7 })
+        swap_complex_argument
+            .spawn_tokio(SimplePair { x: 5, y: 7 })
+            .await
             .unwrap()
             .join()
+            .await
             .expect("swap_complex_argument failed"),
         SimplePair { x: 7, y: 5 }
     );
@@ -80,33 +95,33 @@ async fn main() {
 
     {
         let (mut tx, rx) = channel::<i32>().unwrap();
-        let mut child = with_passed_rx::spawn(rx).unwrap();
+        let mut child = with_passed_rx.spawn_tokio(rx).await.unwrap();
         tx.send(&5).await.unwrap();
         tx.send(&7).await.unwrap();
-        assert_eq!(child.join().expect("with_passed_rx failed"), -2);
+        assert_eq!(child.join().await.expect("with_passed_rx failed"), -2);
         println!("with_passed_rx OK");
     }
 
     {
         let (tx, mut rx) = channel::<i32>().unwrap();
-        let mut child = with_passed_tx::spawn(tx).unwrap();
+        let mut child = with_passed_tx.spawn_tokio(tx).await.unwrap();
         assert_eq!(
             rx.recv().await.unwrap().unwrap() - rx.recv().await.unwrap().unwrap(),
             -2
         );
-        child.join().unwrap();
+        child.join().await.unwrap();
         println!("with_passed_tx OK");
     }
 
     {
         let (mut local, downstream) = duplex::<(i32, i32), i32>().unwrap();
-        let mut child = with_passed_duplex::spawn(downstream).unwrap();
+        let mut child = with_passed_duplex.spawn_tokio(downstream).await.unwrap();
         for (x, y) in [(5, 7), (100, -1), (53, 2354)] {
             local.send(&(x, y)).await.unwrap();
             assert_eq!(local.recv().await.unwrap().unwrap(), x - y);
         }
         drop(local);
-        child.join().unwrap();
+        child.join().await.unwrap();
         println!("with_passed_duplex OK");
     }
 }

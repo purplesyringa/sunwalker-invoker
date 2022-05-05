@@ -1,4 +1,4 @@
-use crate::{Deserializer, SerializeSafe, Serializer};
+use crate::{Deserialize, Deserializer, Object, Serialize, Serializer};
 use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Read, Result, Write};
 use std::marker::PhantomData;
 use std::os::unix::{
@@ -6,30 +6,31 @@ use std::os::unix::{
     net::{AncillaryData, SocketAncillary, UnixStream},
 };
 
-#[derive(SerializeSafe)]
-pub struct Sender<T: SerializeSafe> {
+#[derive(Object)]
+pub struct Sender<T: Serialize> {
     fd: UnixStream,
     marker: PhantomData<T>,
 }
 
-#[derive(SerializeSafe)]
-pub struct Receiver<T: SerializeSafe> {
+#[derive(Object)]
+pub struct Receiver<T: Deserialize> {
     fd: UnixStream,
     marker: PhantomData<T>,
 }
 
-#[derive(SerializeSafe)]
-pub struct Duplex<S: SerializeSafe, R: SerializeSafe> {
+#[derive(Object)]
+pub struct Duplex<S: Serialize, R: Deserialize> {
     sender: Sender<S>,
     receiver: Receiver<R>,
 }
 
-pub fn channel<T: SerializeSafe>() -> Result<(Sender<T>, Receiver<T>)> {
+pub fn channel<T: Serialize + Deserialize>() -> Result<(Sender<T>, Receiver<T>)> {
     let (tx, rx) = UnixStream::pair()?;
     Ok((Sender::from_unix_stream(tx), Receiver::from_unix_stream(rx)))
 }
 
-pub fn duplex<A: SerializeSafe, B: SerializeSafe>() -> Result<(Duplex<A, B>, Duplex<B, A>)> {
+pub fn duplex<A: Serialize + Deserialize, B: Serialize + Deserialize>(
+) -> Result<(Duplex<A, B>, Duplex<B, A>)> {
     let (a_tx, a_rx) = channel::<A>()?;
     let (b_tx, b_rx) = channel::<B>()?;
     Ok((
@@ -44,7 +45,7 @@ pub fn duplex<A: SerializeSafe, B: SerializeSafe>() -> Result<(Duplex<A, B>, Dup
     ))
 }
 
-impl<T: SerializeSafe> Sender<T> {
+impl<T: Serialize> Sender<T> {
     pub fn from_unix_stream(fd: UnixStream) -> Self {
         Sender {
             fd,
@@ -76,19 +77,19 @@ impl<T: SerializeSafe> Sender<T> {
     }
 }
 
-impl<T: SerializeSafe> AsRawFd for Sender<T> {
+impl<T: Serialize> AsRawFd for Sender<T> {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 }
 
-impl<T: SerializeSafe> FromRawFd for Sender<T> {
+impl<T: Serialize> FromRawFd for Sender<T> {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
         Self::from_unix_stream(UnixStream::from_raw_fd(fd))
     }
 }
 
-impl<T: SerializeSafe> Receiver<T> {
+impl<T: Deserialize> Receiver<T> {
     pub fn from_unix_stream(fd: UnixStream) -> Self {
         Receiver {
             fd,
@@ -139,19 +140,19 @@ impl<T: SerializeSafe> Receiver<T> {
     }
 }
 
-impl<T: SerializeSafe> AsRawFd for Receiver<T> {
+impl<T: Deserialize> AsRawFd for Receiver<T> {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 }
 
-impl<T: SerializeSafe> FromRawFd for Receiver<T> {
+impl<T: Deserialize> FromRawFd for Receiver<T> {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
         Self::from_unix_stream(UnixStream::from_raw_fd(fd))
     }
 }
 
-impl<S: SerializeSafe, R: SerializeSafe> Duplex<S, R> {
+impl<S: Serialize, R: Deserialize> Duplex<S, R> {
     pub fn send(&mut self, value: &S) -> Result<()> {
         self.sender.send(value)
     }

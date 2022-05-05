@@ -1,15 +1,17 @@
 #![feature(io_safety)]
-// The code using the following features is mostly copied from stdlib, so it should stay relatively
-// safe
 #![feature(auto_traits)]
 #![feature(negative_impls)]
+#![feature(specialization)]
 #![feature(unix_socket_ancillary_data)]
+#![feature(unboxed_closures)]
+#![feature(fn_traits)]
+#![feature(ptr_metadata)]
+#![feature(never_type)]
+#![feature(generic_associated_types)]
 
 extern crate self as multiprocessing;
 
 pub use multiprocessing_derive::*;
-
-pub trait Entrypoint {}
 
 pub mod imp;
 
@@ -28,3 +30,6 @@ pub mod subprocess;
 pub use subprocess::Child;
 
 pub mod builtins;
+
+pub mod fns;
+pub use fns::*;

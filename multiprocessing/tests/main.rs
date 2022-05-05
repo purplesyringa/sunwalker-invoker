@@ -1,6 +1,6 @@
-use multiprocessing::{channel, duplex, Duplex, Receiver, Sender, SerializeSafe};
+use multiprocessing::{channel, duplex, Bind, Duplex, Object, Receiver, Sender, TraitObject};
 
-#[derive(Debug, PartialEq, SerializeSafe)]
+#[derive(Debug, PartialEq, Object)]
 struct SimplePair {
     x: i32,
     y: i32,
@@ -9,6 +9,11 @@ struct SimplePair {
 #[multiprocessing::entrypoint]
 fn simple() -> i64 {
     0x123456789abcdef
+}
+
+#[multiprocessing::entrypoint]
+fn ret_string() -> String {
+    "hello".to_string()
 }
 
 #[multiprocessing::entrypoint]
@@ -22,6 +27,53 @@ fn swap_complex_argument(pair: SimplePair) -> SimplePair {
         x: pair.y,
         y: pair.x,
     }
+}
+
+#[multiprocessing::entrypoint]
+fn inc_with_boxed(item: Box<i32>) -> Box<i32> {
+    Box::new(*item + 1)
+}
+
+trait Trait: TraitObject {
+    fn say(&self) -> String;
+}
+
+#[derive(Object)]
+struct ImplA(String);
+
+#[derive(Object)]
+struct ImplB(i32);
+
+impl Trait for ImplA {
+    fn say(&self) -> String {
+        format!("ImplA says: {}", self.0)
+    }
+}
+
+impl Trait for ImplB {
+    fn say(&self) -> String {
+        format!("ImplB says: {}", self.0)
+    }
+}
+
+#[multiprocessing::entrypoint]
+fn with_passed_trait(arg: Box<dyn Trait>) -> String {
+    arg.say()
+}
+
+#[multiprocessing::entrypoint]
+fn with_passed_fn(func: Box<dyn multiprocessing::Fn<(i32, i32), Output = i32>>) -> i32 {
+    func(5, 7)
+}
+
+#[multiprocessing::entrypoint]
+fn with_passed_bound_fn(func: Box<dyn multiprocessing::Fn<(i32,), Output = i32>>) -> i32 {
+    func(7)
+}
+
+#[multiprocessing::entrypoint]
+fn with_passed_double_bound_fn(func: Box<dyn multiprocessing::Fn<(), Output = i32>>) -> i32 {
+    func()
 }
 
 #[multiprocessing::entrypoint]
@@ -47,13 +99,24 @@ fn with_passed_duplex(mut chan: Duplex<i32, (i32, i32)>) -> () {
 #[multiprocessing::main]
 fn main() {
     assert_eq!(
-        simple::spawn().unwrap().join().expect("simple failed"),
+        simple.spawn().unwrap().join().expect("simple failed"),
         0x123456789abcdef
     );
     println!("simple OK");
 
     assert_eq!(
-        add_with_arguments::spawn(5, 7)
+        ret_string
+            .spawn()
+            .unwrap()
+            .join()
+            .expect("ret_string failed"),
+        "hello"
+    );
+    println!("ret_string OK");
+
+    assert_eq!(
+        add_with_arguments
+            .spawn(5, 7)
             .unwrap()
             .join()
             .expect("add_with_arguments failed"),
@@ -61,8 +124,12 @@ fn main() {
     );
     println!("add_with_arguments OK");
 
+    assert_eq!(add_with_arguments(5, 7), 12);
+    println!("add_with_arguments call OK");
+
     assert_eq!(
-        swap_complex_argument::spawn(SimplePair { x: 5, y: 7 })
+        swap_complex_argument
+            .spawn(SimplePair { x: 5, y: 7 })
             .unwrap()
             .join()
             .expect("swap_complex_argument failed"),
@@ -70,9 +137,67 @@ fn main() {
     );
     println!("swap_complex_argument OK");
 
+    assert_eq!(
+        *inc_with_boxed
+            .spawn(Box::new(7))
+            .unwrap()
+            .join()
+            .expect("inc_with_boxed failed"),
+        8
+    );
+    println!("inc_with_boxed OK");
+
+    assert_eq!(
+        with_passed_trait
+            .spawn(Box::new(ImplA("hello".to_string())))
+            .unwrap()
+            .join()
+            .expect("with_passed_trait failed"),
+        "ImplA says: hello"
+    );
+    assert_eq!(
+        with_passed_trait
+            .spawn(Box::new(ImplB(5)))
+            .unwrap()
+            .join()
+            .expect("with_passed_trait failed"),
+        "ImplB says: 5"
+    );
+    println!("with_passed_trait OK");
+
+    assert_eq!(
+        with_passed_fn
+            .spawn(Box::new(add_with_arguments))
+            .unwrap()
+            .join()
+            .expect("with_passed_fn failed"),
+        12
+    );
+    println!("with_passed_fn OK");
+
+    assert_eq!(
+        with_passed_bound_fn
+            .spawn(Box::new(add_with_arguments.bind(5)))
+            .unwrap()
+            .join()
+            .expect("with_passed_bound_fn failed"),
+        12
+    );
+    println!("with_passed_bound_fn OK");
+
+    assert_eq!(
+        with_passed_double_bound_fn
+            .spawn(Box::new(add_with_arguments.bind(5).bind(7)))
+            .unwrap()
+            .join()
+            .expect("with_passed_double_bound_fn failed"),
+        12
+    );
+    println!("with_passed_double_bound_fn OK");
+
     {
         let (mut tx, rx) = channel::<i32>().unwrap();
-        let mut child = with_passed_rx::spawn(rx).unwrap();
+        let mut child = with_passed_rx.spawn(rx).unwrap();
         tx.send(&5).unwrap();
         tx.send(&7).unwrap();
         assert_eq!(child.join().expect("with_passed_rx failed"), -2);
@@ -81,7 +206,7 @@ fn main() {
 
     {
         let (tx, mut rx) = channel::<i32>().unwrap();
-        let mut child = with_passed_tx::spawn(tx).unwrap();
+        let mut child = with_passed_tx.spawn(tx).unwrap();
         assert_eq!(
             rx.recv().unwrap().unwrap() - rx.recv().unwrap().unwrap(),
             -2
@@ -92,7 +217,7 @@ fn main() {
 
     {
         let (mut local, downstream) = duplex::<(i32, i32), i32>().unwrap();
-        let mut child = with_passed_duplex::spawn(downstream).unwrap();
+        let mut child = with_passed_duplex.spawn(downstream).unwrap();
         for (x, y) in [(5, 7), (100, -1), (53, 2354)] {
             local.send(&(x, y)).unwrap();
             assert_eq!(local.recv().unwrap().unwrap(), x - y);

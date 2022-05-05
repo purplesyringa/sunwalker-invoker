@@ -27,6 +27,8 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
         input.sig.ident.to_string(),
         &input as *const syn::ItemFn
     );
+
+    let type_ident = format_ident!("T_{}", link_name);
     let fn_name_ident = format_ident!("f_{}", link_name);
     let real_entry_ident = format_ident!("e_{}", link_name);
     let args_struct_name_ident = format_ident!("S_{}", link_name);
@@ -41,17 +43,22 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
     let args = &input.sig.inputs;
 
     let mut fn_args = Vec::new();
+    let mut fn_types = Vec::new();
     let mut extracted_args = Vec::new();
     let mut arg_names = Vec::new();
-    for arg in args {
+    let mut args_from_tuple = Vec::new();
+    for (i, arg) in args.iter().enumerate() {
+        let i = syn::Index::from(i);
         if let syn::FnArg::Typed(pattype) = arg {
             if let syn::Pat::Ident(ref patident) = *pattype.pat {
                 let ident = &patident.ident;
                 let colon_token = &pattype.colon_token;
                 let ty = &pattype.ty;
                 fn_args.push(quote! { #ident #colon_token #ty });
+                fn_types.push(quote! { #ty });
                 extracted_args.push(quote! { multiprocessing_args.#ident });
                 arg_names.push(quote! { #ident });
+                args_from_tuple.push(quote! { args.#i });
             } else {
                 unreachable!();
             }
@@ -73,9 +80,23 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
                 let mut output_tx = unsafe {
                     ::multiprocessing::tokio::Sender::<#return_type>::from_raw_fd(output_tx_fd)
                 };
-                let multiprocessing_args = input_rx.recv().await.unwrap().unwrap();
-                output_tx.send(&#ident::call( #(#extracted_args,)* ).await).await.unwrap();
+                let multiprocessing_args = input_rx
+                    .recv()
+                    .await
+                    .expect("Failed to receive subprocess input")
+                    .expect("EOF encountered while subprocess input was expected");
+                output_tx
+                    .send(&#type_ident::call( #(#extracted_args,)* ).await)
+                    .await
+                    .expect("Failed to send subprocess output");
                 0
+            }
+
+            impl ::multiprocessing::Entrypoint<(#(#fn_types,)*)> for #type_ident {
+                type Output = ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = #return_type> + ::std::marker::Send>>;
+                fn call(args: (#(#fn_types,)*)) -> Self::Output {
+                    ::std::boxed::Box::pin(#type_ident::call(#(#args_from_tuple,)*))
+                }
             }
         };
     } else {
@@ -88,15 +109,27 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
                 let mut output_tx = unsafe {
                     ::multiprocessing::Sender::<#return_type>::from_raw_fd(output_tx_fd)
                 };
-                let multiprocessing_args = input_rx.recv().unwrap().unwrap();
-                output_tx.send(&#ident::call( #(#extracted_args,)* )).unwrap();
+                let multiprocessing_args = input_rx
+                    .recv()
+                    .expect("Failed to receive subprocess input")
+                    .expect("EOF encountered while subprocess input was expected");
+                output_tx
+                    .send(&#type_ident::call( #(#extracted_args,)* ))
+                    .expect("Failed to send subprocess output");
                 0
+            }
+
+            impl ::multiprocessing::Entrypoint<(#(#fn_types,)*)> for #type_ident {
+                type Output = #return_type;
+                fn call(args: (#(#fn_types,)*)) -> Self::Output {
+                    #type_ident::call(#(#args_from_tuple,)*)
+                }
             }
         };
     }
 
     let expanded = quote! {
-        #[derive(::multiprocessing::SerializeSafe)]
+        #[derive(::multiprocessing::Object)]
         struct #args_struct_name_ident {
             #(#fn_args,)*
         }
@@ -105,18 +138,21 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
 
         #[::multiprocessing::imp::ctor]
         fn #fn_name_ident() {
-            ::multiprocessing::imp::ENTRY_POINTS.write().unwrap().insert(#link_name, #real_entry_ident);
+            ::multiprocessing::imp::ENTRY_POINTS
+                .write()
+                .expect("Failed to acquire write access to ENTRY_POINTS")
+                .insert(#link_name, #real_entry_ident);
         }
 
         #[allow(non_camel_case_types)]
-        struct #ident {
-        }
+        #[derive(::multiprocessing::Object)]
+        struct #type_ident;
 
-        impl #ident {
+        impl #type_ident {
             #[link_name = #link_name]
             #input
 
-            pub fn spawn(#(#fn_args,)*) -> ::std::io::Result<::multiprocessing::Child<#return_type>> {
+            pub fn spawn(&self, #(#fn_args,)*) -> ::std::io::Result<::multiprocessing::Child<#return_type>> {
                 use ::std::os::unix::{process::CommandExt, io::AsRawFd};
 
                 let (mut input_tx, mut input_rx) = ::multiprocessing::channel::<#args_struct_name_ident>()?;
@@ -147,10 +183,42 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
 
                 Ok(::multiprocessing::Child::new(child, output_rx))
             }
+
+            pub async fn spawn_tokio(&self, #(#fn_args,)*) -> ::std::io::Result<::multiprocessing::tokio::Child<#return_type>> {
+                use ::std::os::unix::io::AsRawFd;
+
+                let (mut input_tx, mut input_rx) = ::multiprocessing::tokio::channel::<#args_struct_name_ident>()?;
+                let input_rx_fd = input_rx.as_raw_fd();
+
+                let (mut output_tx, mut output_rx) = ::multiprocessing::tokio::channel::<#return_type>()?;
+                let output_tx_fd = output_tx.as_raw_fd();
+
+                let mut command = ::tokio::process::Command::new("/proc/self/exe");
+                let child = unsafe {
+                    command
+                        .arg0(#link_name)
+                        .arg(input_rx_fd.to_string())
+                        .arg(output_tx_fd.to_string())
+                        .pre_exec(move || {
+                            ::multiprocessing::imp::disable_cloexec(input_rx_fd)?;
+                            ::multiprocessing::imp::disable_cloexec(output_tx_fd)?;
+                            Ok(())
+                        })
+                        .spawn()?
+                };
+
+                input_tx.send(
+                    &#args_struct_name_ident {
+                        #(#arg_names,)*
+                    }
+                ).await?;
+
+                Ok(::multiprocessing::tokio::Child::new(child, output_rx))
+            }
         }
 
-        impl ::multiprocessing::Entrypoint for #ident {
-        }
+        #[allow(non_upper_case_globals)]
+        const #ident: ::multiprocessing::EntrypointWrapper<#type_ident> = ::multiprocessing::EntrypointWrapper(#type_ident);
     };
 
     TokenStream::from(expanded)
@@ -167,7 +235,9 @@ pub fn main(_meta: TokenStream, input: TokenStream) -> TokenStream {
 
         #[::multiprocessing::imp::ctor]
         fn multiprocessing_add_main() {
-            *::multiprocessing::imp::MAIN_ENTRY.write().unwrap() = Some(|| {
+            *::multiprocessing::imp::MAIN_ENTRY
+                .write()
+                .expect("Failed to acquire write access to MAIN_ENTRY") = Some(|| {
                 ::multiprocessing::imp::Report::report(multiprocessing_old_main())
             });
         }
@@ -180,8 +250,8 @@ pub fn main(_meta: TokenStream, input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-#[proc_macro_derive(SerializeSafe)]
-pub fn derive_serialize_safe(input: TokenStream) -> TokenStream {
+#[proc_macro_derive(Object)]
+pub fn derive_object(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
     let ident = &input.ident;
@@ -200,9 +270,37 @@ pub fn derive_serialize_safe(input: TokenStream) -> TokenStream {
         quote! { <#(#params,)*> }
     };
 
-    let generics_impl = {
-        let params = input.generics.params;
-        quote! { <#params> }
+    let generic_params = &input.generics.params;
+    let generics_impl = quote! { <#generic_params> };
+
+    let generics_impl_serde = {
+        let params: Vec<_> = input
+            .generics
+            .params
+            .iter()
+            .map(|param| match param {
+                syn::GenericParam::Type(ref ty) => {
+                    let ident = ty.ident.to_token_stream();
+                    if ty.colon_token.is_some() {
+                        let old_bounds = &ty.bounds;
+                        quote! { #ident: 'serde + #old_bounds }
+                    } else {
+                        quote! { #ident: 'serde }
+                    }
+                }
+                syn::GenericParam::Lifetime(ref lt) => {
+                    let ident = lt.lifetime.to_token_stream();
+                    if lt.colon_token.is_some() {
+                        let old_bounds = &lt.bounds;
+                        quote! { #ident: 'serde + #old_bounds }
+                    } else {
+                        quote! { #ident: 'serde }
+                    }
+                }
+                syn::GenericParam::Const(ref con) => con.ident.to_token_stream(),
+            })
+            .collect();
+        quote! { <'serde, #(#params,)*> }
     };
 
     let generics_where = input.generics.where_clause;
@@ -223,20 +321,29 @@ pub fn derive_serialize_safe(input: TokenStream) -> TokenStream {
                     }
                 });
                 quote! {
-                    impl #generics_impl ::multiprocessing::SerializeSafe for #ident #generics #generics_where {
+                    impl #generics_impl ::multiprocessing::Serialize for #ident #generics #generics_where {
                         fn serialize_self(&self, s: &mut ::multiprocessing::Serializer) {
                             #(#serialize_fields)*
                         }
+                    }
+                    impl #generics_impl ::multiprocessing::Deserialize for #ident #generics #generics_where {
                         fn deserialize_self(d: &mut ::multiprocessing::Deserializer) -> Self {
                             Self {
                                 #(#deserialize_fields)*
                             }
                         }
                     }
+                    impl #generics_impl_serde ::multiprocessing::DeserializeBoxed<'serde> for #ident #generics #generics_where {
+                        unsafe fn deserialize_on_heap(&self, d: &mut ::multiprocessing::Deserializer) -> ::std::boxed::Box<dyn ::multiprocessing::DeserializeBoxed<'serde> + 'serde> {
+                            use ::multiprocessing::Deserialize;
+                            ::std::boxed::Box::new(Self::deserialize_self(d))
+                        }
+                    }
                 }
             }
             syn::Fields::Unnamed(fields) => {
                 let serialize_fields = fields.unnamed.iter().enumerate().map(|(i, _)| {
+                    let i = syn::Index::from(i);
                     quote! {
                         s.serialize(&self.#i);
                     }
@@ -247,26 +354,41 @@ pub fn derive_serialize_safe(input: TokenStream) -> TokenStream {
                     }
                 });
                 quote! {
-                    impl #generics_impl ::multiprocessing::SerializeSafe for #ident #generics #generics_where {
+                    impl #generics_impl ::multiprocessing::Serialize for #ident #generics #generics_where {
                         fn serialize_self(&self, s: &mut ::multiprocessing::Serializer) {
                             #(#serialize_fields)*
                         }
+                    }
+                    impl #generics_impl ::multiprocessing::Deserialize for #ident #generics #generics_where {
                         fn deserialize_self(d: &mut ::multiprocessing::Deserializer) -> Self {
                             Self(
                                 #(#deserialize_fields)*
                             )
                         }
                     }
+                    impl #generics_impl_serde ::multiprocessing::DeserializeBoxed<'serde> for #ident #generics #generics_where {
+                        unsafe fn deserialize_on_heap(&self, d: &mut ::multiprocessing::Deserializer) -> ::std::boxed::Box<dyn ::multiprocessing::DeserializeBoxed<'serde> + 'serde> {
+                            use ::multiprocessing::Deserialize;
+                            ::std::boxed::Box::new(Self::deserialize_self(d))
+                        }
+                    }
                 }
             }
             syn::Fields::Unit => {
                 quote! {
-                    impl #generics_impl ::multiprocessing::SerializeSafe for #ident #generics #generics_where {
+                    impl #generics_impl ::multiprocessing::Serialize for #ident #generics #generics_where {
                         fn serialize_self(&self, s: &mut ::multiprocessing::Serializer) {
-                            s.serialize(&self.0);
                         }
+                    }
+                    impl #generics_impl ::multiprocessing::Deserialize for #ident #generics #generics_where {
                         fn deserialize_self(d: &mut ::multiprocessing::Deserializer) -> Self {
-                            Self(d.deserialize())
+                            Self
+                        }
+                    }
+                    impl #generics_impl_serde ::multiprocessing::DeserializeBoxed<'serde> for #ident #generics #generics_where {
+                        unsafe fn deserialize_on_heap(&self, d: &mut ::multiprocessing::Deserializer) -> ::std::boxed::Box<dyn ::multiprocessing::DeserializeBoxed<'serde> + 'serde> {
+                            use ::multiprocessing::Deserialize;
+                            ::std::boxed::Box::new(Self::deserialize_self(d))
                         }
                     }
                 }
@@ -314,17 +436,25 @@ pub fn derive_serialize_safe(input: TokenStream) -> TokenStream {
                 }
             });
             quote! {
-                impl #generics_impl ::multiprocessing::SerializeSafe for #ident #generics #generics_where {
+                impl #generics_impl ::multiprocessing::Serialize for #ident #generics #generics_where {
                     fn serialize_self(&self, s: &mut ::multiprocessing::Serializer) {
                         match self {
                             #(#serialize_variants,)*
                         }
                     }
+                }
+                impl #generics_impl ::multiprocessing::Deserialize for #ident #generics #generics_where {
                     fn deserialize_self(d: &mut ::multiprocessing::Deserializer) -> Self {
                         match d.deserialize::<usize>() {
                             #(#deserialize_variants,)*
                             _ => panic!("Unexpected enum variant"),
                         }
+                    }
+                }
+                impl #generics_impl_serde ::multiprocessing::DeserializeBoxed<'serde> for #ident #generics #generics_where {
+                    unsafe fn deserialize_on_heap(&self, d: &mut ::multiprocessing::Deserializer) -> ::std::boxed::Box<dyn ::multiprocessing::DeserializeBoxed<'serde> + 'serde> {
+                        use ::multiprocessing::Deserialize;
+                        ::std::boxed::Box::new(Self::deserialize_self(d))
                     }
                 }
             }

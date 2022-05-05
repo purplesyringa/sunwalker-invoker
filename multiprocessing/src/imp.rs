@@ -36,18 +36,38 @@ impl<T, E: std::fmt::Debug> Report for Result<T, E> {
 
 pub fn main() {
     let mut args = std::env::args();
-    let s = args.next().unwrap();
-    if s.starts_with("multiprocessing_") {
-        let entry_points = ENTRY_POINTS.read().unwrap();
-        if let Some(entry) = entry_points.get(s.as_str()) {
-            let input_rx_fd: RawFd = args.next().unwrap().parse().unwrap();
-            let output_tx_fd: RawFd = args.next().unwrap().parse().unwrap();
-            enable_cloexec(input_rx_fd).unwrap();
-            enable_cloexec(output_tx_fd).unwrap();
-            std::process::exit(entry(input_rx_fd, output_tx_fd));
+    if let Some(s) = args.next() {
+        if s.starts_with("multiprocessing_") {
+            let entry_points = ENTRY_POINTS
+                .read()
+                .expect("Failed to acquire read access to ENTRY_POINTS");
+            if let Some(entry) = entry_points.get(s.as_str()) {
+                let input_rx_fd: RawFd = args
+                    .next()
+                    .expect("Expected two CLI arguments for multiprocessing_*")
+                    .parse()
+                    .expect(
+                        "Expected the first CLI argument after multiprocessing_* to be an integer",
+                    );
+                let output_tx_fd: RawFd = args
+                    .next()
+                    .expect("Expected two CLI arguments for multiprocessing_*")
+                    .parse()
+                    .expect(
+                        "Expected the second CLI argument after multiprocessing_* to be an integer",
+                    );
+                enable_cloexec(input_rx_fd).expect("Failed to set O_CLOEXEC for input_rx_fd");
+                enable_cloexec(output_tx_fd).expect("Failed to set O_CLOEXEC for output_tx_fd");
+                std::process::exit(entry(input_rx_fd, output_tx_fd));
+            }
         }
     }
-    std::process::exit(MAIN_ENTRY.read().unwrap().unwrap()());
+    std::process::exit(MAIN_ENTRY
+        .read()
+        .expect("Failed to acquire read access to MAIN_ENTRY")
+        .expect(
+            "MAIN_ENTRY was not registered: is #[multiprocessing::main] missing?",
+        )());
 }
 
 pub fn disable_cloexec(fd: RawFd) -> std::io::Result<()> {

@@ -1,4 +1,4 @@
-use crate::{Deserializer, SerializeSafe, Serializer};
+use crate::{Deserialize, Deserializer, Object, Serialize, Serializer};
 use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Result};
 use std::marker::PhantomData;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -7,25 +7,25 @@ use tokio_seqpacket::{
     UnixSeqpacket,
 };
 
-#[derive(SerializeSafe)]
-pub struct Sender<T: SerializeSafe> {
+#[derive(Object)]
+pub struct Sender<T: Serialize> {
     fd: UnixSeqpacket,
     marker: PhantomData<T>,
 }
 
-#[derive(SerializeSafe)]
-pub struct Receiver<T: SerializeSafe> {
+#[derive(Object)]
+pub struct Receiver<T: Deserialize> {
     fd: UnixSeqpacket,
     marker: PhantomData<T>,
 }
 
-#[derive(SerializeSafe)]
-pub struct Duplex<S: SerializeSafe, R: SerializeSafe> {
+#[derive(Object)]
+pub struct Duplex<S: Serialize, R: Deserialize> {
     sender: Sender<S>,
     receiver: Receiver<R>,
 }
 
-pub fn channel<T: SerializeSafe>() -> Result<(Sender<T>, Receiver<T>)> {
+pub fn channel<T: Serialize + Deserialize>() -> Result<(Sender<T>, Receiver<T>)> {
     let (tx, rx) = UnixSeqpacket::pair()?;
     Ok((
         Sender::from_unix_seqpacket(tx),
@@ -33,7 +33,8 @@ pub fn channel<T: SerializeSafe>() -> Result<(Sender<T>, Receiver<T>)> {
     ))
 }
 
-pub fn duplex<A: SerializeSafe, B: SerializeSafe>() -> Result<(Duplex<A, B>, Duplex<B, A>)> {
+pub fn duplex<A: Serialize + Deserialize, B: Serialize + Deserialize>(
+) -> Result<(Duplex<A, B>, Duplex<B, A>)> {
     let (a_tx, a_rx) = channel::<A>()?;
     let (b_tx, b_rx) = channel::<B>()?;
     Ok((
@@ -48,7 +49,7 @@ pub fn duplex<A: SerializeSafe, B: SerializeSafe>() -> Result<(Duplex<A, B>, Dup
     ))
 }
 
-impl<T: SerializeSafe> Sender<T> {
+impl<T: Serialize> Sender<T> {
     pub fn from_unix_seqpacket(fd: UnixSeqpacket) -> Self {
         Sender {
             fd,
@@ -97,19 +98,21 @@ impl<T: SerializeSafe> Sender<T> {
     }
 }
 
-impl<T: SerializeSafe> AsRawFd for Sender<T> {
+impl<T: Serialize> AsRawFd for Sender<T> {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 }
 
-impl<T: SerializeSafe> FromRawFd for Sender<T> {
+impl<T: Serialize> FromRawFd for Sender<T> {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        Self::from_unix_seqpacket(UnixSeqpacket::from_raw_fd(fd).unwrap())
+        Self::from_unix_seqpacket(UnixSeqpacket::from_raw_fd(fd).expect(
+            "Failed to register fd in tokio in multiprocessing::tokio::Sender::from_raw_fd",
+        ))
     }
 }
 
-impl<T: SerializeSafe> Receiver<T> {
+impl<T: Deserialize> Receiver<T> {
     pub fn from_unix_seqpacket(fd: UnixSeqpacket) -> Self {
         Receiver {
             fd,
@@ -169,23 +172,63 @@ impl<T: SerializeSafe> Receiver<T> {
     }
 }
 
-impl<T: SerializeSafe> AsRawFd for Receiver<T> {
+impl<T: Deserialize> AsRawFd for Receiver<T> {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 }
 
-impl<T: SerializeSafe> FromRawFd for Receiver<T> {
+impl<T: Deserialize> FromRawFd for Receiver<T> {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        Self::from_unix_seqpacket(UnixSeqpacket::from_raw_fd(fd).unwrap())
+        Self::from_unix_seqpacket(UnixSeqpacket::from_raw_fd(fd).expect(
+            "Failed to register fd in tokio in multiprocessing::tokio::Receiver::from_raw_fd",
+        ))
     }
 }
 
-impl<S: SerializeSafe, R: SerializeSafe> Duplex<S, R> {
+impl<S: Serialize, R: Deserialize> Duplex<S, R> {
     pub async fn send(&mut self, value: &S) -> Result<()> {
         self.sender.send(value).await
     }
     pub async fn recv(&mut self) -> Result<Option<R>> {
         self.receiver.recv().await
+    }
+}
+
+pub struct Child<T: Deserialize> {
+    proc: tokio::process::Child,
+    output_rx: Receiver<T>,
+}
+
+impl<T: Deserialize> Child<T> {
+    pub fn new(proc: tokio::process::Child, output_rx: Receiver<T>) -> Child<T> {
+        Child { proc, output_rx }
+    }
+
+    pub async fn kill(&mut self) -> Result<()> {
+        self.proc.kill().await
+    }
+
+    pub fn id(&mut self) -> u32 {
+        self.proc.id().expect(
+            "multiprocessing::tokio::Child::id() cannot be called after the process is terminated",
+        )
+    }
+
+    pub async fn join(&mut self) -> Result<T> {
+        let value = self.output_rx.recv().await?;
+        if self.proc.wait().await?.success() {
+            value.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "The subprocess terminated without returning a value",
+                )
+            })
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "The subprocess did not terminate successfully",
+            ))
+        }
     }
 }

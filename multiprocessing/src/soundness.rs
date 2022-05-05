@@ -1,6 +1,6 @@
-use crate::serde::SerializeSafe;
+use crate::serde::Serialize;
 
-pub trait TransferOwnership: SerializeSafe {
+pub trait TransferOwnership: Serialize {
     // fn terminate(self);
     // fn wakeup();
 }

@@ -1,12 +1,12 @@
-use crate::{Receiver, SerializeSafe};
+use crate::{Deserialize, Receiver};
 use std::io::Result;
 
-pub struct Child<T: SerializeSafe> {
+pub struct Child<T: Deserialize> {
     proc: std::process::Child,
     output_rx: Receiver<T>,
 }
 
-impl<T: SerializeSafe> Child<T> {
+impl<T: Deserialize> Child<T> {
     pub fn new(proc: std::process::Child, output_rx: Receiver<T>) -> Child<T> {
         Child { proc, output_rx }
     }
