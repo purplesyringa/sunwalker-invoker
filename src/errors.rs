@@ -1,6 +1,7 @@
+use multiprocessing::Object;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Object)]
 pub enum Error {
     InvokerFailure(String),
     ConductorFailure(String),

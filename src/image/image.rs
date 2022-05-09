@@ -1,22 +1,21 @@
 use crate::{
+    errors,
     image::{config, language, package},
-    system,
 };
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use multiprocessing::Object;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-// Duplicating an owned image via serializing or cloning it is unsafe
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Debug, Object)]
 pub struct Image {
     pub mountpoint: std::path::PathBuf,
     pub config: config::Config,
     pub language_to_package_name: HashMap<String, String>,
-    // owned == true: Automatically unmounted on Drop.
-    // owned == false: Assumes the mountpoint never dies and doesn't unmount it itself. The former
-    // is guaranteed if the mount namespace is unshared.
-    // owned: bool,
+}
+
+#[derive(Debug)]
+pub struct AutoUnmountedImage {
+    pub image: Image,
 }
 
 impl Image {
@@ -30,32 +29,29 @@ impl Image {
         self.language_to_package_name.contains_key(name)
     }
 
-    pub fn get_language(image: Arc<Image>, name: String) -> Result<language::Language> {
+    pub fn get_language(
+        image: Arc<Image>,
+        name: String,
+    ) -> Result<language::Language, errors::Error> {
         let package_name = image
             .language_to_package_name
             .get(&name)
-            .with_context(|| format!("The image does not provide language {}", name))?
+            .ok_or_else(|| {
+                errors::UserFailure(format!("The image does not provide language {}", name))
+            })?
             .clone();
         package::Package::new(image, package_name)?.get_language(&name)
     }
-
-    // pub fn clone_disowned(&self) -> Image {
-    //     Image {
-    //         mountpoint: self.mountpoint.clone(),
-    //         config: self.config.clone(),
-    //         language_to_package_name: self.language_to_package_name.clone(),
-    //         owned: false,
-    //     }
-    // }
 }
 
-impl Drop for Image {
-    fn drop(&mut self) {
-        // if self.owned {
-        // TODO: add logging
-        system::umount(&self.mountpoint)
-            .or_else(|_| system::umount_opt(&self.mountpoint, system::MNT_DETACH))
-            .expect(&format!("Unmounting {:?} failed", self));
-        // }
-    }
-}
+// Leaks? Who cares? At least it doesn't crash magnificently.
+// impl Drop for Image {
+//     fn drop(&mut self) {
+//         system::umount(&self.mountpoint)
+//             .or_else(|_| system::umount_opt(&self.mountpoint, system::MNT_DETACH))
+//             .expect(&format!(
+//                 "Failed to unmount image at {:?}",
+//                 self.mountpoint
+//             ));
+//     }
+// }

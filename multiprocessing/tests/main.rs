@@ -22,6 +22,11 @@ fn add_with_arguments(x: i32, y: i32) -> i32 {
 }
 
 #[multiprocessing::entrypoint]
+fn add_with_template<T: std::ops::Add<Output = T> + Object + 'static>(x: T, y: T) -> T {
+    x + y
+}
+
+#[multiprocessing::entrypoint]
 fn swap_complex_argument(pair: SimplePair) -> SimplePair {
     SimplePair {
         x: pair.y,
@@ -126,6 +131,16 @@ fn main() {
 
     assert_eq!(add_with_arguments(5, 7), 12);
     println!("add_with_arguments call OK");
+
+    assert_eq!(
+        add_with_template
+            .spawn(5, 7)
+            .unwrap()
+            .join()
+            .expect("add_with_template failed"),
+        12
+    );
+    println!("add_with_template OK");
 
     assert_eq!(
         swap_complex_argument

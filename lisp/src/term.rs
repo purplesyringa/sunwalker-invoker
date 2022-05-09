@@ -1,9 +1,9 @@
 use crate::typed::{LispType, NativeType, TypedRef};
-use serde::{Deserialize, Serialize};
+use multiprocessing::Object;
 use std::convert::Infallible;
 use std::fmt::Debug;
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Object)]
 pub struct CallTerm {
     pub name: String,
     pub params: Vec<Term>,
@@ -19,7 +19,7 @@ impl Debug for CallTerm {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Object)]
 pub enum Term {
     Call(CallTerm),
     String(String),

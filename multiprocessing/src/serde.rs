@@ -129,5 +129,5 @@ pub trait DeserializeBoxed<'a> {
 pub trait Object: Serialize + Deserialize {}
 impl<T: Serialize + Deserialize> Object for T {}
 
-pub trait TraitObject: Serialize + for<'a> DeserializeBoxed<'a> {}
-impl<T: Serialize + Deserialize + for<'a> DeserializeBoxed<'a>> TraitObject for T {}
+pub trait TraitObject: Serialize + for<'a> DeserializeBoxed<'a> + Send {}
+impl<T: Serialize + Deserialize + for<'a> DeserializeBoxed<'a> + Send> TraitObject for T {}

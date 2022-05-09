@@ -21,6 +21,57 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
         syn::ReturnType::Type(_, ref ty) => quote! { #ty },
     };
 
+    let generic_params = &input.sig.generics;
+    let generics = {
+        let params: Vec<_> = input
+            .sig
+            .generics
+            .params
+            .iter()
+            .map(|param| match param {
+                syn::GenericParam::Type(ref ty) => ty.ident.to_token_stream(),
+                syn::GenericParam::Lifetime(ref lt) => lt.lifetime.to_token_stream(),
+                syn::GenericParam::Const(ref con) => con.ident.to_token_stream(),
+            })
+            .collect();
+        quote! { <#(#params,)*> }
+    };
+    let generic_phantom: Vec<_> = input
+        .sig
+        .generics
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, param)| {
+            let field = format_ident!("f{}", i);
+            match param {
+                syn::GenericParam::Type(ref ty) => {
+                    let ident = &ty.ident;
+                    quote! { #field: std::marker::PhantomData<fn(#ident) -> #ident> }
+                }
+                syn::GenericParam::Lifetime(ref lt) => {
+                    let lt = &lt.lifetime;
+                    quote! { #field: std::marker::PhantomData<& #lt ()> }
+                }
+                syn::GenericParam::Const(ref _con) => {
+                    unimplemented!()
+                }
+            }
+        })
+        .collect();
+    let generic_phantom_build: Vec<_> = (0..input.sig.generics.params.len())
+        .map(|i| {
+            let field = format_ident!("f{}", i);
+            quote! { #field: std::marker::PhantomData }
+        })
+        .collect();
+    // input.sig.generics = syn::Generics {
+    //     lt_token: None,
+    //     params: syn::punctuated::Punctuated::new(),
+    //     gt_token: None,
+    //     where_clause: None,
+    // };
+
     // Pray all &input are distinct
     let link_name = format!(
         "multiprocessing_{}_{:?}",
@@ -29,9 +80,7 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
     );
 
     let type_ident = format_ident!("T_{}", link_name);
-    let fn_name_ident = format_ident!("f_{}", link_name);
-    let real_entry_ident = format_ident!("e_{}", link_name);
-    let args_struct_name_ident = format_ident!("S_{}", link_name);
+    let entry_ident = format_ident!("E_{}", link_name);
 
     let ident = input.sig.ident;
     input.sig.ident = format_ident!("call");
@@ -47,6 +96,7 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
     let mut extracted_args = Vec::new();
     let mut arg_names = Vec::new();
     let mut args_from_tuple = Vec::new();
+    let mut binding = Vec::new();
     for (i, arg) in args.iter().enumerate() {
         let i = syn::Index::from(i);
         if let syn::FnArg::Typed(pattype) = arg {
@@ -59,6 +109,7 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
                 extracted_args.push(quote! { multiprocessing_args.#ident });
                 arg_names.push(quote! { #ident });
                 args_from_tuple.push(quote! { args.#i });
+                binding.push(quote! { .bind(#ident) });
             } else {
                 unreachable!();
             }
@@ -67,59 +118,86 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
         }
     }
 
+    let bound;
+    if args.len() == 0 {
+        bound = quote! { #ident };
+    } else {
+        let head_ty = &fn_types[0];
+        let tail_ty = &fn_types[1..];
+        let head_arg = &arg_names[0];
+        let tail_binding = &binding[1..];
+        bound = quote! {
+            Bind::<#head_ty, (#(#tail_ty,)*)>::bind(Box::new(#ident), #head_arg) #(#tail_binding)*
+        };
+    }
+
     let entrypoint;
 
     if let Some(tokio_attr) = tokio_attr {
         entrypoint = quote! {
-            #tokio_attr
-            async fn #real_entry_ident(input_rx_fd: ::std::os::unix::io::RawFd, output_tx_fd: ::std::os::unix::io::RawFd) -> i32 {
-                use ::std::os::unix::io::FromRawFd;
-                let mut input_rx = unsafe {
-                    ::multiprocessing::tokio::Receiver::<#args_struct_name_ident>::from_raw_fd(input_rx_fd)
-                };
-                let mut output_tx = unsafe {
-                    ::multiprocessing::tokio::Sender::<#return_type>::from_raw_fd(output_tx_fd)
-                };
-                let multiprocessing_args = input_rx
-                    .recv()
-                    .await
-                    .expect("Failed to receive subprocess input")
-                    .expect("EOF encountered while subprocess input was expected");
-                output_tx
-                    .send(&#type_ident::call( #(#extracted_args,)* ).await)
-                    .await
-                    .expect("Failed to send subprocess output");
-                0
+            impl #generic_params ::multiprocessing::Entrypoint<(::std::os::unix::io::RawFd, ::std::os::unix::io::RawFd)> for #entry_ident #generics {
+                type Output = i32;
+                #tokio_attr
+                async fn call(args: (::std::os::unix::io::RawFd, ::std::os::unix::io::RawFd)) -> Self::Output {
+                    let (input_rx_fd, output_tx_fd) = args;
+                    use ::std::os::unix::io::FromRawFd;
+                    let mut input_rx = unsafe {
+                        ::multiprocessing::tokio::Receiver::<
+                            ::std::boxed::Box<
+                                dyn ::multiprocessing::FnOnce<
+                                    (),
+                                    Output = ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = #return_type>>>
+                                >
+                            >
+                        >
+                            ::from_raw_fd(input_rx_fd)
+                    };
+                    let mut output_tx = unsafe {
+                        ::multiprocessing::tokio::Sender::<#return_type>::from_raw_fd(output_tx_fd)
+                    };
+                    let func = input_rx
+                        .recv()
+                        .await
+                        .expect("Failed to receive subprocess input")
+                        .expect("EOF encountered while subprocess input was expected");
+                    output_tx.send(&func().await)
+                        .await
+                        .expect("Failed to send subprocess output");
+                    0
+                }
             }
 
-            impl ::multiprocessing::Entrypoint<(#(#fn_types,)*)> for #type_ident {
-                type Output = ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = #return_type> + ::std::marker::Send>>;
+            impl #generic_params ::multiprocessing::Entrypoint<(#(#fn_types,)*)> for #type_ident {
+                type Output = ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = #return_type>>>;
                 fn call(args: (#(#fn_types,)*)) -> Self::Output {
-                    ::std::boxed::Box::pin(#type_ident::call(#(#args_from_tuple,)*))
+                    Box::pin(#type_ident::call(#(#args_from_tuple,)*))
                 }
             }
         };
     } else {
         entrypoint = quote! {
-            fn #real_entry_ident(input_rx_fd: ::std::os::unix::io::RawFd, output_tx_fd: ::std::os::unix::io::RawFd) -> i32 {
-                use ::std::os::unix::io::FromRawFd;
-                let mut input_rx = unsafe {
-                    ::multiprocessing::Receiver::<#args_struct_name_ident>::from_raw_fd(input_rx_fd)
-                };
-                let mut output_tx = unsafe {
-                    ::multiprocessing::Sender::<#return_type>::from_raw_fd(output_tx_fd)
-                };
-                let multiprocessing_args = input_rx
-                    .recv()
-                    .expect("Failed to receive subprocess input")
-                    .expect("EOF encountered while subprocess input was expected");
-                output_tx
-                    .send(&#type_ident::call( #(#extracted_args,)* ))
-                    .expect("Failed to send subprocess output");
-                0
+            impl #generic_params ::multiprocessing::Entrypoint<(::std::os::unix::io::RawFd, ::std::os::unix::io::RawFd)> for #entry_ident #generics {
+                type Output = i32;
+                fn call(args: (::std::os::unix::io::RawFd, ::std::os::unix::io::RawFd)) -> Self::Output {
+                    let (input_rx_fd, output_tx_fd) = args;
+                    use ::std::os::unix::io::FromRawFd;
+                    let mut input_rx = unsafe {
+                        ::multiprocessing::Receiver::<::std::boxed::Box<dyn ::multiprocessing::FnOnce<(), Output = #return_type>>>::from_raw_fd(input_rx_fd)
+                    };
+                    let mut output_tx = unsafe {
+                        ::multiprocessing::Sender::<#return_type>::from_raw_fd(output_tx_fd)
+                    };
+                    let func = input_rx
+                        .recv()
+                        .expect("Failed to receive subprocess input")
+                        .expect("EOF encountered while subprocess input was expected");
+                    output_tx.send(&func())
+                        .expect("Failed to send subprocess output");
+                    0
+                }
             }
 
-            impl ::multiprocessing::Entrypoint<(#(#fn_types,)*)> for #type_ident {
+            impl #generic_params ::multiprocessing::Entrypoint<(#(#fn_types,)*)> for #type_ident {
                 type Output = #return_type;
                 fn call(args: (#(#fn_types,)*)) -> Self::Output {
                     #type_ident::call(#(#args_from_tuple,)*)
@@ -130,19 +208,19 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         #[derive(::multiprocessing::Object)]
-        struct #args_struct_name_ident {
-            #(#fn_args,)*
+        struct #entry_ident #generic_params {
+            #(#generic_phantom,)*
+        }
+
+        impl #generic_params #entry_ident #generics {
+            fn new() -> Self {
+                Self {
+                    #(#generic_phantom_build,)*
+                }
+            }
         }
 
         #entrypoint
-
-        #[::multiprocessing::imp::ctor]
-        fn #fn_name_ident() {
-            ::multiprocessing::imp::ENTRY_POINTS
-                .write()
-                .expect("Failed to acquire write access to ENTRY_POINTS")
-                .insert(#link_name, #real_entry_ident);
-        }
 
         #[allow(non_camel_case_types)]
         #[derive(::multiprocessing::Object)]
@@ -152,68 +230,14 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
             #[link_name = #link_name]
             #input
 
-            pub fn spawn(&self, #(#fn_args,)*) -> ::std::io::Result<::multiprocessing::Child<#return_type>> {
-                use ::std::os::unix::{process::CommandExt, io::AsRawFd};
-
-                let (mut input_tx, mut input_rx) = ::multiprocessing::channel::<#args_struct_name_ident>()?;
-                let input_rx_fd = input_rx.as_raw_fd();
-
-                let (mut output_tx, mut output_rx) = ::multiprocessing::channel::<#return_type>()?;
-                let output_tx_fd = output_tx.as_raw_fd();
-
-                let mut command = ::std::process::Command::new("/proc/self/exe");
-                let child = unsafe {
-                    command
-                        .arg0(#link_name)
-                        .arg(input_rx_fd.to_string())
-                        .arg(output_tx_fd.to_string())
-                        .pre_exec(move || {
-                            ::multiprocessing::imp::disable_cloexec(input_rx_fd)?;
-                            ::multiprocessing::imp::disable_cloexec(output_tx_fd)?;
-                            Ok(())
-                        })
-                        .spawn()?
-                };
-
-                input_tx.send(
-                    &#args_struct_name_ident {
-                        #(#arg_names,)*
-                    }
-                )?;
-
-                Ok(::multiprocessing::Child::new(child, output_rx))
+            pub fn spawn #generic_params(&self, #(#fn_args,)*) -> ::std::io::Result<::multiprocessing::Child<#return_type>> {
+                use ::multiprocessing::Bind;
+                ::multiprocessing::spawn(Box::new(::multiprocessing::EntrypointWrapper::<#entry_ident #generics>(#entry_ident::new())), Box::new(#bound))
             }
 
-            pub async fn spawn_tokio(&self, #(#fn_args,)*) -> ::std::io::Result<::multiprocessing::tokio::Child<#return_type>> {
-                use ::std::os::unix::io::AsRawFd;
-
-                let (mut input_tx, mut input_rx) = ::multiprocessing::tokio::channel::<#args_struct_name_ident>()?;
-                let input_rx_fd = input_rx.as_raw_fd();
-
-                let (mut output_tx, mut output_rx) = ::multiprocessing::tokio::channel::<#return_type>()?;
-                let output_tx_fd = output_tx.as_raw_fd();
-
-                let mut command = ::tokio::process::Command::new("/proc/self/exe");
-                let child = unsafe {
-                    command
-                        .arg0(#link_name)
-                        .arg(input_rx_fd.to_string())
-                        .arg(output_tx_fd.to_string())
-                        .pre_exec(move || {
-                            ::multiprocessing::imp::disable_cloexec(input_rx_fd)?;
-                            ::multiprocessing::imp::disable_cloexec(output_tx_fd)?;
-                            Ok(())
-                        })
-                        .spawn()?
-                };
-
-                input_tx.send(
-                    &#args_struct_name_ident {
-                        #(#arg_names,)*
-                    }
-                ).await?;
-
-                Ok(::multiprocessing::tokio::Child::new(child, output_rx))
+            pub async fn spawn_tokio #generic_params(&self, #(#fn_args,)*) -> ::std::io::Result<::multiprocessing::tokio::Child<#return_type>> {
+                use ::multiprocessing::Bind;
+                ::multiprocessing::tokio::spawn(Box::new(::multiprocessing::EntrypointWrapper::<#entry_ident #generics>(#entry_ident::new())), Box::new(#bound)).await
             }
         }
 

@@ -1,6 +1,8 @@
 use crate::{Object, TraitObject};
 use paste::paste;
+use std::future::Future;
 use std::ops::Deref;
+use std::pin::Pin;
 
 pub trait Entrypoint<Args>: Object {
     type Output;
@@ -36,12 +38,12 @@ impl<Args, T: Entrypoint<Args>> std::ops::FnMut<Args> for EntrypointWrapper<T> {
     }
 }
 
-pub trait FnOnce<Args>: std::ops::FnOnce<Args> + TraitObject {}
-pub trait Fn<Args>: std::ops::Fn<Args> + TraitObject {}
+pub trait FnOnce<Args>: std::ops::FnOnce<Args> + TraitObject + Sync {}
+pub trait Fn<Args>: std::ops::Fn<Args> + TraitObject + Sync {}
 pub trait FnMut<Args>: std::ops::FnMut<Args> + TraitObject {}
 
-impl<Args, T: std::ops::FnOnce<Args> + TraitObject> FnOnce<Args> for T {}
-impl<Args, T: std::ops::Fn<Args> + TraitObject> Fn<Args> for T {}
+impl<Args, T: std::ops::FnOnce<Args> + TraitObject + Sync> FnOnce<Args> for T {}
+impl<Args, T: std::ops::Fn<Args> + TraitObject + Sync> Fn<Args> for T {}
 impl<Args, T: std::ops::FnMut<Args> + TraitObject> FnMut<Args> for T {}
 
 pub trait Bind<Head: Object, Tail> {
@@ -105,3 +107,9 @@ macro_rules! decl_fn {
 }
 
 decl_fn!(x 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0);
+
+pub trait Await<T> {}
+
+impl<T> Await<T> for Pin<Box<dyn Future<Output = T>>> {}
+
+impl<T> Await<T> for T {}

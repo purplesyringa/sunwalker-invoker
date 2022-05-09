@@ -32,6 +32,9 @@ tokio-fork = "0.2.1"
 ouroboros = "0.15.0"
 futures = "0.3.21"
 tokio-fd = "0.3.0"
+multiprocessing = { path = "multiprocessing" }
+rtnetlink = "0.9.1"
+ipnetwork = "0.19"
 
 [profile.release]
 debug = true

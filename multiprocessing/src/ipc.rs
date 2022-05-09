@@ -1,4 +1,4 @@
-use crate::{Deserialize, Deserializer, Object, Serialize, Serializer};
+use crate::{imp, Deserialize, Deserializer, Object, Serialize, Serializer};
 use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Read, Result, Write};
 use std::marker::PhantomData;
 use std::os::unix::{
@@ -9,13 +9,13 @@ use std::os::unix::{
 #[derive(Object)]
 pub struct Sender<T: Serialize> {
     fd: UnixStream,
-    marker: PhantomData<T>,
+    marker: PhantomData<fn(T) -> T>,
 }
 
 #[derive(Object)]
 pub struct Receiver<T: Deserialize> {
     fd: UnixStream,
-    marker: PhantomData<T>,
+    marker: PhantomData<fn(T) -> T>,
 }
 
 #[derive(Object)]
@@ -85,6 +85,7 @@ impl<T: Serialize> AsRawFd for Sender<T> {
 
 impl<T: Serialize> FromRawFd for Sender<T> {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        imp::disable_nonblock(fd).expect("Failed to reset O_NONBLOCK");
         Self::from_unix_stream(UnixStream::from_raw_fd(fd))
     }
 }
@@ -148,6 +149,7 @@ impl<T: Deserialize> AsRawFd for Receiver<T> {
 
 impl<T: Deserialize> FromRawFd for Receiver<T> {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        imp::disable_nonblock(fd).expect("Failed to reset O_NONBLOCK");
         Self::from_unix_stream(UnixStream::from_raw_fd(fd))
     }
 }

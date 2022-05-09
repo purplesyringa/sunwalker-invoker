@@ -27,7 +27,7 @@ pub use ipc::{channel, duplex, Duplex, Receiver, Sender};
 pub mod tokio;
 
 pub mod subprocess;
-pub use subprocess::Child;
+pub use subprocess::*;
 
 pub mod builtins;
 

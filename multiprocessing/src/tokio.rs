@@ -1,4 +1,4 @@
-use crate::{Deserialize, Deserializer, Object, Serialize, Serializer};
+use crate::{imp, Await, Deserialize, Deserializer, FnOnce, Object, Serialize, Serializer};
 use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Result};
 use std::marker::PhantomData;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -10,13 +10,13 @@ use tokio_seqpacket::{
 #[derive(Object)]
 pub struct Sender<T: Serialize> {
     fd: UnixSeqpacket,
-    marker: PhantomData<T>,
+    marker: PhantomData<fn(T) -> T>,
 }
 
 #[derive(Object)]
 pub struct Receiver<T: Deserialize> {
     fd: UnixSeqpacket,
-    marker: PhantomData<T>,
+    marker: PhantomData<fn(T) -> T>,
 }
 
 #[derive(Object)]
@@ -106,6 +106,7 @@ impl<T: Serialize> AsRawFd for Sender<T> {
 
 impl<T: Serialize> FromRawFd for Sender<T> {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        imp::enable_nonblock(fd).expect("Failed to set O_NONBLOCK");
         Self::from_unix_seqpacket(UnixSeqpacket::from_raw_fd(fd).expect(
             "Failed to register fd in tokio in multiprocessing::tokio::Sender::from_raw_fd",
         ))
@@ -180,6 +181,7 @@ impl<T: Deserialize> AsRawFd for Receiver<T> {
 
 impl<T: Deserialize> FromRawFd for Receiver<T> {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        imp::enable_nonblock(fd).expect("Failed to set O_NONBLOCK");
         Self::from_unix_seqpacket(UnixSeqpacket::from_raw_fd(fd).expect(
             "Failed to register fd in tokio in multiprocessing::tokio::Receiver::from_raw_fd",
         ))
@@ -231,4 +233,39 @@ impl<T: Deserialize> Child<T> {
             ))
         }
     }
+}
+
+pub async fn spawn<T: Object, U: Await<T>>(
+    entry: Box<dyn FnOnce<(RawFd, RawFd), Output = i32>>,
+    f: Box<dyn FnOnce<(), Output = U>>,
+) -> Result<Child<T>> {
+    let (mut entry_tx, entry_rx) = channel::<Box<dyn FnOnce<(RawFd, RawFd), Output = i32>>>()?;
+    let entry_rx_fd = entry_rx.as_raw_fd();
+
+    let (mut input_tx, input_rx) = channel::<Box<dyn FnOnce<(), Output = U>>>()?;
+    let input_rx_fd = input_rx.as_raw_fd();
+
+    let (output_tx, output_rx) = channel::<T>()?;
+    let output_tx_fd = output_tx.as_raw_fd();
+
+    let mut command = tokio::process::Command::new("/proc/self/exe");
+    let child = unsafe {
+        command
+            .arg0("_multiprocessing_")
+            .arg(entry_rx_fd.to_string())
+            .arg(input_rx_fd.to_string())
+            .arg(output_tx_fd.to_string())
+            .pre_exec(move || {
+                imp::disable_cloexec(entry_rx_fd)?;
+                imp::disable_cloexec(input_rx_fd)?;
+                imp::disable_cloexec(output_tx_fd)?;
+                Ok(())
+            })
+            .spawn()?
+    };
+
+    entry_tx.send(&entry).await?;
+    input_tx.send(&f).await?;
+
+    Ok(Child::new(child, output_rx))
 }

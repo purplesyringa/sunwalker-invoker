@@ -103,11 +103,65 @@ pub async fn client_main(cli_args: init::CLIArgs) -> anyhow::Result<()> {
         );
     }
 
+    // let worker_space = image::sandbox::enter_worker_space(image::sandbox::SandboxConfig {
+    //     max_size_in_bytes: 8 * 1024 * 1024,
+    //     max_inodes: 1024,
+    //     core: 2,
+    // })?;
+    // std::fs::create_dir("/tmp/artifacts/test")?;
+    // std::fs::copy(
+    //     "/home/ivanq/Documents/sunwalker_invoker/hello",
+    //     "/tmp/artifacts/test/hello",
+    // )?;
+    // let package = image::package::Package::new(mounted_image, "gcc".to_string())?;
+    // let rootfs = worker_space
+    //     .make_rootfs(
+    //         &package,
+    //         vec![(
+    //             "/home/ivanq/Documents/sunwalker_invoker/hello"
+    //                 .to_string()
+    //                 .into(),
+    //             "/space/hello".to_string(),
+    //         )],
+    //         "run".to_string(),
+    //     )
+    //     .map_err(|e| {
+    //         errors::InvokerFailure(format!("Failed to make sandbox for running: {:?}", e))
+    //     })?;
+
+    // for _ in 0..1000 {
+    //     use multiprocessing::Bind;
+
+    //     let (mut upstream, downstream) =
+    //         multiprocessing::tokio::duplex::<(), ()>().map_err(|e| {
+    //             errors::InvokerFailure(format!(
+    //                 "Failed to create duplex connection to an isolated subprocess: {:?}",
+    //                 e
+    //             ))
+    //         })?;
+
+    //     let mut child = isolated_entry
+    //         .spawn_tokio(downstream, "run".to_string())
+    //         .await
+    //         .map_err(|e| {
+    //             errors::InvokerFailure(format!("Failed to start an isolated subprocess: {:?}", e))
+    //         })?;
+
+    //     child.join().await.map_err(|e| {
+    //         errors::InvokerFailure(format!(
+    //             "Isolated process didn't terminate gracefully: {:?}",
+    //             e
+    //         ))
+    //     })?;
+    // }
+
+    // return Ok(());
+
     let problem_store =
         problem::store::ProblemStore::new(std::path::PathBuf::from(&config.cache.problems))
             .with_context(|| {
                 format!(
-                    "Failed to create problem store with cache at {} (this path if from field \
+                    "Failed to create problem store with cache at {} (this path is from field \
                      cache.problems of the configuration file)",
                     config.cache.problems
                 )
@@ -124,7 +178,7 @@ pub async fn client_main(cli_args: init::CLIArgs) -> anyhow::Result<()> {
         .await
         .with_context(|| {
             format!(
-                "Failed to connect to the conductor via a websocket at {:?} (this address if from \
+                "Failed to connect to the conductor via a websocket at {:?} (this address is from \
                  field conductor.address of the configuration file)",
                 config.conductor.address
             )
@@ -235,15 +289,8 @@ async fn add_submission(
     let mut submission = submission::Submission::new(
         message.submission_id.clone(),
         problem.dependency_dag.clone(),
-        image::image::Image::get_language(client.mounted_image.clone(), message.language.clone())
-            .map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to get language {}: {:?}",
-                message.language, e
-            ))
-        })?,
-    )
-    .map_err(|e| errors::InvokerFailure(format!("Failed to create submission: {:?}", e)))?;
+        image::image::Image::get_language(client.mounted_image.clone(), message.language.clone())?,
+    )?;
 
     for (name, content) in message.files.into_iter() {
         submission.add_source_file(&name, &content)?;
@@ -259,24 +306,16 @@ async fn add_submission(
             ))
         })?;
 
-    let compilation_result = submission
-        .compile_on_core(message.compilation_core)
-        .await
-        .map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to schedule compilation on core {}: {:?}",
-                message.compilation_core, e
-            ))
-        });
+    let compilation_result = submission.compile_on_core(message.compilation_core).await;
 
     match compilation_result {
-        Ok(()) => {
+        Ok(log) => {
             client
                 .send_to_conductor(message::i2c::Message::NotifyCompilationStatus(
                     message::i2c::NotifyCompilationStatus {
                         submission_id: message.submission_id,
                         success: true,
-                        log: "".to_string(),
+                        log,
                     },
                 ))
                 .await
@@ -314,7 +353,7 @@ async fn push_to_judgment_queue(
 
     for test in message.tests {
         submission
-            .schdule_test_on_core(message.core, test)
+            .schedule_test_on_core(message.core, test)
             .await
             .map_err(|e| {
                 errors::InvokerFailure(format!(
@@ -380,6 +419,7 @@ fn enter_sandbox() -> anyhow::Result<()> {
     // Make various temporary directories
     std::fs::create_dir("/tmp/worker").with_context(|| "Creating /tmp/worker failed")?;
     std::fs::create_dir("/tmp/submissions").with_context(|| "Creating /tmp/submissions failed")?;
+    std::fs::create_dir("/tmp/artifacts").with_context(|| "Creating /tmp/artifacts failed")?;
 
     // Prepare a copy of /dev
     std::fs::create_dir("/tmp/dev").with_context(|| "Creating /tmp/dev failed")?;
@@ -408,3 +448,32 @@ fn enter_sandbox() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// #[multiprocessing::entrypoint]
+// #[tokio::main(flavor = "current_thread")] // unshare requires a single thread
+// async fn isolated_entry(
+//     mut duplex: multiprocessing::tokio::Duplex<(), ()>,
+//     id: String,
+// ) -> Result<(), errors::Error> {
+//     // Unshare namespaces
+//     if unsafe {
+//         libc::unshare(
+//             libc::CLONE_NEWNS
+//                 | libc::CLONE_NEWNET
+//                 | libc::CLONE_NEWUSER
+//                 | libc::CLONE_NEWUTS
+//                 | libc::CLONE_SYSVSEM
+//                 | libc::CLONE_NEWPID,
+//         )
+//     } != 0
+//     {
+//         return Err(errors::InvokerFailure(format!(
+//             "Failed to unshare mount namespace: {:?}",
+//             std::io::Error::last_os_error()
+//         )));
+//     }
+
+//     println!("duh");
+
+//     Ok(())
+// }

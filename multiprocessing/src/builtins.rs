@@ -447,6 +447,27 @@ impl_serialize_for_nonzero!(NonZeroU64, u64);
 impl_serialize_for_nonzero!(NonZeroU128, u128);
 impl_serialize_for_nonzero!(NonZeroUsize, usize);
 
+impl<T: Serialize, const N: usize> Serialize for [T; N] {
+    fn serialize_self(&self, s: &mut Serializer) {
+        for item in self {
+            s.serialize(item);
+        }
+    }
+}
+impl<T: Deserialize, const N: usize> Deserialize for [T; N] {
+    fn deserialize_self(d: &mut Deserializer) -> Self {
+        [0; N].map(|_| d.deserialize())
+    }
+}
+impl<'a, T: 'a + Deserialize, const N: usize> DeserializeBoxed<'a> for [T; N] {
+    unsafe fn deserialize_on_heap(
+        &self,
+        d: &mut Deserializer,
+    ) -> Box<dyn DeserializeBoxed<'a> + 'a> {
+        Box::new(Self::deserialize_self(d))
+    }
+}
+
 macro_rules! impl_serialize_for_sequence {
     (
         $ty:ident < T $(: $tbound1:ident $(+ $tbound2:ident)*)* $(, $typaram:ident : $bound1:ident $(+ $bound2:ident)*)* >,

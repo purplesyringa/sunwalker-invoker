@@ -3,10 +3,9 @@ use crate::{
     image::{config, package, program, sandbox},
     system,
 };
-use anyhow::Context;
+use multiprocessing::{Bind, Deserialize, DeserializeBoxed, Deserializer, Serialize, Serializer};
 use ouroboros::self_referencing;
 use rand::{thread_rng, Rng};
-use serde::{ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -26,58 +25,27 @@ impl LanguageImpl {
         let package = self.borrow_package();
 
         // Make sandbox
-        let rootfs = worker_space.make_rootfs(package, Vec::new()).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to make sandbox for identification: {:?}",
-                e
-            ))
-        })?;
-
-        std::fs::write("/tmp/worker/overlay/identify.txt", "").map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to create /tmp/worker/overlay/identify.txt: {:?}",
-                e
-            ))
-        })?;
-        std::os::unix::fs::chown("/tmp/worker/overlay/identify.txt", Some(65534), Some(65534))
+        let mut rootfs = worker_space
+            .make_rootfs(package, Vec::new(), "identify".to_string())
             .map_err(|e| {
                 errors::InvokerFailure(format!(
-                    "Failed to chown /tmp/worker/overlay/identify.txt: {:?}",
+                    "Failed to make sandbox for identification: {:?}",
                     e
                 ))
             })?;
+        let mut ns = worker_space.make_namespace("identify".to_string()).await?;
 
         // Enter the sandbox in another process
-        rootfs
-            .run_isolated(|| {
-                // Evaluate correct pattern
-                let identify: String =
-                    lisp::evaluate(self.borrow_config().identify.clone(), &lisp::State::new())
-                        .unwrap()
-                        .to_native()
-                        .unwrap();
+        let identification = sandbox::run_isolated(
+            Box::new(identify.bind(self.borrow_config().identify.clone())),
+            &mut rootfs,
+            &mut ns,
+        )
+        .await?;
 
-                // Output the pattern to /identify.txt
-                std::fs::write("/identify.txt", identify)
-                    .with_context(|| "Failed to write pattern to /identify.txt")
-                    .unwrap();
-            })
-            .await?;
-
-        let identify =
-            std::fs::read_to_string("/tmp/worker/overlay/identify.txt").map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Identification succeeded, but did not generate a readable file at \
-                     /tmp/worker/overlay/identify.txt: {:?}",
-                    e
-                ))
-            })?;
-
-        if identify == "" {
+        if identification == "" {
             return Err(errors::InvokerFailure(
-                "Identification succeeded, but did not write anything to
-                 /tmp/worker/overlay/identify.txt"
-                    .to_string(),
+                "Identification succeeded, but did not report anything".to_string(),
             ));
         }
 
@@ -85,54 +53,74 @@ impl LanguageImpl {
             .remove()
             .map_err(|e| errors::InvokerFailure(format!("Failed to remove rootfs: {:?}", e)))?;
 
-        Ok(identify)
+        ns.remove()
+            .map_err(|e| errors::InvokerFailure(format!("Failed to remove namespace: {:?}", e)))?;
+
+        Ok(identification)
     }
 
     pub async fn build(
         &self,
         mut input_files: Vec<&str>,
         worker_space: &sandbox::WorkerSpace,
-    ) -> Result<program::Program, errors::Error> {
+        build_id: String,
+    ) -> Result<(program::Program, String), errors::Error> {
         let package = self.borrow_package();
         let config = self.borrow_config();
         let name = self.borrow_name();
 
-        // Map input files to patterned filenames based on extension
-        let mut patterns_by_extension = Vec::new();
-        for input_pattern in &config.inputs {
-            let suffix = input_pattern
-                .rsplit_once("%")
-                .ok_or_else(|| {
-                    errors::InvokerFailure(format!(
-                        "Input file pattern {} (derived from Makefile of package {}, language {}) \
-                         does not contain glob character %",
-                        input_pattern, package.name, name
-                    ))
-                })?
-                .1;
-            patterns_by_extension.push((input_pattern, suffix));
-        }
+        let mut files_and_patterns: Vec<(&str, &str)> = Vec::new();
 
-        // Sort by suffix lengths (decreasing)
-        patterns_by_extension.sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()));
+        if config.inputs.len() == 1 {
+            if input_files.len() != 1 {
+                return Err(errors::UserFailure(format!(
+                    "There must be exactly one input file, preferably of pattern {}, but {} files \
+                     were provided. This requirement is because language {} accepts exactly one \
+                     input file.",
+                    config.inputs[0],
+                    input_files.len(),
+                    name
+                )));
+            }
 
-        // Rename files appropriately
-        let mut files_and_patterns = Vec::new();
-        for (input_pattern, suffix) in patterns_by_extension.into_iter() {
-            let i = input_files
-                .iter()
-                .enumerate()
-                .find(|(_, input_file)| input_file.ends_with(suffix))
-                .ok_or_else(|| {
-                    errors::UserFailure(format!(
-                        "No input file ends with {} (derived from pattern {}). This requirement \
-                         is because language {} accepts multiple input files.",
-                        suffix, input_pattern, name
-                    ))
-                })?
-                .0;
-            let input_file = input_files.remove(i);
-            files_and_patterns.push((input_file, input_pattern));
+            files_and_patterns.push((input_files[0], &config.inputs[0]));
+        } else {
+            // Map input files to patterned filenames based on extension
+            let mut patterns_by_extension = Vec::new();
+            for input_pattern in &config.inputs {
+                let suffix = input_pattern
+                    .rsplit_once("%")
+                    .ok_or_else(|| {
+                        errors::InvokerFailure(format!(
+                            "Input file pattern {} (derived from Makefile of package {}, language \
+                             {}) does not contain glob character %",
+                            input_pattern, package.name, name
+                        ))
+                    })?
+                    .1;
+                patterns_by_extension.push((input_pattern, suffix));
+            }
+
+            // Sort by suffix lengths (decreasing)
+            patterns_by_extension.sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+            // Rename files appropriately
+            for (input_pattern, suffix) in patterns_by_extension.into_iter() {
+                let i = input_files
+                    .iter()
+                    .enumerate()
+                    .find(|(_, input_file)| input_file.ends_with(suffix))
+                    .ok_or_else(|| {
+                        errors::UserFailure(format!(
+                            "No input file ends with {} (derived from pattern {}). This \
+                             requirement is because language {} accepts multiple input files.",
+                            suffix, input_pattern, name
+                        ))
+                    })?
+                    .0;
+                let input_file = input_files.remove(i);
+                files_and_patterns.push((input_file, input_pattern));
+            }
         }
 
         // Set pattern arbitrarily
@@ -150,143 +138,60 @@ impl LanguageImpl {
         }
 
         // Make sandbox
-        let rootfs = worker_space
-            .make_rootfs(package, bound_files)
+        let mut rootfs = worker_space
+            .make_rootfs(package, bound_files, "build".to_string())
             .map_err(|e| {
                 errors::InvokerFailure(format!("Failed to make sandbox for build: {:?}", e))
             })?;
+        let mut ns = worker_space.make_namespace("build".to_string()).await?;
 
-        // Add /artifacts -> /tmp/worker/artifacts
-        std::fs::create_dir("/tmp/worker/artifacts").map_err(|e| {
-            errors::InvokerFailure(format!("Failed to create /tmp/worker/artifacts: {:?}", e))
+        // Add /artifacts -> /tmp/artifacts/{build_id}
+        let artifacts_path = format!("/tmp/artifacts/{}", build_id);
+        let overlay_artifacts_path = format!("{}/artifacts", rootfs.overlay());
+        std::fs::create_dir(&artifacts_path).map_err(|e| {
+            errors::InvokerFailure(format!("Failed to create {}: {:?}", artifacts_path, e))
         })?;
-        std::fs::create_dir("/tmp/worker/overlay/artifacts").map_err(|e| {
+        std::fs::create_dir(&overlay_artifacts_path).map_err(|e| {
             errors::InvokerFailure(format!(
-                "Failed to create /tmp/worker/overlay/artifacts: {:?}",
-                e
+                "Failed to create {}: {:?}",
+                overlay_artifacts_path, e
             ))
         })?;
-        system::bind_mount("/tmp/worker/artifacts", "/tmp/worker/overlay/artifacts").map_err(
+        system::bind_mount(&artifacts_path, &overlay_artifacts_path).map_err(|e| {
+            errors::InvokerFailure(format!("Failed to bind-mount {}: {:?}", artifacts_path, e))
+        })?;
+
+        // Allow the sandbox user to access data
+        std::os::unix::fs::chown(&overlay_artifacts_path, Some(65534), Some(65534)).map_err(
             |e| {
                 errors::InvokerFailure(format!(
-                    "Failed to bind-mount /tmp/worker/overlay/artifacts: {:?}",
-                    e
+                    "Failed to chown {}: {:?}",
+                    overlay_artifacts_path, e
                 ))
             },
         )?;
 
-        // Allow the sandbox user to access data
-        std::os::unix::fs::chown("/tmp/worker/overlay/artifacts", Some(65534), Some(65534))
-            .map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Failed to chown /tmp/worker/overlay/artifacts: {:?}",
-                    e
-                ))
-            })?;
-
         // Enter the sandbox in another process
-        rootfs
-            .run_isolated(|| {
-                // Evaluate correct pattern
-                let pattern: String = lisp::evaluate(
-                    config.base_rule.clone(),
-                    &lisp::State::new().var("$base".to_string(), pre_pattern.clone()),
-                )
-                .unwrap()
-                .to_native()
-                .unwrap();
-
-                if pre_pattern != pattern {
-                    // Rename files according to new pattern
-                    for (_, input_pattern) in files_and_patterns {
-                        let mut old_path = PathBuf::new();
-                        old_path.push("/space");
-                        old_path.push(input_pattern.replace("%", &pre_pattern));
-
-                        let mut new_path = PathBuf::new();
-                        new_path.push("/space");
-                        new_path.push(input_pattern.replace("%", &pattern));
-
-                        std::fs::write(&new_path, "")
-                            .with_context(|| {
-                                format!("Failed to create file {:?} on overlay", new_path)
-                            })
-                            .unwrap();
-                        system::move_mount(&old_path, &new_path)
-                            .with_context(|| {
-                                format!(
-                                    "Failed to move mount {:?} -> {:?} on overlay",
-                                    &old_path, new_path
-                                )
-                            })
-                            .unwrap();
-                        std::fs::remove_file(&old_path)
-                            .with_context(|| {
-                                format!("Failed to remove old file {:?} on overlay", old_path)
-                            })
-                            .unwrap();
-                    }
-                }
-
-                // Run build process
-                let state = lisp::State::new().var("$base".to_string(), pattern.clone());
-                let build_output: String = lisp::evaluate(config.build.clone(), &state)
-                    .with_context(|| "Failed to evaluate build schema")
-                    .unwrap()
-                    .to_native()
-                    .with_context(|| "Build schema didn't return string, as was expected")
-                    .unwrap();
-
-                // TODO: log?
-                // println!("build output: {}", build_output);
-
-                let run_prerequisites: Vec<String> =
-                    lisp::evaluate(config.run.prerequisites.clone(), &state)
-                        .with_context(|| "Failed to evaluate prerequisites for running")
-                        .unwrap()
-                        .to_native()
-                        .with_context(|| {
-                            "Prerequisite schema didn't return a list of strings, as was expected"
-                        })
-                        .unwrap();
-
-                // Copy run prerequisites to artifacts.
-                // TODO: this can be optimized further. If a prerequisite is an artifact of the build
-                // process, the file can simply be moved. If it is an input file, it can be bind-mounted
-                // from its original source.
-                for rel_path in run_prerequisites.into_iter() {
-                    let mut from = std::path::PathBuf::from("/space");
-                    from.push(&rel_path);
-                    let mut to = std::path::PathBuf::from("/artifacts");
-                    to.push(&rel_path);
-                    std::fs::copy(&from, &to)
-                        .with_context(|| {
-                            format!(
-                                "Failed to copy artifact {} from {:?} to {:?}",
-                                rel_path, from, to
-                            )
-                        })
-                        .unwrap();
-                }
-
-                // Output the pattern to /artifacts/pattern.txt
-                std::fs::write("/artifacts/pattern.txt", pattern)
-                    .with_context(|| "Failed to write pattern to /artifacts/pattern.txt")
-                    .unwrap();
-            })
-            .await?;
+        let (pattern, log) = sandbox::run_isolated(
+            Box::new(
+                build.bind((*config).clone()).bind(pre_pattern).bind(
+                    files_and_patterns
+                        .into_iter()
+                        .map(|(_, pattern)| pattern.to_string())
+                        .collect(),
+                ),
+            ),
+            &mut rootfs,
+            &mut ns,
+        )
+        .await?;
 
         rootfs
             .remove()
             .map_err(|e| errors::InvokerFailure(format!("Failed to remove rootfs: {:?}", e)))?;
 
-        let pattern =
-            std::fs::read_to_string("/tmp/worker/artifacts/pattern.txt").map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Failed to read pattern from /artifacts/pattern.txt: {:?}",
-                    e
-                ))
-            })?;
+        ns.remove()
+            .map_err(|e| errors::InvokerFailure(format!("Failed to remove namespace: {:?}", e)))?;
 
         let prerequisites: Vec<String> = lisp::evaluate(
             config.run.prerequisites.clone(),
@@ -316,19 +221,15 @@ impl LanguageImpl {
             ))
         })?;
 
-        Ok(program::Program {
-            package: self.borrow_package().clone(),
-            prerequisites,
-            argv,
-        })
-    }
-
-    pub async fn run(
-        &self,
-        worker_space: &sandbox::WorkerSpace,
-        program: &program::Program,
-    ) -> Result<(), errors::Error> {
-        program.run(worker_space).await
+        Ok((
+            program::Program {
+                package: self.borrow_package().clone(),
+                prerequisites,
+                argv,
+                build_id,
+            },
+            log,
+        ))
     }
 }
 
@@ -337,20 +238,22 @@ pub struct Language {
 }
 
 impl Language {
-    pub fn new(package: package::Package, name: &str) -> anyhow::Result<Language> {
+    pub fn new(package: package::Package, name: &str) -> Result<Language, errors::Error> {
         package
             .image
             .config
             .packages
             .get(&package.name)
-            .with_context(|| format!("Package {} not found in the image", package.name))?
+            .ok_or_else(|| {
+                errors::InvokerFailure(format!("Package {} not found in the image", package.name))
+            })?
             .languages
             .get(name)
-            .with_context(|| {
-                format!(
+            .ok_or_else(|| {
+                errors::InvokerFailure(format!(
                     "Packages {} does not provide language {}",
                     package.name, name
-                )
+                ))
             })?;
 
         Ok(Language {
@@ -383,16 +286,9 @@ impl Language {
         &self,
         input_files: Vec<&str>,
         worker_space: &sandbox::WorkerSpace,
-    ) -> Result<program::Program, errors::Error> {
-        self.nested.build(input_files, worker_space).await
-    }
-
-    pub async fn run(
-        &self,
-        worker_space: &sandbox::WorkerSpace,
-        program: &program::Program,
-    ) -> Result<(), errors::Error> {
-        self.nested.run(worker_space, program).await
+        build_id: String,
+    ) -> Result<(program::Program, String), errors::Error> {
+        self.nested.build(input_files, worker_space, build_id).await
     }
 }
 
@@ -407,26 +303,24 @@ impl Clone for Language {
 }
 
 impl Serialize for Language {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("Language", 2)?;
-        state.serialize_field("package", self.nested.borrow_package())?;
-        state.serialize_field("name", self.nested.borrow_name())?;
-        state.end()
+    fn serialize_self(&self, s: &mut Serializer) {
+        s.serialize(self.nested.borrow_package());
+        s.serialize(self.nested.borrow_name());
     }
 }
-
-impl<'de> Deserialize<'de> for Language {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Language, D::Error> {
-        let (package, name) = {
-            #[derive(Deserialize)]
-            struct Language {
-                package: package::Package,
-                name: String,
-            }
-            let language = <Language as Deserialize<'de>>::deserialize(deserializer)?;
-            (language.package, language.name)
-        };
-        Ok(Language::new(package, &name).expect("Failed to deserialize a language"))
+impl Deserialize for Language {
+    fn deserialize_self(d: &mut Deserializer) -> Self {
+        let package = d.deserialize();
+        let name: String = d.deserialize();
+        Language::new(package, &name).expect("Failed to deserialize a language")
+    }
+}
+impl<'a> DeserializeBoxed<'a> for Language {
+    unsafe fn deserialize_on_heap(
+        &self,
+        d: &mut Deserializer,
+    ) -> Box<dyn DeserializeBoxed<'a> + 'a> {
+        Box::new(Self::deserialize_self(d))
     }
 }
 
@@ -449,7 +343,7 @@ fn exec(call: lisp::CallTerm, state: &lisp::State) -> Result<lisp::TypedRef, lis
     } else {
         Err(lisp::Error {
             message: format!(
-                "Process {:?} failed: {}\n\n{}\n\n{}",
+                "Process failed: {:?}: {}\n\n{}\n\n{}",
                 argv,
                 output.status,
                 String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -470,4 +364,119 @@ fn mv(call: lisp::CallTerm, state: &lisp::State) -> Result<lisp::TypedRef, lisp:
             message: format!("Failed to move file {:?} to {:?}: {}", from, to, e),
         }),
     }
+}
+
+#[multiprocessing::entrypoint]
+fn identify(term: lisp::Term) -> Result<String, errors::Error> {
+    lisp::evaluate(term, &lisp::State::new())
+        .map_err(|e| errors::InvokerFailure(format!("Failed to identify: {:?}", e)))?
+        .to_native()
+        .map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to interpret identify result as a string: {:?}",
+                e
+            ))
+        })
+}
+
+#[multiprocessing::entrypoint]
+fn build(
+    config: config::Language,
+    pre_pattern: String,
+    patterns: Vec<String>,
+) -> Result<(String, String), errors::Error> {
+    // Evaluate correct pattern
+    let pattern: String = lisp::evaluate(
+        config.base_rule.clone(),
+        &lisp::State::new().var("$base".to_string(), pre_pattern.clone()),
+    )
+    .map_err(|e| errors::InvokerFailure(format!("Failed to evaluate pattern: {:?}", e)))?
+    .to_native()
+    .map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to parse the pattern generated by the schema as a string: {:?}",
+            e
+        ))
+    })?;
+
+    if pre_pattern != pattern {
+        // Rename files according to new pattern
+        for pattern in patterns {
+            let mut old_path = PathBuf::new();
+            old_path.push("/space");
+            old_path.push(pattern.replace("%", &pre_pattern));
+
+            let mut new_path = PathBuf::new();
+            new_path.push("/space");
+            new_path.push(pattern.replace("%", &pattern));
+
+            std::fs::write(&new_path, "").map_err(|e| {
+                errors::InvokerFailure(format!(
+                    "Failed to create file {:?} on overlay: {:?}",
+                    new_path, e
+                ))
+            })?;
+            system::move_mount(&old_path, &new_path).map_err(|e| {
+                errors::InvokerFailure(format!(
+                    "Failed to move mount {:?} -> {:?} on overlay: {:?}",
+                    &old_path, new_path, e
+                ))
+            })?;
+            std::fs::remove_file(&old_path).map_err(|e| {
+                errors::InvokerFailure(format!(
+                    "Failed to remove old file {:?} on overlay: {:?}",
+                    old_path, e
+                ))
+            })?;
+        }
+    }
+
+    // Run build process
+    let state = lisp::State::new().var("$base".to_string(), pattern.clone());
+    let log: String = lisp::evaluate(config.build.clone(), &state)
+        .map_err(|e| {
+            if e.message.starts_with("Process failed: ") {
+                errors::UserFailure(e.message)
+            } else {
+                errors::InvokerFailure(format!("Failed to build the program: {:?}", e))
+            }
+        })?
+        .to_native()
+        .map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to parse compilation log as a string: {:?}",
+                e
+            ))
+        })?;
+
+    let run_prerequisites: Vec<String> = lisp::evaluate(config.run.prerequisites.clone(), &state)
+        .map_err(|e| {
+            errors::InvokerFailure(format!("Failed to evaluate run.prerequisites: {:?}", e))
+        })?
+        .to_native()
+        .map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to parse prerequisites generated by the schema as vector of strings: {:?}",
+                e
+            ))
+        })?;
+
+    // Copy run prerequisites to artifacts.
+    // TODO: this can be optimized further. If a prerequisite is an artifact of the build
+    // process, the file can simply be moved. If it is an input file, it can be bind-mounted
+    // from its original source.
+    for rel_path in run_prerequisites.into_iter() {
+        let mut from = std::path::PathBuf::from("/space");
+        from.push(&rel_path);
+        let mut to = std::path::PathBuf::from("/artifacts");
+        to.push(&rel_path);
+        std::fs::copy(&from, &to).map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to copy artifact {} from {:?} to {:?}: {:?}",
+                rel_path, from, to, e
+            ))
+        })?;
+    }
+
+    Ok((pattern, log))
 }

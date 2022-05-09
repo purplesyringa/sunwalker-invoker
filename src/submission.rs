@@ -3,19 +3,20 @@ use crate::{
     image::{language, program, sandbox},
     problem, worker,
 };
-use serde::{Deserialize, Serialize};
+use multiprocessing::Object;
 use std::collections::HashMap;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Object)]
 pub enum Command {
-    Compile,
+    Compile(String),
     Test(u64),
 }
 
 #[derive(Debug)]
 pub enum W2IMessage {
-    CompilationResult(Result<program::Program, errors::Error>),
+    CompilationResult(Result<(program::Program, String), errors::Error>),
+    Failure(errors::Error),
 }
 
 pub struct Submission {
@@ -64,14 +65,18 @@ impl Submission {
                 "Failed to write a source code file for submission {} at {}: {:?}",
                 self.id, path, e
             ))
-        })
+        })?;
+        self.source_files.push(path);
+        Ok(())
     }
 
     async fn schedule_on_core(&self, core: u64, command: Command) -> Result<(), errors::Error> {
         let mut workers = self.workers.write().await;
-        if !workers.contains_key(&core) {
-            workers.insert(
-                core,
+
+        use std::collections::hash_map::Entry;
+        let worker = match workers.entry(core) {
+            Entry::Occupied(occupied) => occupied.into_mut(),
+            Entry::Vacant(vacant) => vacant.insert(
                 worker::Worker::new(
                     self.language.clone(),
                     self.source_files.clone(),
@@ -83,25 +88,35 @@ impl Submission {
                     self.dependency_dag.read().await.clone(),
                     self.program.read().await.clone(),
                     self.cumulative_messages_tx.clone(),
-                )?,
-            );
+                )
+                .await?,
+            ),
+        };
+
+        if let Err(e) = worker.push_command(command).await {
+            if let Some(message) = self.cumulative_messages_rx.lock().await.recv().await {
+                if let W2IMessage::Failure(reason) = message {
+                    return Err(errors::InvokerFailure(format!(
+                        "Failed to push command: {:?}; likely reason: {:?}",
+                        e, reason
+                    )));
+                }
+            }
+            Err(e)
+        } else {
+            Ok(())
         }
-
-        let worker = workers.get(&core).unwrap();
-
-        worker.push_command(command).await?;
-
-        Ok(())
     }
 
     // Not abortable
-    pub async fn compile_on_core(&self, core: u64) -> Result<(), errors::Error> {
+    pub async fn compile_on_core(&self, core: u64) -> Result<String, errors::Error> {
         if self.program.read().await.is_some() {
             return Err(errors::ConductorFailure(
                 "The submission is already compiled".to_string(),
             ));
         }
-        self.schedule_on_core(core, Command::Compile).await?;
+        self.schedule_on_core(core, Command::Compile(format!("judge-{}", self.id)))
+            .await?;
         let message = self
             .cumulative_messages_rx
             .lock()
@@ -114,19 +129,16 @@ impl Submission {
                 ))
             })?;
         match message {
-            W2IMessage::CompilationResult(Ok(program)) => {
+            W2IMessage::CompilationResult(Ok((program, log))) => {
                 *self.program.write().await = Some(program);
-                Ok(())
+                Ok(log)
             }
             W2IMessage::CompilationResult(Err(e)) => Err(e),
-            _ => Err(errors::InvokerFailure(format!(
-                "An unexpected message was received while waiting for compilation result: {:?}",
-                message
-            ))),
+            W2IMessage::Failure(e) => Err(e),
         }
     }
 
-    pub async fn schdule_test_on_core(&self, core: u64, test: u64) -> Result<(), errors::Error> {
+    pub async fn schedule_test_on_core(&self, core: u64, test: u64) -> Result<(), errors::Error> {
         if self.program.read().await.is_none() {
             return Err(errors::ConductorFailure(
                 "Cannot judge submission before the program is built".to_string(),
@@ -149,6 +161,9 @@ impl Submission {
     }
 
     pub async fn finalize(&mut self) -> Result<(), errors::Error> {
+        if let Some(program) = self.program.write().await.take() {
+            program.remove()?;
+        }
         Ok(())
     }
 }

@@ -16,13 +16,9 @@ mod client;
 
 mod config;
 
-mod corepool;
-
 mod errors;
 
 pub mod init;
-
-mod ipc;
 
 mod message {
     pub(crate) mod c2i;
@@ -34,8 +30,6 @@ mod problem {
     pub(crate) mod problem;
     pub(crate) mod store;
 }
-
-mod process;
 
 mod submission;
 

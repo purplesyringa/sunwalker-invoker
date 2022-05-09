@@ -2,54 +2,67 @@ use crate::{
     errors,
     image::{package, sandbox},
 };
-use anyhow::Context;
-use serde::{Deserialize, Serialize};
+use multiprocessing::{Bind, Object};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Object)]
 pub struct Program {
     pub package: package::Package,
     pub prerequisites: Vec<String>,
     pub argv: Vec<String>,
+    pub build_id: String,
 }
 
 impl Program {
-    pub async fn run(&self, worker_space: &sandbox::WorkerSpace) -> Result<(), errors::Error> {
+    pub fn make_rootfs(
+        &self,
+        worker_space: &sandbox::WorkerSpace,
+    ) -> Result<sandbox::RootFS, errors::Error> {
         let mut bound_files = Vec::new();
         for prerequisite in &self.prerequisites {
             bound_files.push((
-                format!("/tmp/worker/artifacts/{}", prerequisite).into(),
+                format!("/tmp/artifacts/{}/{}", self.build_id, prerequisite).into(),
                 format!("/space/{}", prerequisite),
             ));
         }
-
-        let rootfs = worker_space
-            .make_rootfs(&self.package, bound_files)
+        worker_space
+            .make_rootfs(&self.package, bound_files, "run".to_string())
             .map_err(|e| {
                 errors::InvokerFailure(format!("Failed to make sandbox for running: {:?}", e))
-            })?;
-
-        // Enter the sandbox in another process
-        rootfs
-            .run_isolated(|| {
-                std::env::set_current_dir("/space")
-                    .with_context(|| "Failed to chdir to /space")
-                    .unwrap();
-
-                std::process::Command::new(&self.argv[0])
-                    .args(&self.argv[1..])
-                    .spawn()
-                    .with_context(|| format!("Failed to spawn {:?}", self.argv))
-                    .unwrap()
-                    .wait()
-                    .with_context(|| format!("Failed to get exit code of {:?}", self.argv))
-                    .unwrap();
             })
-            .await?;
-
-        rootfs
-            .remove()
-            .map_err(|e| errors::InvokerFailure(format!("Failed to remove rootfs: {:?}", e)))?;
-
-        Ok(())
     }
+
+    pub async fn run(
+        &self,
+        rootfs: &mut sandbox::RootFS,
+        ns: &mut sandbox::Namespace,
+    ) -> Result<(), errors::Error> {
+        sandbox::run_isolated(Box::new(start.bind(self.argv.clone())), rootfs, ns).await
+    }
+
+    pub fn remove(self) -> Result<(), errors::Error> {
+        let path = format!("/tmp/artifacts/{}", self.build_id);
+        std::fs::remove_dir_all(&path).map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to remove program artifacts at {}: {:?}",
+                path, e
+            ))
+        })
+    }
+}
+
+#[multiprocessing::entrypoint]
+fn start(argv: Vec<String>) -> Result<(), errors::Error> {
+    std::env::set_current_dir("/space")
+        .map_err(|e| errors::InvokerFailure(format!("Failed to chdir to /space: {:?}", e)))?;
+
+    std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .spawn()
+        .map_err(|e| errors::InvokerFailure(format!("Failed to spawn {:?}: {:?}", argv, e)))?
+        .wait()
+        .map_err(|e| {
+            errors::InvokerFailure(format!("Failed to get exit code of {:?}: {:?}", argv, e))
+        })?;
+
+    Ok(())
 }

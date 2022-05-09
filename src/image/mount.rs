@@ -105,7 +105,6 @@ impl ImageMounter {
             mountpoint,
             config,
             language_to_package_name,
-            // owned: true,
         })
     }
 }

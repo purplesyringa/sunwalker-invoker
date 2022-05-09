@@ -1,64 +1,31 @@
 use crate::{
-    // entry::entrypoint,
     errors,
     image::{language, program, sandbox},
-    ipc,
-    problem,
-    process,
-    submission,
+    problem, submission,
 };
 use futures::future::{AbortHandle, Abortable};
-use serde::{Deserialize, Serialize};
+use multiprocessing::tokio::{channel, Child, Receiver, Sender};
+use multiprocessing::Object;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Object)]
 enum I2WUrgentCommand {
     AddFailedTests(Vec<u64>),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Object)]
 enum W2INotification {
-    CompilationResult(Result<program::Program, errors::Error>),
+    CompilationResult(Result<(program::Program, String), errors::Error>),
 }
 
 pub struct Worker {
-    tx_i2w_command: Mutex<ipc::Sender<submission::Command>>,
-    tx_i2w_urgent: Mutex<ipc::Sender<I2WUrgentCommand>>,
-    detached: Arc<DetachedState>,
-}
-
-struct DetachedState {
-    rx_w2i: Mutex<ipc::Receiver<W2INotification>>,
-    event_sink: mpsc::UnboundedSender<submission::W2IMessage>,
-}
-
-struct Subprocess {
-    rx_i2w_command: Mutex<ipc::Receiver<submission::Command>>,
-    rx_i2w_urgent: Mutex<ipc::Receiver<I2WUrgentCommand>>,
-    tx_w2i: Mutex<ipc::Sender<W2INotification>>,
-    worker_space: sandbox::WorkerSpace,
-    current_command: Mutex<Option<(submission::Command, AbortHandle)>>,
-    program: RwLock<Option<program::Program>>,
-    language: language::Language,
-    source_files: Vec<String>,
-    dependency_dag: RwLock<problem::dependencies::DependencyDAG>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct InitializationInfo {
-    rx_i2w_command: ipc::Receiver<submission::Command>,
-    rx_i2w_urgent: ipc::Receiver<I2WUrgentCommand>,
-    tx_w2i: ipc::Sender<W2INotification>,
-    language: language::Language,
-    source_files: Vec<String>,
-    sandbox_config: sandbox::SandboxConfig,
-    dependency_dag: problem::dependencies::DependencyDAG,
-    program: Option<program::Program>,
+    tx_i2w_command: Mutex<Sender<submission::Command>>,
+    tx_i2w_urgent: Mutex<Sender<I2WUrgentCommand>>,
 }
 
 impl Worker {
-    pub fn new(
+    pub async fn new(
         language: language::Language,
         source_files: Vec<String>,
         sandbox_config: sandbox::SandboxConfig,
@@ -66,74 +33,58 @@ impl Worker {
         program: Option<program::Program>,
         event_sink: mpsc::UnboundedSender<submission::W2IMessage>,
     ) -> Result<Worker, errors::Error> {
-        let (tx_i2w_command, rx_i2w_command) = ipc::channel(ipc::Direction::ParentToChild)
-            .map_err(|e| {
-                errors::InvokerFailure(format!("Failed to create an IPC channel: {:?}", e))
-            })?;
-
-        let (tx_i2w_urgent, rx_i2w_urgent) =
-            ipc::channel(ipc::Direction::ParentToChild).map_err(|e| {
-                errors::InvokerFailure(format!("Failed to create an IPC channel: {:?}", e))
-            })?;
-
-        let (tx_w2i, rx_w2i) = ipc::channel(ipc::Direction::ChildToParent).map_err(|e| {
+        let (tx_i2w_command, rx_i2w_command) = channel().map_err(|e| {
+            errors::InvokerFailure(format!("Failed to create an IPC channel: {:?}", e))
+        })?;
+        let (tx_i2w_urgent, rx_i2w_urgent) = channel().map_err(|e| {
+            errors::InvokerFailure(format!("Failed to create an IPC channel: {:?}", e))
+        })?;
+        let (tx_w2i, rx_w2i) = channel().map_err(|e| {
             errors::InvokerFailure(format!("Failed to create an IPC channel: {:?}", e))
         })?;
 
-        let init = InitializationInfo {
-            rx_i2w_command,
-            rx_i2w_urgent,
-            tx_w2i,
-            language,
-            source_files,
-            sandbox_config,
-            dependency_dag,
-            program,
-        };
-
-        let init = rmp_serde::to_vec(&init).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to serialize the initialization message to the worker subprocess: {:?}",
-                e
-            ))
-        })?;
-
-        process::spawn(move || {
-            Subprocess::main(init).unwrap();
-        })
-        .map_err(|e| {
-            errors::InvokerFailure(format!("Failed to spawn a worker subprocess: {:?}", e))
-        })?;
+        let child = subprocess_main
+            .spawn_tokio(
+                rx_i2w_command,
+                rx_i2w_urgent,
+                tx_w2i,
+                language,
+                source_files,
+                sandbox_config,
+                dependency_dag,
+                program,
+            )
+            .await
+            .map_err(|e| {
+                errors::InvokerFailure(format!("Failed to spawn a worker subprocess: {:?}", e))
+            })?;
 
         let worker = Worker {
             tx_i2w_command: Mutex::new(tx_i2w_command),
             tx_i2w_urgent: Mutex::new(tx_i2w_urgent),
-            detached: Arc::new(DetachedState {
-                rx_w2i: Mutex::new(rx_w2i),
-                event_sink,
-            }),
         };
 
-        tokio::spawn(work_detached(worker.detached.clone()));
+        tokio::spawn(work_detached(rx_w2i, event_sink, child));
 
         Ok(worker)
     }
 
     pub async fn push_command(&self, command: submission::Command) -> Result<(), errors::Error> {
-        if let Err(_) = self.tx_i2w_command.lock().await.send(command).await {
-            Err(errors::InvokerFailure(
-                "Failed to send command to the worker--it was possibly terminated".to_string(),
-            ))
-        } else {
-            Ok(())
-        }
+        self.tx_i2w_command
+            .lock()
+            .await
+            .send(&command)
+            .await
+            .map_err(|e| {
+                errors::InvokerFailure(format!("Failed to send command to the worker: {:?}", e))
+            })
     }
 
     pub async fn add_failed_tests(&self, tests: Vec<u64>) -> Result<(), errors::Error> {
         self.tx_i2w_urgent
             .lock()
             .await
-            .send(I2WUrgentCommand::AddFailedTests(tests))
+            .send(&I2WUrgentCommand::AddFailedTests(tests))
             .await
             .map_err(|e| {
                 errors::InvokerFailure(format!(
@@ -144,90 +95,137 @@ impl Worker {
     }
 }
 
-async fn work_detached(state: Arc<DetachedState>) -> Result<(), errors::Error> {
-    while let Some(notification) = state.rx_w2i.lock().await.recv().await.map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to read notification from worker subprocess: {:?}",
-            e
-        ))
-    })? {
-        match notification {
-            W2INotification::CompilationResult(program) => state
-                .event_sink
-                .send(submission::W2IMessage::CompilationResult(program))
-                .map_err(|e| {
-                    errors::InvokerFailure(format!(
-                        "Failed to send compilation result to sink: {:?}",
-                        e
-                    ))
-                })?,
-        };
+async fn work_detached(
+    mut rx_w2i: Receiver<W2INotification>,
+    event_sink: mpsc::UnboundedSender<submission::W2IMessage>,
+    mut child: Child<Result<(), errors::Error>>,
+) {
+    let event_sink = &event_sink;
+    let result = async move || -> Result<(), errors::Error> {
+        while let Some(notification) = rx_w2i.recv().await.map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to read notification from worker subprocess: {:?}",
+                e
+            ))
+        })? {
+            match notification {
+                W2INotification::CompilationResult(result) => event_sink
+                    .send(submission::W2IMessage::CompilationResult(result))
+                    .map_err(|e| {
+                        errors::InvokerFailure(format!(
+                            "Failed to send compilation result to sink: {:?}",
+                            e
+                        ))
+                    })?,
+            };
+        }
+
+        child
+            .join()
+            .await
+            .map_err(|e| errors::InvokerFailure(format!("Worker process crashed: {:?}", e)))?
+    }()
+    .await;
+
+    if let Err(err) = result {
+        if let Err(send_err) = event_sink.send(submission::W2IMessage::Failure(err.clone())) {
+            println!(
+                "Failed to report error ({:?}) to event sink: {:?}",
+                err, send_err
+            );
+        }
     }
+}
+
+struct Subprocess {
+    worker_space: sandbox::WorkerSpace,
+    current_command: Mutex<Option<(submission::Command, AbortHandle)>>,
+    language: language::Language,
+    source_files: Vec<String>,
+    dependency_dag: RwLock<problem::dependencies::DependencyDAG>,
+}
+
+struct SubprocessMain {
+    tx_w2i: Sender<W2INotification>,
+    program: Option<program::Program>,
+    rootfs_ns: Option<(sandbox::RootFS, sandbox::Namespace)>,
+}
+
+// multithreading does not interact with sandboxing well. For one thing, unshare only seems to apply
+// to the current thread rather than the whole process. /proc/self/mounts refers to the mount
+// namespace of the main thread of the process, and different threads of the same process can be in
+// different mount namespaces despite what man says, which leads to sandbox escape. Disabling
+// multithreading seems like the most robust solution.
+#[multiprocessing::entrypoint]
+#[tokio::main(flavor = "current_thread")]
+pub async fn subprocess_main(
+    mut rx_i2w_command: Receiver<submission::Command>,
+    mut rx_i2w_urgent: Receiver<I2WUrgentCommand>,
+    tx_w2i: Sender<W2INotification>,
+    language: language::Language,
+    source_files: Vec<String>,
+    sandbox_config: sandbox::SandboxConfig,
+    dependency_dag: problem::dependencies::DependencyDAG,
+    program: Option<program::Program>,
+) -> Result<(), errors::Error> {
+    let worker_space = sandbox::enter_worker_space(sandbox_config)
+        .map_err(|e| errors::InvokerFailure(format!("Failed to enter worker space: {:?}", e)))?;
+
+    let subprocess = Arc::new(Subprocess {
+        worker_space,
+        current_command: Mutex::new(None),
+        language,
+        source_files,
+        dependency_dag: RwLock::new(dependency_dag),
+    });
+
+    let proc = subprocess.clone();
+    let commands_future = tokio::spawn(async move {
+        let mut main = SubprocessMain {
+            tx_w2i,
+            program,
+            rootfs_ns: None,
+        };
+
+        while let Some(command) = rx_i2w_command.recv().await.map_err(|e| {
+            errors::InvokerFailure(format!("Failed to receive command from invoker: {:?}", e))
+        })? {
+            proc.handle_core_command(command.clone(), &mut main).await?;
+        }
+        Ok(()) as Result<(), errors::Error>
+    });
+
+    let urgent_commands_future = tokio::spawn(async move {
+        while let Some(command) = rx_i2w_urgent.recv().await.map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to receive urgent command from invoker: {:?}",
+                e
+            ))
+        })? {
+            subprocess.handle_urgent_command(command).await?;
+        }
+        Ok(()) as Result<(), errors::Error>
+    });
+
+    commands_future.await.map_err(|e| {
+        errors::InvokerFailure(format!("Worker main loop returned error: {:?}", e))
+    })??;
+    urgent_commands_future
+        .await
+        .map_err(|e| errors::InvokerFailure(format!("Worker urgent returned error: {:?}", e)))??;
 
     Ok(())
 }
 
 impl Subprocess {
-    // #[entrypoint("core_worker")]
-    pub fn main(init: Vec<u8>) -> Result<(), errors::Error> {
-        println!("Child main!");
-
-        let init: InitializationInfo = rmp_serde::from_slice(&init).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to parse initialization information as msgpack format: {:?}",
-                e
-            ))
-        })?;
-
-        let worker_space = sandbox::enter_worker_space(init.sandbox_config).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to enter worker space: {:?}", e))
-        })?;
-
-        let mut subprocess = Subprocess {
-            rx_i2w_command: Mutex::new(init.rx_i2w_command),
-            rx_i2w_urgent: Mutex::new(init.rx_i2w_urgent),
-            tx_w2i: Mutex::new(init.tx_w2i),
-            worker_space,
-            current_command: Mutex::new(None),
-            program: RwLock::new(None),
-            language: init.language,
-            source_files: init.source_files,
-            dependency_dag: RwLock::new(init.dependency_dag),
-        };
-
-        let rt = tokio::runtime::Runtime::new().map_err(|e| {
-            errors::InvokerFailure(format!("Failed to create tokio runtime: {:?}", e))
-        })?;
-        rt.block_on(subprocess.work())
-    }
-
-    async fn work(&mut self) -> Result<(), errors::Error> {
-        let commands_future = async {
-            while let Some(command) = self.rx_i2w_command.lock().await.recv().await? {
-                self.handle_core_command(command).await?;
-            }
-            Ok(()) as anyhow::Result<()>
-        };
-
-        let urgent_commands_future = async {
-            while let Some(command) = self.rx_i2w_urgent.lock().await.recv().await? {
-                self.handle_urgent_command(command).await?;
-            }
-            Ok(()) as anyhow::Result<()>
-        };
-
-        tokio::select! {
-            _ = commands_future => {},
-            _ = urgent_commands_future => {}
-        };
-
-        Ok(())
-    }
-
-    async fn handle_core_command(&self, command: submission::Command) -> Result<(), errors::Error> {
+    async fn handle_core_command(
+        &self,
+        command: submission::Command,
+        main: &mut SubprocessMain,
+    ) -> Result<(), errors::Error> {
         let (handle, reg) = AbortHandle::new_pair();
         *self.current_command.lock().await = Some((command.clone(), handle));
-        let ret = Abortable::new(self._handle_core_command(command), reg).await;
+        let ret = Abortable::new(self._handle_core_command(command, main), reg).await;
         *self.current_command.lock().await = None;
         ret.unwrap_or(Ok(())) // It's fine if the command was aborted
     }
@@ -237,23 +235,23 @@ impl Subprocess {
     async fn _handle_core_command(
         &self,
         command: submission::Command,
+        main: &mut SubprocessMain,
     ) -> Result<(), errors::Error> {
         match command {
-            submission::Command::Compile => {
+            submission::Command::Compile(build_id) => {
                 let result = self
                     .language
                     .build(
                         self.source_files.iter().map(|s| s.as_ref()).collect(),
                         &self.worker_space,
+                        build_id,
                     )
                     .await;
-                if let Ok(ref program) = result {
-                    *self.program.write().await = Some(program.clone());
+                if let Ok((ref program, _)) = result {
+                    main.program = Some(program.clone());
                 }
-                self.tx_w2i
-                    .lock()
-                    .await
-                    .send(W2INotification::CompilationResult(result))
+                main.tx_w2i
+                    .send(&W2INotification::CompilationResult(result))
                     .await
                     .map_err(|e| {
                         errors::InvokerFailure(format!(
@@ -268,9 +266,7 @@ impl Subprocess {
                     return Ok(());
                 }
 
-                let lock = self.program.read().await;
-
-                let program = lock.as_ref().ok_or_else(|| {
+                let program = main.program.as_ref().ok_or_else(|| {
                     errors::InvokerFailure(
                         "Attempted to judge a program on a core before the core acquired a \
                          reference to the built program"
@@ -278,8 +274,17 @@ impl Subprocess {
                     )
                 })?;
 
-                // TODO: handle errors
-                program.run(&self.worker_space).await?;
+                if let None = main.rootfs_ns {
+                    main.rootfs_ns = Some((
+                        program.make_rootfs(&self.worker_space)?,
+                        self.worker_space.make_namespace("run".to_string()).await?,
+                    ));
+                } else {
+                    main.rootfs_ns.as_mut().unwrap().0.reset()?;
+                }
+
+                let (rootfs, ns) = main.rootfs_ns.as_mut().unwrap();
+                program.run(rootfs, ns).await?;
             }
         }
 
