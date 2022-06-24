@@ -6,7 +6,7 @@ use crate::{
 use multiprocessing::{Bind, Deserialize, DeserializeBoxed, Deserializer, Serialize, Serializer};
 use ouroboros::self_referencing;
 use rand::{thread_rng, Rng};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[self_referencing(pub_extras)]
@@ -18,33 +18,38 @@ pub struct LanguageImpl {
 }
 
 impl LanguageImpl {
-    pub async fn identify(
-        &self,
-        worker_space: &sandbox::WorkerSpace,
-    ) -> Result<String, errors::Error> {
+    pub async fn identify(&self) -> Result<String, errors::Error> {
         let package = self.borrow_package();
 
         // Make sandbox
-        let mut rootfs = worker_space
-            .make_rootfs(package, Vec::new(), "identify".to_string())
-            .map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Failed to make sandbox for identification: {:?}",
-                    e
-                ))
-            })?;
-        let mut ns = worker_space.make_namespace("identify".to_string()).await?;
+        let rootfs = sandbox::make_rootfs(
+            package,
+            Vec::new(),
+            sandbox::DiskQuotas {
+                // It should be read-only anyway
+                space: 4096,
+                max_inodes: 16,
+            },
+            "identify".to_string(),
+        )
+        .map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to make sandbox for identification: {:?}",
+                e
+            ))
+        })?;
+        let ns = sandbox::make_namespace("identify".to_string()).await?;
 
         // Enter the sandbox in another process
         let identification = sandbox::run_isolated(
             Box::new(identify.bind(self.borrow_config().identify.clone())),
-            &mut rootfs,
-            &mut ns,
+            &rootfs,
+            &ns,
         )
         .await?;
 
         if identification == "" {
-            return Err(errors::InvokerFailure(
+            return Err(errors::ConfigurationFailure(
                 "Identification succeeded, but did not report anything".to_string(),
             ));
         }
@@ -62,7 +67,6 @@ impl LanguageImpl {
     pub async fn build(
         &self,
         mut input_files: Vec<&str>,
-        worker_space: &sandbox::WorkerSpace,
         build_id: String,
     ) -> Result<(program::Program, String), errors::Error> {
         let package = self.borrow_package();
@@ -91,7 +95,7 @@ impl LanguageImpl {
                 let suffix = input_pattern
                     .rsplit_once("%")
                     .ok_or_else(|| {
-                        errors::InvokerFailure(format!(
+                        errors::ConfigurationFailure(format!(
                             "Input file pattern {} (derived from Makefile of package {}, language \
                              {}) does not contain glob character %",
                             input_pattern, package.name, name
@@ -102,7 +106,7 @@ impl LanguageImpl {
             }
 
             // Sort by suffix lengths (decreasing)
-            patterns_by_extension.sort_unstable_by(|a, b| b.1.len().cmp(&a.1.len()));
+            patterns_by_extension.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
             // Rename files appropriately
             for (input_pattern, suffix) in patterns_by_extension.into_iter() {
@@ -138,18 +142,25 @@ impl LanguageImpl {
         }
 
         // Make sandbox
-        let mut rootfs = worker_space
-            .make_rootfs(package, bound_files, "build".to_string())
-            .map_err(|e| {
-                errors::InvokerFailure(format!("Failed to make sandbox for build: {:?}", e))
-            })?;
-        let mut ns = worker_space.make_namespace("build".to_string()).await?;
+        let rootfs = sandbox::make_rootfs(
+            package,
+            bound_files,
+            sandbox::DiskQuotas {
+                space: 32 * 1024 * 1024, // TODO: make this configurable
+                max_inodes: 1024,
+            },
+            "build".to_string(),
+        )
+        .map_err(|e| {
+            errors::InvokerFailure(format!("Failed to make sandbox for build: {:?}", e))
+        })?;
+        let ns = sandbox::make_namespace("build".to_string()).await?;
 
         // Add /artifacts -> /tmp/artifacts/{build_id}
-        let artifacts_path = format!("/tmp/artifacts/{}", build_id);
+        let artifacts_path = PathBuf::from(format!("/tmp/artifacts/{}", build_id));
         let overlay_artifacts_path = format!("{}/artifacts", rootfs.overlay());
         std::fs::create_dir(&artifacts_path).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to create {}: {:?}", artifacts_path, e))
+            errors::InvokerFailure(format!("Failed to create {:?}: {:?}", artifacts_path, e))
         })?;
         std::fs::create_dir(&overlay_artifacts_path).map_err(|e| {
             errors::InvokerFailure(format!(
@@ -158,7 +169,10 @@ impl LanguageImpl {
             ))
         })?;
         system::bind_mount(&artifacts_path, &overlay_artifacts_path).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to bind-mount {}: {:?}", artifacts_path, e))
+            errors::InvokerFailure(format!(
+                "Failed to bind-mount {:?}: {:?}",
+                artifacts_path, e
+            ))
         })?;
 
         // Allow the sandbox user to access data
@@ -181,8 +195,8 @@ impl LanguageImpl {
                         .collect(),
                 ),
             ),
-            &mut rootfs,
-            &mut ns,
+            &rootfs,
+            &ns,
         )
         .await?;
 
@@ -198,11 +212,11 @@ impl LanguageImpl {
             &lisp::State::new().var("$base".to_string(), pattern.clone()),
         )
         .map_err(|e| {
-            errors::InvokerFailure(format!("Failed to evaluate run.prerequisites: {:?}", e))
+            errors::ConfigurationFailure(format!("Failed to evaluate run.prerequisites: {:?}", e))
         })?
         .to_native()
         .map_err(|e| {
-            errors::InvokerFailure(format!(
+            errors::ConfigurationFailure(format!(
                 "Failed to parse prerequisites generated by the schema as vector of strings: {:?}",
                 e
             ))
@@ -212,10 +226,10 @@ impl LanguageImpl {
             config.run.argv.clone(),
             &lisp::State::new().var("$base".to_string(), pattern.clone()),
         )
-        .map_err(|e| errors::InvokerFailure(format!("Failed to evaluate run.argv: {:?}", e)))?
+        .map_err(|e| errors::ConfigurationFailure(format!("Failed to evaluate run.argv: {:?}", e)))?
         .to_native()
         .map_err(|e| {
-            errors::InvokerFailure(format!(
+            errors::ConfigurationFailure(format!(
                 "Failed to parse argv generated by the schema as vector of strings: {:?}",
                 e
             ))
@@ -226,7 +240,7 @@ impl LanguageImpl {
                 package: self.borrow_package().clone(),
                 prerequisites,
                 argv,
-                build_id,
+                artifacts_path,
             },
             log,
         ))
@@ -275,20 +289,16 @@ impl Language {
         })
     }
 
-    pub async fn identify(
-        &self,
-        worker_space: &sandbox::WorkerSpace,
-    ) -> Result<String, errors::Error> {
-        self.nested.identify(worker_space).await
+    pub async fn identify(&self) -> Result<String, errors::Error> {
+        self.nested.identify().await
     }
 
     pub async fn build(
         &self,
         input_files: Vec<&str>,
-        worker_space: &sandbox::WorkerSpace,
         build_id: String,
     ) -> Result<(program::Program, String), errors::Error> {
-        self.nested.build(input_files, worker_space, build_id).await
+        self.nested.build(input_files, build_id).await
     }
 }
 
@@ -402,14 +412,8 @@ fn build(
     if pre_pattern != pattern {
         // Rename files according to new pattern
         for pattern in patterns {
-            let mut old_path = PathBuf::new();
-            old_path.push("/space");
-            old_path.push(pattern.replace("%", &pre_pattern));
-
-            let mut new_path = PathBuf::new();
-            new_path.push("/space");
-            new_path.push(pattern.replace("%", &pattern));
-
+            let old_path = Path::new("/space").join(pattern.replace("%", &pre_pattern));
+            let new_path = Path::new("/space").join(pattern.replace("%", &pattern));
             std::fs::write(&new_path, "").map_err(|e| {
                 errors::InvokerFailure(format!(
                     "Failed to create file {:?} on overlay: {:?}",
@@ -466,10 +470,8 @@ fn build(
     // process, the file can simply be moved. If it is an input file, it can be bind-mounted
     // from its original source.
     for rel_path in run_prerequisites.into_iter() {
-        let mut from = std::path::PathBuf::from("/space");
-        from.push(&rel_path);
-        let mut to = std::path::PathBuf::from("/artifacts");
-        to.push(&rel_path);
+        let from = Path::new("/space").join(&rel_path);
+        let to = Path::new("/artifacts").join(&rel_path);
         std::fs::copy(&from, &to).map_err(|e| {
             errors::InvokerFailure(format!(
                 "Failed to copy artifact {} from {:?} to {:?}: {:?}",

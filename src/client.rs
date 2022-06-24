@@ -4,16 +4,14 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use libc::CLONE_NEWNS;
+use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::sync::{atomic, Arc};
+use tokio::sync::{oneshot, Mutex, RwLock};
 
-struct Client {
-    config: config::Config,
-    submissions: RwLock<HashMap<String, submission::Submission>>,
-    problem_store: problem::store::ProblemStore,
-    mounted_image: Arc<image::image::Image>,
-    ephemeral_disk_space: u64,
+pub struct Communicator {
     conductor_read: Mutex<
         SplitStream<
             tokio_tungstenite::WebSocketStream<
@@ -29,9 +27,26 @@ struct Client {
             tungstenite::Message,
         >,
     >,
+    next_request_id: atomic::AtomicU64,
+    requests: Mutex<HashMap<u64, oneshot::Sender<Result<Vec<u8>, errors::Error>>>>,
 }
 
-impl Client {
+pub struct Client {
+    config: config::Config,
+    submissions: RwLock<HashMap<String, Arc<submission::Submission>>>,
+    problem_store: problem::store::ProblemStore,
+    mounted_image: Arc<image::image::Image>,
+    ephemeral_disk_space: u64,
+    communicator: Arc<Communicator>,
+}
+
+#[derive(Deserialize)]
+struct ArchiveManifest {
+    directories: Vec<String>,
+    file_hashes: HashMap<String, String>,
+}
+
+impl Communicator {
     async fn send_to_conductor(&self, message: message::i2c::Message) -> Result<(), errors::Error> {
         self.conductor_write
             .lock()
@@ -51,17 +66,129 @@ impl Client {
                     e
                 ))
             })?;
+
+        Ok(())
+    }
+
+    async fn request_file(&self, hash: &str) -> Result<Vec<u8>, errors::Error> {
+        let request_id = self.next_request_id.fetch_add(1, atomic::Ordering::Relaxed);
+
+        let (tx, rx) = oneshot::channel();
+        self.requests.lock().await.insert(request_id, tx);
+
+        self.send_to_conductor(message::i2c::Message::RequestFile(
+            message::i2c::RequestFile {
+                request_id,
+                hash: hash.to_string(),
+            },
+        ))
+        .await?;
+
+        rx.await.map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Did not receive response to request of file {}: {:?}",
+                hash, e
+            ))
+        })?
+    }
+
+    pub async fn download_archive(
+        &self,
+        topic: &str,
+        target_path: &Path,
+    ) -> Result<(), errors::Error> {
+        std::fs::remove_dir_all(target_path);
+        std::fs::create_dir_all(target_path).map_err(|e| {
+            errors::InvokerFailure(format!("Failed to create {:?}: {:?}", target_path, e))
+        })?;
+
+        let manifest = self.request_file(&format!("manifest/{}", topic)).await?;
+
+        let manifest = std::str::from_utf8(&manifest).map_err(|e| {
+            errors::ConfigurationFailure(format!("Invalid manifest for topic {}: {:?}", topic, e))
+        })?;
+
+        for mut line in manifest.lines() {
+            if line.ends_with('/') {
+                // Directory
+                let dir_path = target_path.join(&line);
+                std::fs::create_dir(&dir_path).map_err(|e| {
+                    errors::InvokerFailure(format!("Failed to create {:?}: {:?}", dir_path, e))
+                })?;
+            } else {
+                // File
+                let mut executable = false;
+                if line.starts_with("+x ") {
+                    executable = true;
+                    line = &line[3..];
+                }
+
+                // TODO: deduplication
+                let (hash, file) = line.split_once(' ').ok_or_else(|| {
+                    errors::InvokerFailure(format!(
+                        "Invalid manifest for topic {}: invalid line format",
+                        topic
+                    ))
+                })?;
+
+                // TODO: stream directly to file without loading to RAM
+                let data = self.request_file(hash).await.map_err(|e| {
+                    errors::InvokerFailure(format!(
+                        "Failed to download file {} from package {}: {:?}",
+                        file, topic, e
+                    ))
+                })?;
+
+                let file_path = target_path.join(&file);
+                std::fs::write(&file_path, data).map_err(|e| {
+                    errors::InvokerFailure(format!("Failed to write to {:?}: {:?}", file_path, e))
+                })?;
+
+                if executable {
+                    let mut permissions = file_path
+                        .metadata()
+                        .map_err(|e| {
+                            errors::InvokerFailure(format!(
+                                "Failed to get metadata of {:?}: {:?}",
+                                file_path, e
+                            ))
+                        })?
+                        .permissions();
+
+                    // Whoever can read can also execute
+                    permissions.set_mode(permissions.mode() | ((permissions.mode() & 0o444) >> 2));
+
+                    std::fs::set_permissions(&file_path, permissions).map_err(|e| {
+                        errors::InvokerFailure(format!(
+                            "Failed to make {:?} executable: {:?}",
+                            file_path, e
+                        ))
+                    })?
+                }
+            }
+        }
+
+        let ready_path = target_path.join(".ready");
+        std::fs::write(&ready_path, b"").map_err(|e| {
+            errors::InvokerFailure(format!("Failed to write to {:?}: {:?}", ready_path, e))
+        })?;
+
         Ok(())
     }
 }
 
+pub fn client_main(cli_args: init::CLIArgs) -> anyhow::Result<()> {
+    // Entering the sandbox must be done outside tokio runtime, because otherwise some threads are
+    // not sandboxed. See the comments in src/worker.rs for more information.
+    enter_sandbox()?;
+    client_main_async(cli_args)
+}
+
 #[tokio::main]
-pub async fn client_main(cli_args: init::CLIArgs) -> anyhow::Result<()> {
+async fn client_main_async(cli_args: init::CLIArgs) -> anyhow::Result<()> {
     let config = std::fs::read_to_string(&cli_args.config)
         .with_context(|| format!("Failed to read config from {}", cli_args.config))?;
     let config: config::Config = toml::from_str(&config).with_context(|| "Config is invalid")?;
-
-    enter_sandbox()?;
 
     let image_cfg = std::fs::read_to_string(&config.image.config).with_context(|| {
         format!(
@@ -103,77 +230,6 @@ pub async fn client_main(cli_args: init::CLIArgs) -> anyhow::Result<()> {
         );
     }
 
-    // let worker_space = image::sandbox::enter_worker_space(image::sandbox::SandboxConfig {
-    //     max_size_in_bytes: 8 * 1024 * 1024,
-    //     max_inodes: 1024,
-    //     core: 2,
-    // })?;
-    // std::fs::create_dir("/tmp/artifacts/test")?;
-    // std::fs::copy(
-    //     "/home/ivanq/Documents/sunwalker_invoker/hello",
-    //     "/tmp/artifacts/test/hello",
-    // )?;
-    // let package = image::package::Package::new(mounted_image, "gcc".to_string())?;
-    // let rootfs = worker_space
-    //     .make_rootfs(
-    //         &package,
-    //         vec![(
-    //             "/home/ivanq/Documents/sunwalker_invoker/hello"
-    //                 .to_string()
-    //                 .into(),
-    //             "/space/hello".to_string(),
-    //         )],
-    //         "run".to_string(),
-    //     )
-    //     .map_err(|e| {
-    //         errors::InvokerFailure(format!("Failed to make sandbox for running: {:?}", e))
-    //     })?;
-
-    // for _ in 0..1000 {
-    //     use multiprocessing::Bind;
-
-    //     let (mut upstream, downstream) =
-    //         multiprocessing::tokio::duplex::<(), ()>().map_err(|e| {
-    //             errors::InvokerFailure(format!(
-    //                 "Failed to create duplex connection to an isolated subprocess: {:?}",
-    //                 e
-    //             ))
-    //         })?;
-
-    //     let mut child = isolated_entry
-    //         .spawn_tokio(downstream, "run".to_string())
-    //         .await
-    //         .map_err(|e| {
-    //             errors::InvokerFailure(format!("Failed to start an isolated subprocess: {:?}", e))
-    //         })?;
-
-    //     child.join().await.map_err(|e| {
-    //         errors::InvokerFailure(format!(
-    //             "Isolated process didn't terminate gracefully: {:?}",
-    //             e
-    //         ))
-    //     })?;
-    // }
-
-    // return Ok(());
-
-    let problem_store =
-        problem::store::ProblemStore::new(std::path::PathBuf::from(&config.cache.problems))
-            .with_context(|| {
-                format!(
-                    "Failed to create problem store with cache at {} (this path is from field \
-                     cache.problems of the configuration file)",
-                    config.cache.problems
-                )
-            })?;
-
-    let ephemeral_disk_space: u64 = config
-        .environment
-        .ephemeral_disk_space
-        .clone()
-        .try_into()
-        .with_context(|| "Failed to parse environment.ephemeral_disk_space as size")?;
-
     let (conductor_ws, _) = tokio_tungstenite::connect_async(&config.conductor.address)
         .await
         .with_context(|| {
@@ -186,6 +242,32 @@ pub async fn client_main(cli_args: init::CLIArgs) -> anyhow::Result<()> {
 
     let (conductor_write, conductor_read) = conductor_ws.split();
 
+    let communicator = Arc::new(Communicator {
+        conductor_write: Mutex::new(conductor_write),
+        conductor_read: Mutex::new(conductor_read),
+        next_request_id: atomic::AtomicU64::new(0),
+        requests: Mutex::new(HashMap::new()),
+    });
+
+    let problem_store = problem::store::ProblemStore::new(
+        std::path::PathBuf::from(&config.cache.problems),
+        communicator.clone(),
+    )
+    .with_context(|| {
+        format!(
+            "Failed to create problem store with cache at {} (this path is from field \
+             cache.problems of the configuration file)",
+            config.cache.problems
+        )
+    })?;
+
+    let ephemeral_disk_space: u64 = config
+        .environment
+        .ephemeral_disk_space
+        .clone()
+        .try_into()
+        .with_context(|| "Failed to parse environment.ephemeral_disk_space as size")?;
+
     println!(
         "Connected to the conductor at address {:?}",
         config.conductor.address
@@ -197,12 +279,12 @@ pub async fn client_main(cli_args: init::CLIArgs) -> anyhow::Result<()> {
         problem_store,
         mounted_image,
         ephemeral_disk_space,
-        conductor_write: Mutex::new(conductor_write),
-        conductor_read: Mutex::new(conductor_read),
+        communicator,
     });
 
     // Handshake
     client
+        .communicator
         .send_to_conductor(message::i2c::Message::Handshake(message::i2c::Handshake {
             invoker_name: client.config.invoker.name.clone(),
         }))
@@ -210,6 +292,7 @@ pub async fn client_main(cli_args: init::CLIArgs) -> anyhow::Result<()> {
 
     // Initial mode
     client
+        .communicator
         .send_to_conductor(message::i2c::Message::UpdateMode(
             message::i2c::UpdateMode {
                 added_cores: client.config.environment.cpu_cores.clone(),
@@ -219,7 +302,7 @@ pub async fn client_main(cli_args: init::CLIArgs) -> anyhow::Result<()> {
         ))
         .await?;
 
-    while let Some(message) = client.conductor_read.lock().await.next().await {
+    while let Some(message) = client.communicator.conductor_read.lock().await.next().await {
         let message = message.with_context(|| "Failed to read message from the conductor")?;
         match message {
             tungstenite::Message::Close(_) => break,
@@ -249,11 +332,12 @@ async fn handle_message(
 
     match message {
         Message::AddSubmission(message) => add_submission(message, client).await?,
-        Message::PushToJudgementQueue(message) => push_to_judgment_queue(message, client).await?,
+        Message::PushToJudgementQueue(message) => push_to_judgment_queue(message, &client).await?,
         Message::CancelJudgementOnTests(message) => {
             cancel_judgement_on_tests(message, client).await?
         }
         Message::FinalizeSubmission(message) => finalize_submission(message, client).await?,
+        Message::SupplyFile(message) => supply_file(message, client).await?,
     }
 
     Ok(())
@@ -283,64 +367,78 @@ async fn add_submission(
         )));
     }
 
-    // tokio::spawn(async move {
-    let problem = client.problem_store.load(&message.problem_id).await?;
+    let closure = async move {
+        let problem = client
+            .problem_store
+            .load_revision(message.problem_id, message.revision_id)
+            .await?;
 
-    let mut submission = submission::Submission::new(
-        message.submission_id.clone(),
-        problem.dependency_dag.clone(),
-        image::image::Image::get_language(client.mounted_image.clone(), message.language.clone())?,
-    )?;
+        let mut submission = submission::Submission::new(
+            message.submission_id.clone(),
+            problem,
+            image::image::Image::get_language(
+                client.mounted_image.clone(),
+                message.language.clone(),
+            )?,
+        )?;
 
-    for (name, content) in message.files.into_iter() {
-        submission.add_source_file(&name, &content)?;
-    }
-
-    let mut submissions = client.submissions.write().await;
-    let submission = submissions
-        .try_insert(message.submission_id.clone(), submission)
-        .map_err(|_| {
-            errors::ConductorFailure(format!(
-                "A submission with ID {} cannot be added because it is already in the queue",
-                message.submission_id
-            ))
-        })?;
-
-    let compilation_result = submission.compile_on_core(message.compilation_core).await;
-
-    match compilation_result {
-        Ok(log) => {
-            client
-                .send_to_conductor(message::i2c::Message::NotifyCompilationStatus(
-                    message::i2c::NotifyCompilationStatus {
-                        submission_id: message.submission_id,
-                        success: true,
-                        log,
-                    },
-                ))
-                .await
+        for (name, content) in message.files.into_iter() {
+            submission.add_source_file(&name, &content)?;
         }
-        Err(errors::UserFailure(log)) => {
-            client
-                .send_to_conductor(message::i2c::Message::NotifyCompilationStatus(
-                    message::i2c::NotifyCompilationStatus {
-                        submission_id: message.submission_id,
-                        success: false,
-                        log,
-                    },
-                ))
-                .await
-        }
-        Err(e) => Err(e),
-    }
-    // });
 
-    // Ok(())
+        let mut submissions = client.submissions.write().await;
+        let submission = submissions
+            .try_insert(message.submission_id.clone(), Arc::new(submission))
+            .map_err(|_| {
+                errors::ConductorFailure(format!(
+                    "A submission with ID {} cannot be added because it is already in the queue",
+                    message.submission_id
+                ))
+            })?;
+
+        let compilation_result = submission.compile_on_core(message.compilation_core).await;
+
+        match compilation_result {
+            Ok(log) => {
+                client
+                    .communicator
+                    .send_to_conductor(message::i2c::Message::NotifyCompilationStatus(
+                        message::i2c::NotifyCompilationStatus {
+                            submission_id: message.submission_id,
+                            success: true,
+                            log,
+                        },
+                    ))
+                    .await
+            }
+            Err(errors::UserFailure(log)) => {
+                client
+                    .communicator
+                    .send_to_conductor(message::i2c::Message::NotifyCompilationStatus(
+                        message::i2c::NotifyCompilationStatus {
+                            submission_id: message.submission_id,
+                            success: false,
+                            log,
+                        },
+                    ))
+                    .await
+            }
+            Err(e) => Err(e),
+        }
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = closure.await {
+            println!("Failed AddSubmission: {:?}", e);
+        }
+    });
+
+    Ok(())
 }
 
 async fn push_to_judgment_queue(
     message: message::c2i::PushToJudgementQueue,
-    client: Arc<Client>,
+    client: &Client,
 ) -> Result<(), errors::Error> {
     let submissions = client.submissions.read().await;
 
@@ -352,15 +450,37 @@ async fn push_to_judgment_queue(
     })?;
 
     for test in message.tests {
-        submission
-            .schedule_test_on_core(message.core, test)
-            .await
-            .map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Failed to schedule evaluation of test {} on core {}: {:?}",
-                    test, message.core, e
+        let submission = submission.clone();
+        let communicator = client.communicator.clone();
+        tokio::spawn(async move {
+            let judgement_result = submission
+                .test_on_core(message.core, test)
+                .await
+                .unwrap_or_else(|e| problem::verdict::TestJudgementResult {
+                    verdict: problem::verdict::TestVerdict::Bug(format!(
+                        "Failed to schedule evaluation: {:?}",
+                        e
+                    )),
+                    logs: HashMap::new(),
+                    real_time: std::time::Duration::ZERO,
+                    user_time: std::time::Duration::ZERO,
+                    sys_time: std::time::Duration::ZERO,
+                    memory_used: 0,
+                });
+
+            if let Err(e) = communicator
+                .send_to_conductor(message::i2c::Message::NotifyTestStatus(
+                    message::i2c::NotifyTestStatus {
+                        submission_id: submission.id.clone(),
+                        test,
+                        judgement_result,
+                    },
                 ))
-            })?;
+                .await
+            {
+                println!("Failed to send to conductor: {:?}", e);
+            }
+        });
     }
 
     Ok(())
@@ -390,7 +510,7 @@ async fn finalize_submission(
 ) -> Result<(), errors::Error> {
     let mut submissions = client.submissions.write().await;
 
-    let mut submission = submissions.remove(&message.submission_id).ok_or_else(|| {
+    let submission = submissions.remove(&message.submission_id).ok_or_else(|| {
         errors::ConductorFailure(format!(
             "Cannot finalize an unknown (or already finalized) submission {}",
             message.submission_id
@@ -400,6 +520,32 @@ async fn finalize_submission(
     submission.finalize().await?;
 
     Ok(())
+}
+
+async fn supply_file(
+    message: message::c2i::SupplyFile,
+    client: Arc<Client>,
+) -> Result<(), errors::Error> {
+    let tx = client
+        .communicator
+        .requests
+        .lock()
+        .await
+        .remove(&message.request_id)
+        .ok_or_else(|| {
+            errors::ConductorFailure(format!(
+                "Conductor sent reply to message #{}, which either does not exist or has been \
+                 responded to already",
+                message.request_id
+            ))
+        })?;
+
+    tx.send(Ok(message.contents)).map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Conductor sent reply to message #{}, but its handler is dead: {:?}",
+            message.request_id, e
+        ))
+    })
 }
 
 fn enter_sandbox() -> anyhow::Result<()> {
@@ -448,32 +594,3 @@ fn enter_sandbox() -> anyhow::Result<()> {
 
     Ok(())
 }
-
-// #[multiprocessing::entrypoint]
-// #[tokio::main(flavor = "current_thread")] // unshare requires a single thread
-// async fn isolated_entry(
-//     mut duplex: multiprocessing::tokio::Duplex<(), ()>,
-//     id: String,
-// ) -> Result<(), errors::Error> {
-//     // Unshare namespaces
-//     if unsafe {
-//         libc::unshare(
-//             libc::CLONE_NEWNS
-//                 | libc::CLONE_NEWNET
-//                 | libc::CLONE_NEWUSER
-//                 | libc::CLONE_NEWUTS
-//                 | libc::CLONE_SYSVSEM
-//                 | libc::CLONE_NEWPID,
-//         )
-//     } != 0
-//     {
-//         return Err(errors::InvokerFailure(format!(
-//             "Failed to unshare mount namespace: {:?}",
-//             std::io::Error::last_os_error()
-//         )));
-//     }
-
-//     println!("duh");
-
-//     Ok(())
-// }

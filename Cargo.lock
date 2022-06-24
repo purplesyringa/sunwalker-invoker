@@ -1362,6 +1362,7 @@ dependencies = [
  "futures",
  "futures-util",
  "ipnetwork",
+ "itertools",
  "libc",
  "lisp",
  "multiprocessing",

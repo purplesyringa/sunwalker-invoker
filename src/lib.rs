@@ -1,4 +1,4 @@
-#![feature(async_closure, map_try_insert, unix_chown)]
+#![feature(async_closure, map_try_insert, unix_chown, io_safety)]
 
 mod image {
     pub(crate) mod config;
@@ -8,6 +8,7 @@ mod image {
     pub(crate) mod package;
     pub(crate) mod program;
     pub(crate) mod sandbox;
+    pub(crate) mod strategy;
 }
 
 mod cgroups;
@@ -26,9 +27,9 @@ mod message {
 }
 
 mod problem {
-    pub(crate) mod dependencies;
     pub(crate) mod problem;
     pub(crate) mod store;
+    pub(crate) mod verdict;
 }
 
 mod submission;

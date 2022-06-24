@@ -13,16 +13,9 @@ pub struct Image {
     pub language_to_package_name: HashMap<String, String>,
 }
 
-#[derive(Debug)]
-pub struct AutoUnmountedImage {
-    pub image: Image,
-}
-
 impl Image {
     pub fn has_package(&self, package: &str) -> bool {
-        let mut path = self.mountpoint.clone();
-        path.push(package);
-        path.exists()
+        self.mountpoint.join(package).exists()
     }
 
     pub fn has_language(&self, name: &str) -> bool {

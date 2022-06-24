@@ -7,6 +7,7 @@ pub enum Message {
     PushToJudgementQueue(PushToJudgementQueue),
     CancelJudgementOnTests(CancelJudgementOnTests),
     FinalizeSubmission(FinalizeSubmission),
+    SupplyFile(SupplyFile),
 }
 
 #[derive(Debug, Deserialize)]
@@ -14,6 +15,7 @@ pub struct AddSubmission {
     pub compilation_core: u64,
     pub submission_id: String,
     pub problem_id: String,
+    pub revision_id: String,
     pub files: HashMap<String, Vec<u8>>,
     pub language: String,
 }
@@ -34,4 +36,10 @@ pub struct CancelJudgementOnTests {
 #[derive(Debug, Deserialize)]
 pub struct FinalizeSubmission {
     pub submission_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SupplyFile {
+    pub request_id: u64,
+    pub contents: Vec<u8>,
 }

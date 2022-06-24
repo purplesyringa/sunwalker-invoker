@@ -1,3 +1,4 @@
+use crate::problem::verdict::TestJudgementResult;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -6,6 +7,7 @@ pub enum Message {
     UpdateMode(UpdateMode),
     NotifyCompilationStatus(NotifyCompilationStatus),
     NotifyTestStatus(NotifyTestStatus),
+    RequestFile(RequestFile),
 }
 
 #[derive(Debug, Serialize)]
@@ -31,5 +33,11 @@ pub struct NotifyCompilationStatus {
 pub struct NotifyTestStatus {
     pub submission_id: String,
     pub test: u64,
-    pub verdict: String,
+    pub judgement_result: TestJudgementResult,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RequestFile {
+    pub request_id: u64,
+    pub hash: String,
 }

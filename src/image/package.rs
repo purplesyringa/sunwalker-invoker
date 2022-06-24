@@ -16,9 +16,9 @@ impl Package {
         if image.has_package(name.as_ref()) {
             Ok(Package { image, name })
         } else {
-            Err(errors::InvokerFailure(format!(
+            Err(errors::ConfigurationFailure(format!(
                 "Image {:?} does not contain package {}",
-                image, name
+                image.mountpoint, name
             )))
         }
     }

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum Error {
     InvokerFailure(String),
     ConductorFailure(String),
+    ConfigurationFailure(String),
     CommunicationError(String),
     UserFailure(String),
 }

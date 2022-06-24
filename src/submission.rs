@@ -1,39 +1,36 @@
 use crate::{
     errors,
-    image::{language, program, sandbox},
-    problem, worker,
+    image::{language, program},
+    problem::{problem, verdict},
+    worker,
 };
+use itertools::Itertools;
 use multiprocessing::Object;
 use std::collections::HashMap;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Clone, Debug, Object)]
 pub enum Command {
     Compile(String),
     Test(u64),
-}
-
-#[derive(Debug)]
-pub enum W2IMessage {
-    CompilationResult(Result<(program::Program, String), errors::Error>),
-    Failure(errors::Error),
+    Finalize,
 }
 
 pub struct Submission {
-    id: String,
-    dependency_dag: RwLock<problem::dependencies::DependencyDAG>,
+    pub id: String,
+    instantiated_dependency_dag: RwLock<problem::InstantiatedDependencyDAG>,
     language: language::Language,
     source_files: Vec<String>,
     program: RwLock<Option<program::Program>>,
     workers: RwLock<HashMap<u64, worker::Worker>>,
-    cumulative_messages_tx: mpsc::UnboundedSender<W2IMessage>,
-    cumulative_messages_rx: Mutex<mpsc::UnboundedReceiver<W2IMessage>>,
+    problem_revision: Arc<problem::ProblemRevision>,
 }
 
 impl Submission {
     pub fn new(
         id: String,
-        dependency_dag: problem::dependencies::DependencyDAG,
+        problem_revision: Arc<problem::ProblemRevision>,
         language: language::Language,
     ) -> Result<Submission, errors::Error> {
         let root = format!("/tmp/submissions/{}", id);
@@ -44,17 +41,16 @@ impl Submission {
             ))
         })?;
 
-        let (cumulative_messages_tx, cumulative_messages_rx) = mpsc::unbounded_channel();
-
         Ok(Submission {
             id,
-            dependency_dag: RwLock::new(dependency_dag),
+            instantiated_dependency_dag: RwLock::new(
+                problem_revision.dependency_dag.clone().instantiate(),
+            ),
             language,
             source_files: Vec::new(),
             program: RwLock::new(None),
             workers: RwLock::new(HashMap::new()),
-            cumulative_messages_tx,
-            cumulative_messages_rx: Mutex::new(cumulative_messages_rx),
+            problem_revision,
         })
     }
 
@@ -70,88 +66,85 @@ impl Submission {
         Ok(())
     }
 
-    async fn schedule_on_core(&self, core: u64, command: Command) -> Result<(), errors::Error> {
+    async fn execute_on_core(
+        &self,
+        core: u64,
+        command: Command,
+    ) -> Result<worker::W2IMessage, errors::Error> {
         let mut workers = self.workers.write().await;
 
         use std::collections::hash_map::Entry;
-        let worker = match workers.entry(core) {
-            Entry::Occupied(occupied) => occupied.into_mut(),
-            Entry::Vacant(vacant) => vacant.insert(
-                worker::Worker::new(
-                    self.language.clone(),
-                    self.source_files.clone(),
-                    sandbox::SandboxConfig {
-                        max_size_in_bytes: 8 * 1024 * 1024, // TODO: get from config
-                        max_inodes: 1024,
-                        core,
-                    },
-                    self.dependency_dag.read().await.clone(),
-                    self.program.read().await.clone(),
-                    self.cumulative_messages_tx.clone(),
-                )
-                .await?,
-            ),
-        };
 
-        if let Err(e) = worker.push_command(command).await {
-            if let Some(message) = self.cumulative_messages_rx.lock().await.recv().await {
-                if let W2IMessage::Failure(reason) = message {
-                    return Err(errors::InvokerFailure(format!(
-                        "Failed to push command: {:?}; likely reason: {:?}",
-                        e, reason
-                    )));
-                }
+        match workers.entry(core) {
+            Entry::Occupied(occupied) => occupied.get().execute_command(command).await,
+            Entry::Vacant(vacant) => {
+                let worker = vacant.insert(
+                    worker::Worker::new(
+                        self.language.clone(),
+                        self.source_files.clone(),
+                        core,
+                        self.instantiated_dependency_dag.read().await.clone(),
+                        self.program.read().await.clone(),
+                        self.problem_revision.strategy_factory.clone(),
+                        self.problem_revision.data.clone(),
+                    )
+                    .await?,
+                );
+                worker.execute_command(command).await
             }
-            Err(e)
-        } else {
-            Ok(())
         }
     }
 
-    // Not abortable
     pub async fn compile_on_core(&self, core: u64) -> Result<String, errors::Error> {
         if self.program.read().await.is_some() {
             return Err(errors::ConductorFailure(
                 "The submission is already compiled".to_string(),
             ));
         }
-        self.schedule_on_core(core, Command::Compile(format!("judge-{}", self.id)))
+
+        let response = self
+            .execute_on_core(core, Command::Compile(format!("judge-{}", self.id)))
             .await?;
-        let message = self
-            .cumulative_messages_rx
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or_else(|| {
-                errors::InvokerFailure(format!(
-                    "Compilation result was not sent back to the submission object",
-                ))
-            })?;
-        match message {
-            W2IMessage::CompilationResult(Ok((program, log))) => {
+        match response {
+            worker::W2IMessage::CompilationResult(program, log) => {
                 *self.program.write().await = Some(program);
                 Ok(log)
             }
-            W2IMessage::CompilationResult(Err(e)) => Err(e),
-            W2IMessage::Failure(e) => Err(e),
+            worker::W2IMessage::Failure(e) => Err(e),
+            _ => Err(errors::InvokerFailure(format!(
+                "Unexpected response to compilation request: {:?}",
+                response
+            ))),
         }
     }
 
-    pub async fn schedule_test_on_core(&self, core: u64, test: u64) -> Result<(), errors::Error> {
+    pub async fn test_on_core(
+        &self,
+        core: u64,
+        test: u64,
+    ) -> Result<verdict::TestJudgementResult, errors::Error> {
         if self.program.read().await.is_none() {
             return Err(errors::ConductorFailure(
                 "Cannot judge submission before the program is built".to_string(),
             ));
         }
-        self.schedule_on_core(core, Command::Test(test)).await
+
+        let response = self.execute_on_core(core, Command::Test(test)).await?;
+        match response {
+            worker::W2IMessage::TestResult(result) => Ok(result),
+            worker::W2IMessage::Failure(e) => Err(e),
+            _ => Err(errors::InvokerFailure(format!(
+                "Unexpected response to judgement request: {:?}",
+                response
+            ))),
+        }
     }
 
     pub async fn add_failed_tests(&self, tests: &[u64]) -> Result<(), errors::Error> {
         {
-            let mut dependency_dag = self.dependency_dag.write().await;
+            let mut instantiated_dependency_dag = self.instantiated_dependency_dag.write().await;
             for test in tests {
-                dependency_dag.fail_test(*test);
+                instantiated_dependency_dag.fail_test(*test);
             }
         }
         for (_, worker) in self.workers.read().await.iter() {
@@ -160,10 +153,26 @@ impl Submission {
         Ok(())
     }
 
-    pub async fn finalize(&mut self) -> Result<(), errors::Error> {
+    pub async fn finalize(&self) -> Result<(), errors::Error> {
         if let Some(program) = self.program.write().await.take() {
             program.remove()?;
         }
-        Ok(())
+        let mut workers = self.workers.write().await;
+
+        let mut errors =
+            futures::future::join_all(workers.iter_mut().map(|(_, worker)| worker.finalize()))
+                .await
+                .into_iter()
+                .filter_map(|res| res.err())
+                .peekable();
+
+        if errors.peek().is_none() {
+            Ok(())
+        } else {
+            Err(errors::InvokerFailure(format!(
+                "Failed to finalize submission: {}",
+                errors.map(|e| format!("{:?}", e)).join(", ")
+            )))
+        }
     }
 }

@@ -8,24 +8,20 @@ use libc::{
 use multiprocessing::Object;
 use std::ffi::{CStr, OsString};
 use std::io::BufRead;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::{ffi::OsStrExt, io::AsRawFd};
 use std::path::PathBuf;
 
-#[derive(Clone, Object)]
-pub struct SandboxConfig {
-    pub max_size_in_bytes: u64,
+pub struct DiskQuotas {
+    pub space: u64,
     pub max_inodes: u64,
-    pub core: u64,
-}
-
-pub struct WorkerSpace {
-    sandbox_config: SandboxConfig,
 }
 
 pub struct RootFS {
     removed: bool,
     pub id: String,
-    config: String,
+    fs_options: String,
+    quotas: DiskQuotas,
 }
 
 pub struct Namespace {
@@ -69,7 +65,7 @@ fn unmount_recursively(prefix: &str) -> Result<(), errors::Error> {
     Ok(())
 }
 
-pub fn enter_worker_space(sandbox_config: SandboxConfig) -> anyhow::Result<WorkerSpace> {
+pub fn enter_worker_space(core: u64) -> anyhow::Result<()> {
     // Unshare namespaces
     unsafe {
         if libc::unshare(CLONE_NEWNS) != 0 {
@@ -78,231 +74,240 @@ pub fn enter_worker_space(sandbox_config: SandboxConfig) -> anyhow::Result<Worke
     }
 
     // Create per-worker tmpfs
-    system::mount(
-        "none",
-        "/tmp/worker",
-        "tmpfs",
-        0,
-        Some(
-            format!(
-                "size={},nr_inodes={}",
-                sandbox_config.max_size_in_bytes, sandbox_config.max_inodes
-            )
-            .as_ref(),
-        ),
-    )
-    .with_context(|| "Mounting tmpfs on /tmp/worker failed")?;
+    system::mount("none", "/tmp/worker", "tmpfs", 0, None)
+        .with_context(|| "Mounting tmpfs on /tmp/worker failed")?;
 
     std::fs::create_dir("/tmp/worker/rootfs")?;
     std::fs::create_dir("/tmp/worker/ns")?;
+    std::fs::create_dir("/tmp/worker/aux")?;
 
     // Switch to core
     let pid = unsafe { libc::getpid() };
-    cgroups::add_task_to_core(pid, sandbox_config.core).with_context(|| {
+    cgroups::add_task_to_core(pid, core).with_context(|| {
         format!(
             "Failed to move current process (PID {}) to core {}",
-            pid, sandbox_config.core
+            pid, core
         )
     })?;
 
-    Ok(WorkerSpace { sandbox_config })
+    Ok(())
 }
 
-impl WorkerSpace {
-    pub fn make_rootfs(
-        &self,
-        package: &package::Package,
-        bound_files: Vec<(PathBuf, String)>,
-        id: String,
-    ) -> anyhow::Result<RootFS> {
-        let prefix = format!("/tmp/worker/rootfs/{}", id);
+pub fn make_rootfs(
+    package: &package::Package,
+    bound_files: Vec<(PathBuf, String)>,
+    quotas: DiskQuotas,
+    id: String,
+) -> anyhow::Result<RootFS> {
+    let prefix = format!("/tmp/worker/rootfs/{}", id);
 
-        std::fs::create_dir(&prefix)?;
-        std::fs::create_dir(format!("{}/dynamic", prefix))?;
-        std::fs::create_dir(format!("{}/ephemeral", prefix))?;
-        std::fs::create_dir(format!("{}/work", prefix))?;
-        std::fs::create_dir(format!("{}/overlay", prefix))?;
+    std::fs::create_dir(&prefix)?;
+    std::fs::create_dir(format!("{}/dynamic", prefix))?;
+    std::fs::create_dir(format!("{}/ephemeral", prefix))?;
+    std::fs::create_dir(format!("{}/overlay", prefix))?;
+    std::fs::create_dir(format!("{}/overlay/root", prefix))?;
 
-        // Initialize user directory.
-        // Do not use bind mount here because overlayfs doesn't support nested mounts in lowerdir
-        std::fs::create_dir(format!("{}/dynamic/space", prefix))
-            .with_context(|| format!("Failed to create {}/dynamic/space", prefix))?;
-        for (from, to) in bound_files.into_iter() {
-            let to = format!("{}/dynamic{}", prefix, to);
+    // Mount tmpfs on ephemeral to implement disk quotas
+    system::mount(
+        "none",
+        format!("{}/ephemeral", prefix),
+        "tmpfs",
+        system::MS_NOSUID,
+        Some(format!("size={},nr_inodes={}", quotas.space, quotas.max_inodes).as_ref()),
+    )
+    .with_context(|| format!("Mounting tmpfs on {}/ephemeral failed", prefix))?;
 
-            let data =
-                std::fs::read(&from).with_context(|| format!("Failed to read {:?}", from))?;
-            std::fs::write(&to, data).with_context(|| format!("Failed to write to {}", to))?;
+    std::fs::create_dir(format!("{}/ephemeral/upper", prefix))?;
+    std::fs::create_dir(format!("{}/ephemeral/work", prefix))?;
 
-            let meta = std::fs::metadata(&from)
-                .with_context(|| format!("Failed to get metadata of {:?}", from))?;
-            std::fs::set_permissions(&to, meta.permissions())
-                .with_context(|| format!("Failed to set permissions of {}", to))?;
-        }
+    // Initialize user directory.
+    // Do not use bind mount here because overlayfs doesn't support nested mounts in lowerdir
+    std::fs::create_dir(format!("{}/dynamic/space", prefix))
+        .with_context(|| format!("Failed to create {}/dynamic/space", prefix))?;
+    for (from, to) in bound_files.into_iter() {
+        let to = format!("{}/dynamic{}", prefix, to);
 
-        // Allow the sandbox user to write to /space
-        std::os::unix::fs::chown(
-            format!("{}/dynamic/space", prefix),
-            Some(65534),
-            Some(65534),
-        )?;
+        let data = std::fs::read(&from).with_context(|| format!("Failed to read {:?}", from))?;
+        std::fs::write(&to, data).with_context(|| format!("Failed to write to {}", to))?;
 
-        // Mount overlay
-        let config = format!(
-            "lowerdir={}/{}:{}/dynamic,upperdir={}/ephemeral,workdir={}/work",
-            package
-                .image
-                .mountpoint
-                .to_str()
-                .with_context(|| "Mountpoint must be a string")?,
-            package.name,
-            prefix,
-            prefix,
-            prefix,
-        );
-        system::mount(
-            "overlay",
-            format!("{}/overlay", prefix),
-            "overlay",
-            0,
-            Some(&config),
-        )
-        .with_context(|| format!("Failed to mount overlay at {}", prefix))?;
-
-        // Mount /dev on overlay, rather than dynamic, because overlayfs doesn't support nested
-        // mounts. We'll have to restore this later upon reset.
-        std::fs::create_dir(format!("{}/overlay/dev", prefix))
-            .with_context(|| format!("Failed to create {}/overlay/dev", prefix))?;
-        system::bind_mount_opt(
-            "/tmp/dev",
-            format!("{}/overlay/dev", prefix),
-            system::MS_RDONLY,
-        )
-        .with_context(|| "Failed to mount /dev on .../overlay")?;
-
-        Ok(RootFS {
-            removed: false,
-            id,
-            config,
-        })
+        let meta = std::fs::metadata(&from)
+            .with_context(|| format!("Failed to get metadata of {:?}", from))?;
+        std::fs::set_permissions(&to, meta.permissions())
+            .with_context(|| format!("Failed to set permissions of {}", to))?;
     }
 
-    pub async fn make_namespace(&self, id: String) -> Result<Namespace, errors::Error> {
-        let (mut upstream, downstream) =
-            multiprocessing::tokio::duplex::<(), ()>().map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Failed to create duplex connection to an isolated subprocess: {:?}",
-                    e
-                ))
-            })?;
+    // Allow the sandbox user to write to /space
+    std::os::unix::fs::chown(
+        format!("{}/dynamic/space", prefix),
+        Some(65534),
+        Some(65534),
+    )?;
 
-        let mut child = make_ns.spawn_tokio(downstream).await.map_err(|e| {
-            errors::InvokerFailure(format!("Failed to start an isolated subprocess: {:?}", e))
-        })?;
+    // Mount overlay
+    let fs_options = format!(
+        "lowerdir={}/{}:{}/dynamic,upperdir={}/ephemeral/upper,workdir={}/ephemeral/work",
+        package
+            .image
+            .mountpoint
+            .to_str()
+            .with_context(|| "Mountpoint must be a string")?,
+        package.name,
+        prefix,
+        prefix,
+        prefix,
+    );
+    system::mount(
+        "overlay",
+        format!("{}/overlay/root", prefix),
+        "overlay",
+        0,
+        Some(&fs_options),
+    )
+    .with_context(|| format!("Failed to mount overlay at {}/overlay/root", prefix))?;
 
-        let res = upstream.recv().await.map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to read start confirmation from the isolated subprocess: {:?}",
-                e
-            ))
-        })?;
-        if res.is_none() {
-            let res = child.join().await.map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Isolated process didn't terminate gracefully: {:?}",
-                    e
-                ))
-            })?;
-            let err = res
-                .err()
-                .unwrap_or_else(|| errors::InvokerFailure("(no error reported)".to_string()));
-            return Err(errors::InvokerFailure(format!(
-                "Isolated process failed to start isolation: {:?}",
-                err
-            )));
-        }
+    // Mount /dev on overlay, rather than dynamic, because overlayfs doesn't support nested
+    // mounts. We'll have to restore this later upon reset.
+    std::fs::create_dir(format!("{}/overlay/root/dev", prefix))
+        .with_context(|| format!("Failed to create {}/overlay/root/dev", prefix))?;
+    system::bind_mount_opt(
+        "/tmp/dev",
+        format!("{}/overlay/root/dev", prefix),
+        system::MS_RDONLY,
+    )
+    .with_context(|| "Failed to mount /dev on .../overlay/root")?;
 
-        // Fill uid/gid maps and switch to
-        std::fs::write(
-            format!("/proc/{}/uid_map", child.id()),
-            format!("0 65534 1\n"),
-        )
-        .map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to create uid_map for the isolated subprocess: {:?}",
-                e
-            ))
-        })?;
+    Ok(RootFS {
+        removed: false,
+        id,
+        fs_options,
+        quotas,
+    })
+}
 
-        std::fs::write(format!("/proc/{}/setgroups", child.id()), "deny\n").map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to create setgroups for the isolated subprocess: {:?}",
-                e
-            ))
-        })?;
-
-        std::fs::write(
-            format!("/proc/{}/gid_map", child.id()),
-            format!("0 65534 1\n"),
-        )
-        .map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to create gid_map for the isolated subprocess: {:?}",
-                e
-            ))
-        })?;
-
-        let prefix = &format!("/tmp/worker/ns/{}", id);
-        std::fs::create_dir(prefix)
-            .map_err(|e| errors::InvokerFailure(format!("Failed to create {}: {:?}", prefix, e)))?;
-
-        (async move || {
-            for name in ["ipc", "user", "uts"] {
-                let path = format!("{}/{}", prefix, name);
-                std::fs::write(&path, "").map_err(|e| {
-                    errors::InvokerFailure(format!("Failed to create {}: {:?}", path, e))
-                })?;
-                system::bind_mount(&format!("/proc/{}/ns/{}", child.id(), name), &path).map_err(
-                    |e| {
-                        errors::InvokerFailure(format!(
-                            "Failed to bind-mount /proc/{}/ns/{} to {}: {:?}",
-                            child.id(),
-                            name,
-                            path,
-                            e
-                        ))
-                    },
-                )?;
-            }
-
-            upstream.send(&()).await.map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Failed to tell the isolated subprocess to terminate: {:?}",
-                    e
-                ))
-            })?;
-
-            child.join().await.map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Isolated process didn't terminate gracefully: {:?}",
-                    e
-                ))
-            })?
-        })()
-        .await
-        .map_err(|e| {
-            unmount_recursively(&prefix);
-            std::fs::remove_dir_all(&prefix);
+pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
+    let (mut upstream, downstream) = multiprocessing::tokio::duplex::<(), ()>().map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to create duplex connection to an isolated subprocess: {:?}",
             e
+        ))
+    })?;
+
+    let mut child = make_ns.spawn_tokio(downstream).await.map_err(|e| {
+        errors::InvokerFailure(format!("Failed to start an isolated subprocess: {:?}", e))
+    })?;
+
+    let res = upstream.recv().await.map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to read start confirmation from the isolated subprocess: {:?}",
+            e
+        ))
+    })?;
+    if res.is_none() {
+        let res = child.join().await.map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Isolated process didn't terminate gracefully: {:?}",
+                e
+            ))
+        })?;
+        let err = res
+            .err()
+            .unwrap_or_else(|| errors::InvokerFailure("(no error reported)".to_string()));
+        return Err(errors::InvokerFailure(format!(
+            "Isolated process failed to start isolation: {:?}",
+            err
+        )));
+    }
+
+    // Fill uid/gid maps and switch to
+    std::fs::write(
+        format!("/proc/{}/uid_map", child.id()),
+        format!("0 65534 1\n"),
+    )
+    .map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to create uid_map for the isolated subprocess: {:?}",
+            e
+        ))
+    })?;
+
+    std::fs::write(format!("/proc/{}/setgroups", child.id()), "deny\n").map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to create setgroups for the isolated subprocess: {:?}",
+            e
+        ))
+    })?;
+
+    std::fs::write(
+        format!("/proc/{}/gid_map", child.id()),
+        format!("0 65534 1\n"),
+    )
+    .map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to create gid_map for the isolated subprocess: {:?}",
+            e
+        ))
+    })?;
+
+    let prefix = &format!("/tmp/worker/ns/{}", id);
+    std::fs::create_dir(prefix)
+        .map_err(|e| errors::InvokerFailure(format!("Failed to create {}: {:?}", prefix, e)))?;
+
+    (async move || {
+        for name in ["ipc", "user", "uts"] {
+            let path = format!("{}/{}", prefix, name);
+            std::fs::write(&path, "").map_err(|e| {
+                errors::InvokerFailure(format!("Failed to create {}: {:?}", path, e))
+            })?;
+            system::bind_mount(&format!("/proc/{}/ns/{}", child.id(), name), &path).map_err(
+                |e| {
+                    errors::InvokerFailure(format!(
+                        "Failed to bind-mount /proc/{}/ns/{} to {}: {:?}",
+                        child.id(),
+                        name,
+                        path,
+                        e
+                    ))
+                },
+            )?;
+        }
+
+        upstream.send(&()).await.map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to tell the isolated subprocess to terminate: {:?}",
+                e
+            ))
         })?;
 
-        Ok(Namespace { removed: false, id })
-    }
+        child.join().await.map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Isolated process didn't terminate gracefully: {:?}",
+                e
+            ))
+        })?
+    })()
+    .await
+    .map_err(|e| {
+        if let Err(e) = unmount_recursively(&prefix) {
+            println!(
+                "Failed to unmount {} recursively after unsuccessful initialization: {:?}",
+                prefix, e
+            );
+        }
+        if let Err(e) = std::fs::remove_dir_all(&prefix) {
+            println!(
+                "Failed to rm -r {} after unsuccessful initialization: {:?}",
+                prefix, e
+            );
+        }
+        e
+    })?;
+
+    Ok(Namespace { removed: false, id })
 }
 
 impl RootFS {
-    pub fn reset(&mut self) -> Result<(), errors::Error> {
-        let overlay = format!("/tmp/worker/rootfs/{}/overlay", self.id);
+    pub fn reset(&self) -> Result<(), errors::Error> {
+        let overlay = format!("/tmp/worker/rootfs/{}/overlay/root", self.id);
 
         // Unmount old overlay
         unmount_recursively(&overlay)?;
@@ -310,17 +315,24 @@ impl RootFS {
             errors::InvokerFailure(format!("Failed to unmount {}: {:?}", overlay, e))
         })?;
 
-        // Recreate ephemeral
+        // Clean up ephemeral
         let ephemeral = format!("/tmp/worker/rootfs/{}/ephemeral", self.id);
-        std::fs::remove_dir_all(&ephemeral).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to delete {}: {:?}", ephemeral, e))
+        unmount_recursively(&ephemeral)?;
+        std::fs::remove_dir_all(format!("{}/upper", ephemeral)).map_err(|e| {
+            errors::InvokerFailure(format!("Failed to remove {}/upper: {:?}", ephemeral, e))
         })?;
-        std::fs::create_dir(&ephemeral).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to create {}: {:?}", ephemeral, e))
+        std::fs::remove_dir_all(format!("{}/work", ephemeral)).map_err(|e| {
+            errors::InvokerFailure(format!("Failed to remove {}/work: {:?}", ephemeral, e))
+        })?;
+        std::fs::create_dir(format!("{}/upper", ephemeral)).map_err(|e| {
+            errors::InvokerFailure(format!("Failed to create {}/upper: {:?}", ephemeral, e))
+        })?;
+        std::fs::create_dir(format!("{}/work", ephemeral)).map_err(|e| {
+            errors::InvokerFailure(format!("Failed to create {}/work: {:?}", ephemeral, e))
         })?;
 
         // Mount overlay
-        system::mount("overlay", &overlay, "overlay", 0, Some(&self.config)).map_err(|e| {
+        system::mount("overlay", &overlay, "overlay", 0, Some(&self.fs_options)).map_err(|e| {
             errors::InvokerFailure(format!("Failed to mount overlay at {}: {:?}", overlay, e))
         })?;
 
@@ -357,7 +369,32 @@ impl RootFS {
     }
 
     pub fn overlay(&self) -> String {
-        format!("/tmp/worker/rootfs/{}/overlay", self.id)
+        format!("/tmp/worker/rootfs/{}/overlay/root", self.id)
+    }
+
+    pub fn read(&self, path: &str) -> Result<Vec<u8>, errors::Error> {
+        let path = format!("{}/{}", self.overlay(), path);
+
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|e| errors::UserFailure(format!("Failed to stat {:?}: {:?}", path, e)))?;
+
+        if !metadata.is_file() {
+            return Err(errors::UserFailure(format!(
+                "{:?} is not a regular file",
+                path
+            )));
+        }
+
+        if metadata.size() > self.quotas.space {
+            return Err(errors::UserFailure(format!(
+                "Size of {:?} is more than the maximum size of the filesystem",
+                path
+            )));
+        }
+
+        std::fs::read(&path).map_err(|e| {
+            errors::UserFailure(format!("Failed to open {:?} for reading: {:?}", path, e))
+        })
     }
 
     pub fn remove(mut self) -> anyhow::Result<()> {
@@ -376,7 +413,7 @@ impl Namespace {
         let prefix = format!("/tmp/worker/ns/{}", self.id);
         unmount_recursively(&prefix)?;
         std::fs::remove_dir_all(&prefix).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to remove {} recursively", prefix))
+            errors::InvokerFailure(format!("Failed to remove {} recursively: {:?}", prefix, e))
         })?;
 
         Ok(())
@@ -401,8 +438,8 @@ impl Drop for Namespace {
 
 pub async fn run_isolated<T: Object + 'static>(
     f: Box<dyn multiprocessing::FnOnce<(), Output = Result<T, errors::Error>> + Send + Sync>,
-    rootfs: &mut RootFS,
-    ns: &mut Namespace,
+    rootfs: &RootFS,
+    ns: &Namespace,
 ) -> Result<T, errors::Error> {
     let mut child = isolated_entry
         .spawn_tokio(f, rootfs.id.clone(), ns.id.clone())
@@ -700,10 +737,29 @@ async fn isolated_entry<T: Object + 'static>(
         )));
     }
 
-    // The kernel marks .../overlay as MNT_LOCKED as a safety restriction due to the use of user
-    // namespaces. pivot_root requires the new root not to be MNT_LOCKED (the reason for which I
-    // don't quite understand), and the simplest way to fix that is to bind-mount .../overlay onto
-    // itself.
+    // Instead of pivot_root'ing directly into .../overlay/root, we pivot_root into .../overlay
+    // first and chroot into /root second. There are two reasons for this inefficiency:
+    //
+    // 1. We prefer pivot_root to chroot because that allows us to unmount the old root, which
+    // a) prevents various chroot exploits from working, because there's no old root to return to
+    // anyway, and b) enables slightly more efficient mount namespace management and avoids
+    // unnecessary locking.
+    //
+    // 2. The resulting environment must be chrooted, because that preventß unshare(CLONE_NEWUSER)
+    // from succeeding inside the namespace. This is, in fact, the only way to do this without
+    // spooky action at a distance, that I am aware of. This used to be an implementation detail of
+    // the Linux kernel, but should perhaps be considered more stable now. The necessity to disable
+    // user namespaces comes not from their intrinsic goal but from the fact that they enable all
+    // other namespaces to work without root, and while most of them are harmless (e.g. network and
+    // PID namespaces), others may be used to bypass quotas (not other security measures, though).
+    // One prominent example is mount namespace, which enables the user to mount a read-write tmpfs
+    // without disk limits and use it as unlimited temporary storage to exceed the memory limit.
+
+    // pivot_root requires the new root to be a mount, and for it not to be MNT_LOCKED (the reason
+    // for which I don't quite understand). The simplest way to do that is to bind-mount .../overlay
+    // onto itself. Note that if we pivot_root'ed into .../overlay/root, we'd need to bind-mount
+    // itself anyway because the kernel marks .../overlay/root as MNT_LOCKED as a safety restriction
+    // due to the use of user namespaces.
     let overlay = format!("/tmp/worker/rootfs/{}/overlay", rootfs_id);
 
     system::bind_mount_opt(&overlay, &overlay, system::MS_REC).map_err(|e| {
@@ -713,7 +769,7 @@ async fn isolated_entry<T: Object + 'static>(
         ))
     })?;
 
-    // Change root
+    // Change root to .../overlay
     std::env::set_current_dir(&overlay).map_err(|e| {
         errors::InvokerFailure(format!(
             "Failed to chdir to new root at {}: {:?}",
@@ -724,9 +780,12 @@ async fn isolated_entry<T: Object + 'static>(
         .map_err(|e| errors::InvokerFailure(format!("Failed to pivot_root: {:?}", e)))?;
     system::umount_opt(".", system::MNT_DETACH)
         .map_err(|e| errors::InvokerFailure(format!("Failed to unmount self: {:?}", e)))?;
-    std::env::set_current_dir("/").map_err(|e| {
-        errors::InvokerFailure(format!("Failed to chdir to new root at /: {:?}", e))
-    })?;
+
+    // Chroot into .../overlay/root
+    std::env::set_current_dir("/root")
+        .map_err(|e| errors::InvokerFailure(format!("Failed to chdir to /root: {:?}", e)))?;
+    nix::unistd::chroot(".")
+        .map_err(|e| errors::InvokerFailure(format!("Failed to chroot into /root: {:?}", e)))?;
 
     // Expose defaults for environment variables
     std::env::set_var(
@@ -748,17 +807,17 @@ async fn isolated_entry<T: Object + 'static>(
 
     // Use environment from the package
     let file = std::fs::File::open("/.sunwalker/env").map_err(|e| {
-        errors::InvokerFailure(format!(
+        errors::ConfigurationFailure(format!(
             "Failed to open /.sunwalker/env for reading: {:?}",
             e
         ))
     })?;
     for line in std::io::BufReader::new(file).lines() {
         let line = line.map_err(|e| {
-            errors::InvokerFailure(format!("Failed to read from /.sunwalker/env: {:?}", e))
+            errors::ConfigurationFailure(format!("Failed to read from /.sunwalker/env: {:?}", e))
         })?;
         let idx = line.find('=').ok_or_else(|| {
-            errors::InvokerFailure(format!(
+            errors::ConfigurationFailure(format!(
                 "'=' not found in a line of /.sunwalker/env: {}",
                 line
             ))
