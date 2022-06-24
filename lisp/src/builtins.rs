@@ -31,6 +31,15 @@ pub fn as_tuple3(call: CallTerm) -> Result<(Term, Term, Term), Error> {
     }
 }
 
+pub fn as_tuple4(call: CallTerm) -> Result<(Term, Term, Term, Term), Error> {
+    match call.params.into_iter().collect_tuple() {
+        Some(t) => Ok(t),
+        None => Err(Error {
+            message: format!("Exactly 4 arguments required"),
+        }),
+    }
+}
+
 #[function]
 fn list(call: CallTerm, state: &State) -> Result<TypedRef, Error> {
     let mut vec = Vec::new();
