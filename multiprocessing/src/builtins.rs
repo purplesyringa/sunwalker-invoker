@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, LinkedL
 use std::hash::{BuildHasher, Hash};
 use std::os::raw::c_void;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::io::{AsRawFd, IntoRawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -635,6 +635,27 @@ impl<'a, T: 'a + Deserialize, E: 'a + Deserialize> DeserializeBoxed<'a> for Resu
     }
 }
 
+impl Serialize for OwnedFd {
+    fn serialize_self(&self, s: &mut Serializer) {
+        let fd = s.add_fd(self.as_raw_fd());
+        s.serialize(&fd)
+    }
+}
+impl Deserialize for OwnedFd {
+    fn deserialize_self(d: &mut Deserializer) -> Self {
+        let fd = d.deserialize();
+        d.drain_fd(fd)
+    }
+}
+impl<'a> DeserializeBoxed<'a> for OwnedFd {
+    unsafe fn deserialize_on_heap(
+        &self,
+        d: &mut Deserializer,
+    ) -> Box<dyn DeserializeBoxed<'a> + 'a> {
+        Box::new(Self::deserialize_self(d))
+    }
+}
+
 impl Serialize for std::fs::File {
     fn serialize_self(&self, s: &mut Serializer) {
         let fd = s.add_fd(self.as_raw_fd());
@@ -643,8 +664,8 @@ impl Serialize for std::fs::File {
 }
 impl Deserialize for std::fs::File {
     fn deserialize_self(d: &mut Deserializer) -> Self {
-        let fd = d.deserialize();
-        <Self as From<std::os::unix::io::OwnedFd>>::from(d.drain_fd(fd))
+        let fd: OwnedFd = d.deserialize();
+        Self::from(fd)
     }
 }
 impl<'a> DeserializeBoxed<'a> for std::fs::File {
@@ -713,6 +734,28 @@ impl Deserialize for tokio_seqpacket::UnixSeqpacket {
     }
 }
 impl<'a> DeserializeBoxed<'a> for tokio_seqpacket::UnixSeqpacket {
+    unsafe fn deserialize_on_heap(
+        &self,
+        d: &mut Deserializer,
+    ) -> Box<dyn DeserializeBoxed<'a> + 'a> {
+        Box::new(Self::deserialize_self(d))
+    }
+}
+
+impl Serialize for std::time::Duration {
+    fn serialize_self(&self, s: &mut Serializer) {
+        s.serialize(&self.as_secs());
+        s.serialize(&self.subsec_nanos());
+    }
+}
+impl Deserialize for std::time::Duration {
+    fn deserialize_self(d: &mut Deserializer) -> Self {
+        let secs: u64 = d.deserialize();
+        let nanos: u32 = d.deserialize();
+        Self::new(secs, nanos)
+    }
+}
+impl<'a> DeserializeBoxed<'a> for std::time::Duration {
     unsafe fn deserialize_on_heap(
         &self,
         d: &mut Deserializer,
