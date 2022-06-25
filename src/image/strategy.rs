@@ -488,19 +488,6 @@ impl Strategy {
 
 impl<'a> StrategyRun<'a> {
     async fn invoke(mut self) -> Result<verdict::TestJudgementResult, errors::Error> {
-        // Clean up
-        for (block, program) in std::iter::zip(
-            self.strategy.blocks.iter(),
-            self.strategy.invocable_programs.iter(),
-        ) {
-            program.rootfs.reset().map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Failed to reset rootfs for {}: {:?}",
-                    block.command, e
-                ))
-            })?;
-        }
-
         // Create files on filesystem and in memory
         let mut pipes: HashMap<String, (OwnedFd, OwnedFd)> = HashMap::new();
         for (name, file_type) in self.strategy.files.iter() {
