@@ -4,11 +4,14 @@ use crate::{
     problem::{problem, verdict},
     submission,
 };
-use futures::future::{AbortHandle, Abortable};
+use futures::{
+    future::{AbortHandle, Abortable},
+    StreamExt,
+};
 use multiprocessing::tokio::{channel, Child, Receiver, Sender};
 use multiprocessing::Object;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 #[derive(Object)]
 enum I2WUrgentCommand {
@@ -80,18 +83,8 @@ impl Worker {
     pub async fn execute_command(
         &self,
         command: submission::Command,
-    ) -> Result<W2IMessage, errors::Error> {
-        // The order is:
-        // 1. Lock tx
-        // 2. Send command
-        // 3. Start locking rx
-        // 4. Release tx
-        // 5. Lock rx
-        // 6. Receive reply
-        // 7. Release rx
-        // This way no two messages are sent or received at the same time, and the order in which
-        // tasks receive replies is the same that commands were sent in, because tokio's Mutex is
-        // FIFO.
+        n_messages: usize,
+    ) -> Result<impl futures::stream::Stream<Item = W2IMessage>, errors::Error> {
         let tx_i2w_command = self
             .tx_i2w_command
             .as_ref()
@@ -101,31 +94,56 @@ impl Worker {
                 )
             })?
             .clone();
+
         let rx_w2i = self.rx_w2i.clone();
+
+        let (tx, rx) = mpsc::unbounded_channel();
+
         // After we send the value to tx, the coroutine is no longer abortable
         tokio::spawn(async move {
-            let mut tx_i2w_command = tx_i2w_command.lock().await;
-            tx_i2w_command.send(&command).await.map_err(|e| {
-                errors::InvokerFailure(format!("Failed to send command to the worker: {:?}", e))
-            })?;
-            let rx_w2i = rx_w2i.lock(); // TODO: does this actually start locking?
-            drop(tx_i2w_command);
-            let mut rx_w2i = rx_w2i.await;
-            rx_w2i
-                .recv()
-                .await
-                .map_err(|e| {
-                    errors::InvokerFailure(format!(
-                        "Failed to receive response to {:?} from the worker: {:?}",
-                        command, e
-                    ))
-                })?
-                .ok_or_else(|| {
-                    errors::InvokerFailure(format!("No response to {:?} from the worker", command))
-                })
-        })
-        .await
-        .map_err(|e| errors::InvokerFailure(format!("Panic in tokio task: {:?}", e)))?
+            let res: Result<(), errors::Error> = try {
+                let mut rx_w2i = rx_w2i.lock().await;
+
+                tx_i2w_command
+                    .lock()
+                    .await
+                    .send(&command)
+                    .await
+                    .map_err(|e| {
+                        errors::InvokerFailure(format!(
+                            "Failed to send command to the worker: {:?}",
+                            e
+                        ))
+                    })?;
+
+                for _ in 0..n_messages {
+                    let msg = rx_w2i
+                        .recv()
+                        .await
+                        .map_err(|e| {
+                            errors::InvokerFailure(format!(
+                                "Failed to receive response to {:?} from the worker: {:?}",
+                                command, e
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            errors::InvokerFailure(format!(
+                                "No response to {:?} from the worker",
+                                command
+                            ))
+                        })?;
+                    if let Err(e) = tx.send(msg) {
+                        println!("Response to a command is ignored: {:?}", e);
+                    }
+                }
+            };
+
+            if let Err(e) = res {
+                println!("Error while executing a worker command: {:?}", e);
+            }
+        });
+
+        Ok(tokio_stream::wrappers::UnboundedReceiverStream::new(rx))
     }
 
     pub async fn add_failed_tests(&self, tests: Vec<u64>) -> Result<(), errors::Error> {
@@ -149,10 +167,14 @@ impl Worker {
     pub async fn finalize(&mut self) -> Result<(), errors::Error> {
         self.tx_i2w_command = None;
         self.tx_i2w_urgent = None;
-        let response = self.execute_command(submission::Command::Finalize).await?;
+        let response = self
+            .execute_command(submission::Command::Finalize, 1)
+            .await?
+            .next()
+            .await;
         match response {
-            W2IMessage::Finalized => Ok(()),
-            W2IMessage::Failure(e) => Err(e),
+            Some(W2IMessage::Finalized) => Ok(()),
+            Some(W2IMessage::Failure(e)) => Err(e),
             _ => Err(errors::InvokerFailure(format!(
                 "Unexpected response to finalization request: {:?}",
                 response
@@ -162,7 +184,7 @@ impl Worker {
 }
 
 struct Subprocess {
-    current_command: Mutex<Option<(submission::Command, AbortHandle)>>,
+    current_test: Mutex<Option<(u64, AbortHandle)>>,
     language: language::Language,
     source_files: Vec<String>,
     instantiated_dependency_dag: RwLock<problem::InstantiatedDependencyDAG>,
@@ -205,7 +227,7 @@ pub async fn subprocess_main(
         };
 
         let subprocess = Arc::new(Subprocess {
-            current_command: Mutex::new(None),
+            current_test: Mutex::new(None),
             language,
             source_files,
             instantiated_dependency_dag: RwLock::new(instantiated_dependency_dag),
@@ -268,71 +290,99 @@ impl Subprocess {
         command: submission::Command,
         main: &mut SubprocessMain,
     ) -> Result<(), errors::Error> {
-        let (handle, reg) = AbortHandle::new_pair();
-        *self.current_command.lock().await = Some((command.clone(), handle));
-        let ret = Abortable::new(self._handle_core_command(command, main), reg).await;
-        *self.current_command.lock().await = None;
-        let message = ret
-            .unwrap_or(Ok(W2IMessage::Aborted))
-            .unwrap_or_else(|e| W2IMessage::Failure(e));
-        if let W2IMessage::Finalized = message {
-            Ok(())
-        } else {
-            main.tx_w2i.send(&message).await.map_err(|e| {
-                errors::InvokerFailure(format!("Failed to send command result to invoker: {:?}", e))
-            })
-        }
-    }
-
-    async fn _handle_core_command(
-        &self,
-        command: submission::Command,
-        main: &mut SubprocessMain,
-    ) -> Result<W2IMessage, errors::Error> {
         match command {
             submission::Command::Compile(build_id) => {
-                let (program, log) = self
-                    .language
-                    .build(
-                        self.source_files.iter().map(|s| s.as_ref()).collect(),
-                        build_id,
-                    )
-                    .await?;
-                main.strategy = Some(main.strategy_factory.make(&program).await?);
-                Ok(W2IMessage::CompilationResult(program, log))
+                let res: Result<W2IMessage, errors::Error> = try {
+                    let (program, log) = self
+                        .language
+                        .build(
+                            self.source_files.iter().map(|s| s.as_ref()).collect(),
+                            build_id,
+                        )
+                        .await?;
+                    main.strategy = Some(main.strategy_factory.make(&program).await?);
+                    W2IMessage::CompilationResult(program, log)
+                };
+                let res = res.unwrap_or_else(|e| W2IMessage::Failure(e));
+                main.tx_w2i.send(&res).await.map_err(|e| {
+                    errors::InvokerFailure(format!(
+                        "Failed to send command result to invoker: {:?}",
+                        e
+                    ))
+                })
             }
 
-            submission::Command::Test(test) => {
-                if !self
-                    .instantiated_dependency_dag
-                    .read()
-                    .await
-                    .is_test_enabled(test)
-                {
-                    return Ok(W2IMessage::Aborted);
+            submission::Command::Test(tests) => {
+                for test in tests {
+                    if !self
+                        .instantiated_dependency_dag
+                        .read()
+                        .await
+                        .is_test_enabled(test)
+                    {
+                        main.tx_w2i.send(&W2IMessage::Aborted).await.map_err(|e| {
+                            errors::InvokerFailure(format!(
+                                "Failed to send command result to invoker: {:?}",
+                                e
+                            ))
+                        })?;
+                        continue;
+                    }
+
+                    let strategy = main.strategy.as_mut().ok_or_else(|| {
+                        errors::InvokerFailure(
+                            "Attempted to judge a program on a core before the core acquired a \
+                             reference to the built program"
+                                .to_string(),
+                        )
+                    })?;
+
+                    let (handle, reg) = AbortHandle::new_pair();
+                    *self.current_test.lock().await = Some((test, handle));
+
+                    let result = Abortable::new(
+                        async {
+                            match strategy
+                                .invoke(
+                                    "run".to_string(),
+                                    main.strategy_factory
+                                        .root
+                                        .join("tests")
+                                        .join(test.to_string()),
+                                )
+                                .await
+                            {
+                                Ok(result) => W2IMessage::TestResult(result),
+                                Err(e) => W2IMessage::Failure(e),
+                            }
+                        },
+                        reg,
+                    )
+                    .await;
+
+                    *self.current_test.lock().await = None;
+
+                    let message = result.unwrap_or(W2IMessage::Aborted);
+
+                    main.tx_w2i.send(&message).await.map_err(|e| {
+                        errors::InvokerFailure(format!(
+                            "Failed to send command result to invoker: {:?}",
+                            e
+                        ))
+                    })?;
                 }
 
-                let strategy = main.strategy.as_mut().ok_or_else(|| {
-                    errors::InvokerFailure(
-                        "Attempted to judge a program on a core before the core acquired a \
-                         reference to the built program"
-                            .to_string(),
-                    )
-                })?;
-
-                let result = strategy
-                    .invoke(
-                        "run".to_string(),
-                        main.strategy_factory
-                            .root
-                            .join("tests")
-                            .join(test.to_string()),
-                    )
-                    .await?;
-                Ok(W2IMessage::TestResult(result))
+                Ok(())
             }
 
-            submission::Command::Finalize => Ok(W2IMessage::Finalized),
+            submission::Command::Finalize => {
+                main.tx_w2i.send(&W2IMessage::Finalized).await.map_err(|e| {
+                    errors::InvokerFailure(format!(
+                        "Failed to send command result to invoker: {:?}",
+                        e
+                    ))
+                })
+            }
         }
     }
 
@@ -343,8 +393,8 @@ impl Subprocess {
                 for test in tests.into_iter() {
                     dag.fail_test(test);
                 }
-                let current_command = self.current_command.lock().await;
-                if let Some((submission::Command::Test(test), ref handle)) = *current_command {
+                let current_test = self.current_test.lock().await;
+                if let Some((test, ref handle)) = *current_test {
                     if !dag.is_test_enabled(test) {
                         handle.abort();
                     }

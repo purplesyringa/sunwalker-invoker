@@ -1378,6 +1378,7 @@ dependencies = [
  "tokio",
  "tokio-fd",
  "tokio-fork",
+ "tokio-stream",
  "tokio-tungstenite",
  "toml",
  "tungstenite",
@@ -1541,6 +1542,17 @@ checksum = "9c6c35a3e32adef32541a7491eaabccdb8e0a7ea10c3ad9814f9ab8f1c9174da"
 dependencies = [
  "filedesc",
  "libc",
+ "tokio",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df54d54117d6fdc4e4fea40fe1e4e566b3505700e148a6827e59b34b0d2600d9"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
  "tokio",
 ]
 

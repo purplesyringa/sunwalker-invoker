@@ -1,4 +1,4 @@
-#![feature(async_closure, map_try_insert, unix_chown, io_safety)]
+#![feature(async_closure, map_try_insert, unix_chown, io_safety, try_blocks)]
 
 mod image {
     pub(crate) mod config;

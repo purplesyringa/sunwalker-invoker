@@ -1,6 +1,6 @@
 use crate::{cgroups, config, errors, image, init, message, problem, submission, system};
 use anyhow::Context;
-use futures_util::stream::{SplitSink, SplitStream};
+use futures::stream::{SplitSink, SplitStream};
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use libc::CLONE_NEWNS;
@@ -442,32 +442,22 @@ async fn push_to_judgment_queue(
 ) -> Result<(), errors::Error> {
     let submissions = client.submissions.read().await;
 
-    let submission = submissions.get(&message.submission_id).ok_or_else(|| {
-        errors::ConductorFailure(format!(
-            "Submission {} does not exist or has already been finalized",
-            message.submission_id
-        ))
-    })?;
+    let submission = submissions
+        .get(&message.submission_id)
+        .ok_or_else(|| {
+            errors::ConductorFailure(format!(
+                "Submission {} does not exist or has already been finalized",
+                message.submission_id
+            ))
+        })?
+        .clone();
 
-    for test in message.tests {
-        let submission = submission.clone();
-        let communicator = client.communicator.clone();
-        tokio::spawn(async move {
-            let judgement_result = submission
-                .test_on_core(message.core, test)
-                .await
-                .unwrap_or_else(|e| problem::verdict::TestJudgementResult {
-                    verdict: problem::verdict::TestVerdict::Bug(format!(
-                        "Failed to schedule evaluation: {:?}",
-                        e
-                    )),
-                    logs: HashMap::new(),
-                    real_time: std::time::Duration::ZERO,
-                    user_time: std::time::Duration::ZERO,
-                    sys_time: std::time::Duration::ZERO,
-                    memory_used: 0,
-                });
+    let communicator = client.communicator.clone();
 
+    tokio::spawn(async move {
+        let mut stream = submission.test_on_core(message.core, message.tests).await?;
+
+        while let Some((test, judgement_result)) = stream.next().await {
             if let Err(e) = communicator
                 .send_to_conductor(message::i2c::Message::NotifyTestStatus(
                     message::i2c::NotifyTestStatus {
@@ -480,8 +470,10 @@ async fn push_to_judgment_queue(
             {
                 println!("Failed to send to conductor: {:?}", e);
             }
-        });
-    }
+        }
+
+        Ok(()) as Result<(), errors::Error>
+    });
 
     Ok(())
 }

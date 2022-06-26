@@ -36,6 +36,7 @@ multiprocessing = { path = "multiprocessing" }
 rtnetlink = "0.9.1"
 ipnetwork = "0.19"
 itertools = "0.10.3"
+tokio-stream = "0.1.9"
 
 [profile.release]
 debug = true

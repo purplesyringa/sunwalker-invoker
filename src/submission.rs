@@ -4,6 +4,7 @@ use crate::{
     problem::{problem, verdict},
     worker,
 };
+use futures::stream::StreamExt;
 use itertools::Itertools;
 use multiprocessing::Object;
 use std::collections::HashMap;
@@ -13,7 +14,7 @@ use tokio::sync::RwLock;
 #[derive(Clone, Debug, Object)]
 pub enum Command {
     Compile(String),
-    Test(u64),
+    Test(Vec<u64>),
     Finalize,
 }
 
@@ -70,7 +71,8 @@ impl Submission {
         &self,
         core: u64,
         command: Command,
-    ) -> Result<worker::W2IMessage, errors::Error> {
+        n_messages: usize,
+    ) -> Result<impl futures::stream::Stream<Item = worker::W2IMessage>, errors::Error> {
         use std::collections::hash_map::Entry;
 
         let mut workers = self.workers.write().await;
@@ -94,7 +96,7 @@ impl Submission {
         drop(workers);
 
         let worker = worker.read().await;
-        worker.execute_command(command).await
+        worker.execute_command(command, n_messages).await
     }
 
     pub async fn compile_on_core(&self, core: u64) -> Result<String, errors::Error> {
@@ -105,14 +107,16 @@ impl Submission {
         }
 
         let response = self
-            .execute_on_core(core, Command::Compile(format!("judge-{}", self.id)))
-            .await?;
+            .execute_on_core(core, Command::Compile(format!("judge-{}", self.id)), 1)
+            .await?
+            .next()
+            .await;
         match response {
-            worker::W2IMessage::CompilationResult(program, log) => {
+            Some(worker::W2IMessage::CompilationResult(program, log)) => {
                 *self.program.write().await = Some(program);
                 Ok(log)
             }
-            worker::W2IMessage::Failure(e) => Err(e),
+            Some(worker::W2IMessage::Failure(e)) => Err(e),
             _ => Err(errors::InvokerFailure(format!(
                 "Unexpected response to compilation request: {:?}",
                 response
@@ -123,23 +127,49 @@ impl Submission {
     pub async fn test_on_core(
         &self,
         core: u64,
-        test: u64,
-    ) -> Result<verdict::TestJudgementResult, errors::Error> {
+        tests: Vec<u64>,
+    ) -> Result<
+        impl futures::stream::Stream<Item = (u64, verdict::TestJudgementResult)>,
+        errors::Error,
+    > {
         if self.program.read().await.is_none() {
             return Err(errors::ConductorFailure(
                 "Cannot judge submission before the program is built".to_string(),
             ));
         }
 
-        let response = self.execute_on_core(core, Command::Test(test)).await?;
-        match response {
-            worker::W2IMessage::TestResult(result) => Ok(result),
-            worker::W2IMessage::Failure(e) => Err(e),
-            _ => Err(errors::InvokerFailure(format!(
-                "Unexpected response to judgement request: {:?}",
-                response
-            ))),
-        }
+        let mut i = 0usize;
+
+        Ok(self
+            .execute_on_core(core, Command::Test(tests.clone()), tests.len())
+            .await?
+            .map(move |judgement_result| {
+                let test = tests[i];
+                i += 1;
+
+                let judgement_result = match judgement_result {
+                    worker::W2IMessage::TestResult(result) => Ok(result),
+                    worker::W2IMessage::Failure(e) => Err(e),
+                    _ => Err(errors::InvokerFailure(format!(
+                        "Unexpected response to judgement request: {:?}",
+                        judgement_result
+                    ))),
+                };
+                (
+                    test,
+                    judgement_result.unwrap_or_else(|e| verdict::TestJudgementResult {
+                        verdict: verdict::TestVerdict::Bug(format!(
+                            "Failed to evaluate test: {:?}",
+                            e
+                        )),
+                        logs: HashMap::new(),
+                        real_time: std::time::Duration::ZERO,
+                        user_time: std::time::Duration::ZERO,
+                        sys_time: std::time::Duration::ZERO,
+                        memory_used: 0,
+                    }),
+                )
+            }))
     }
 
     pub async fn add_failed_tests(&self, tests: &[u64]) -> Result<(), errors::Error> {
