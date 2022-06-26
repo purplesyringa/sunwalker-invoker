@@ -23,7 +23,7 @@ pub struct Submission {
     language: language::Language,
     source_files: Vec<String>,
     program: RwLock<Option<program::Program>>,
-    workers: RwLock<HashMap<u64, worker::Worker>>,
+    workers: RwLock<HashMap<u64, Arc<RwLock<worker::Worker>>>>,
     problem_revision: Arc<problem::ProblemRevision>,
 }
 
@@ -71,14 +71,13 @@ impl Submission {
         core: u64,
         command: Command,
     ) -> Result<worker::W2IMessage, errors::Error> {
-        let mut workers = self.workers.write().await;
-
         use std::collections::hash_map::Entry;
 
-        match workers.entry(core) {
-            Entry::Occupied(occupied) => occupied.get().execute_command(command).await,
-            Entry::Vacant(vacant) => {
-                let worker = vacant.insert(
+        let mut workers = self.workers.write().await;
+        let worker = match workers.entry(core) {
+            Entry::Occupied(occupied) => occupied.get().clone(),
+            Entry::Vacant(vacant) => vacant
+                .insert(Arc::new(RwLock::new(
                     worker::Worker::new(
                         self.language.clone(),
                         self.source_files.clone(),
@@ -89,10 +88,13 @@ impl Submission {
                         self.problem_revision.data.clone(),
                     )
                     .await?,
-                );
-                worker.execute_command(command).await
-            }
-        }
+                )))
+                .clone(),
+        };
+        drop(workers);
+
+        let worker = worker.read().await;
+        worker.execute_command(command).await
     }
 
     pub async fn compile_on_core(&self, core: u64) -> Result<String, errors::Error> {
@@ -148,7 +150,11 @@ impl Submission {
             }
         }
         for (_, worker) in self.workers.read().await.iter() {
-            worker.add_failed_tests(Vec::from(tests)).await?;
+            worker
+                .read()
+                .await
+                .add_failed_tests(Vec::from(tests))
+                .await?;
         }
         Ok(())
     }
@@ -159,12 +165,15 @@ impl Submission {
         }
         let mut workers = self.workers.write().await;
 
-        let mut errors =
-            futures::future::join_all(workers.iter_mut().map(|(_, worker)| worker.finalize()))
-                .await
-                .into_iter()
-                .filter_map(|res| res.err())
-                .peekable();
+        let mut errors = futures::future::join_all(
+            workers
+                .iter_mut()
+                .map(async move |(_, worker)| worker.write().await.finalize().await),
+        )
+        .await
+        .into_iter()
+        .filter_map(|res| res.err())
+        .peekable();
 
         if errors.peek().is_none() {
             Ok(())
