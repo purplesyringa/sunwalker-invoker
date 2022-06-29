@@ -1,4 +1,5 @@
 use crate::{imp, Deserialize, Deserializer, Object, Serialize, Serializer};
+use nix::libc::{AF_UNIX, SOCK_CLOEXEC, SOCK_SEQPACKET};
 use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Read, Result, Write};
 use std::marker::PhantomData;
 use std::os::unix::{
@@ -25,8 +26,15 @@ pub struct Duplex<S: Serialize, R: Deserialize> {
 }
 
 pub fn channel<T: Serialize + Deserialize>() -> Result<(Sender<T>, Receiver<T>)> {
-    let (tx, rx) = UnixStream::pair()?;
-    Ok((Sender::from_unix_stream(tx), Receiver::from_unix_stream(rx)))
+    // UnixStream creates a SOCK_STREAM by default, while we need SOCK_SEQPACKET
+    unsafe {
+        let mut fds = [0, 0];
+        if nix::libc::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, fds.as_mut_ptr()) == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok((Sender::from_raw_fd(fds[0]), Receiver::from_raw_fd(fds[1])))
+    }
 }
 
 pub fn duplex<A: Serialize + Deserialize, B: Serialize + Deserialize>(
