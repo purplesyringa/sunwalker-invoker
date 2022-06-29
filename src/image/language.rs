@@ -156,9 +156,9 @@ impl LanguageImpl {
         })?;
         let ns = sandbox::make_namespace("build".to_string()).await?;
 
-        // Add /artifacts -> /tmp/artifacts/{build_id}
+        // Add /space/artifacts -> /tmp/artifacts/{build_id}
         let artifacts_path = PathBuf::from(format!("/tmp/artifacts/{}", build_id));
-        let overlay_artifacts_path = format!("{}/artifacts", rootfs.overlay());
+        let overlay_artifacts_path = format!("{}/space/artifacts", rootfs.overlay());
         std::fs::create_dir(&artifacts_path).map_err(|e| {
             errors::InvokerFailure(format!("Failed to create {:?}: {:?}", artifacts_path, e))
         })?;
@@ -471,7 +471,7 @@ fn build(
     // from its original source.
     for rel_path in run_prerequisites.into_iter() {
         let from = Path::new("/space").join(&rel_path);
-        let to = Path::new("/artifacts").join(&rel_path);
+        let to = Path::new("/space/artifacts").join(&rel_path);
         std::fs::copy(&from, &to).map_err(|e| {
             errors::InvokerFailure(format!(
                 "Failed to copy artifact {} from {:?} to {:?}: {:?}",

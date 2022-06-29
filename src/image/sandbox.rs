@@ -20,7 +20,7 @@ pub struct DiskQuotas {
 pub struct RootFS {
     removed: bool,
     pub id: String,
-    fs_options: String,
+    bound_files: Vec<(PathBuf, String)>,
     quotas: DiskQuotas,
 }
 
@@ -99,61 +99,54 @@ pub fn make_rootfs(
     quotas: DiskQuotas,
     id: String,
 ) -> anyhow::Result<RootFS> {
+    // There are two (obvious) ways to mount an image in a writable way.
+    //
+    // First, we can mount a tmpfs that would store the ephemeral data, and then mount an overlayfs
+    // that uses the image as the lowerdir and the ephemeral tmpfs as the upperdir (and the workdir
+    // too).
+    //
+    // Second, we can mount a tmpfs on top of every directory that needs to be writable.
+    //
+    // The former way is, perhaps, more universal, but it has a slight defect in terms of
+    // efficiency. Keep in mind that we have to somehow reset this structure every time we judge the
+    // submission on a new test. Unfortunately, it's not as simple as cleaning the upperdir, due to
+    // some caching shenanigans. Instead, we would have to somehow guess as to which files are from
+    // the image and which are ephemeral and remove the latter explicitly. This is error-prone. To
+    // add insult to injury, even this sort of clean-up may lead to information leak, because in
+    // newer Linux kernels inodes are assigned consecutively, and removing a file does not free up
+    // its inode number.
+    //
+    // The latter way, on the other hand, amounts to mounting an overlayfs with two lowerdirs--one
+    // right from the image and one that contains two empty directories, /space and /dev. We would
+    // then mount tmpfs on top of /space and /dev. To reset the rootfs, we would simply remount
+    // /space. There would, of course, be some problems regarding dynamic content, which will have
+    // to be remounted every time because it's located in /space too. Also, while using an overlayfs
+    // to add a single directory to the tree seems suboptimal, it's perhaps fine, especially if
+    // /space and /dev are in the *second* lowerdir, so that the tmpfs doesn't have to handle all
+    // the accesses to the permanent files just to return ENOENT.
+
     let prefix = format!("/tmp/worker/rootfs/{}", id);
 
     std::fs::create_dir(&prefix)?;
-    std::fs::create_dir(format!("{}/dynamic", prefix))?;
     std::fs::create_dir(format!("{}/ephemeral", prefix))?;
     std::fs::create_dir(format!("{}/overlay", prefix))?;
     std::fs::create_dir(format!("{}/overlay/root", prefix))?;
 
-    // Mount tmpfs on ephemeral to implement disk quotas
-    system::mount(
-        "none",
-        format!("{}/ephemeral", prefix),
-        "tmpfs",
-        system::MS_NOSUID,
-        Some(format!("size={},nr_inodes={}", quotas.space, quotas.max_inodes).as_ref()),
-    )
-    .with_context(|| format!("Mounting tmpfs on {}/ephemeral failed", prefix))?;
-
-    std::fs::create_dir(format!("{}/ephemeral/upper", prefix))?;
-    std::fs::create_dir(format!("{}/ephemeral/work", prefix))?;
-
-    // Initialize user directory.
-    // Do not use bind mount here because overlayfs doesn't support nested mounts in lowerdir
-    std::fs::create_dir(format!("{}/dynamic/space", prefix))
-        .with_context(|| format!("Failed to create {}/dynamic/space", prefix))?;
-    for (from, to) in bound_files.into_iter() {
-        let to = format!("{}/dynamic{}", prefix, to);
-
-        let data = std::fs::read(&from).with_context(|| format!("Failed to read {:?}", from))?;
-        std::fs::write(&to, data).with_context(|| format!("Failed to write to {}", to))?;
-
-        let meta = std::fs::metadata(&from)
-            .with_context(|| format!("Failed to get metadata of {:?}", from))?;
-        std::fs::set_permissions(&to, meta.permissions())
-            .with_context(|| format!("Failed to set permissions of {}", to))?;
-    }
-
-    // Allow the sandbox user to write to /space
-    std::os::unix::fs::chown(
-        format!("{}/dynamic/space", prefix),
-        Some(65534),
-        Some(65534),
-    )?;
+    // Create a lowerdir for /space and /dev
+    system::mount("none", format!("{}/ephemeral", prefix), "tmpfs", 0, None)
+        .with_context(|| format!("Mounting tmpfs on {}/ephemeral failed", prefix))?;
+    std::fs::create_dir(format!("{}/ephemeral/space", prefix))?;
+    std::fs::create_dir(format!("{}/ephemeral/dev", prefix))?;
 
     // Mount overlay
     let fs_options = format!(
-        "lowerdir={}/{}:{}/dynamic,upperdir={}/ephemeral/upper,workdir={}/ephemeral/work",
+        "lowerdir={}/{}:{}/ephemeral",
         package
             .image
             .mountpoint
             .to_str()
             .with_context(|| "Mountpoint must be a string")?,
         package.name,
-        prefix,
-        prefix,
         prefix,
     );
     system::mount(
@@ -165,10 +158,7 @@ pub fn make_rootfs(
     )
     .with_context(|| format!("Failed to mount overlay at {}/overlay/root", prefix))?;
 
-    // Mount /dev on overlay, rather than dynamic, because overlayfs doesn't support nested
-    // mounts. We'll have to restore this later upon reset.
-    std::fs::create_dir(format!("{}/overlay/root/dev", prefix))
-        .with_context(|| format!("Failed to create {}/overlay/root/dev", prefix))?;
+    // Mount /dev on overlay
     system::bind_mount_opt(
         "/tmp/dev",
         format!("{}/overlay/root/dev", prefix),
@@ -176,10 +166,36 @@ pub fn make_rootfs(
     )
     .with_context(|| "Failed to mount /dev on .../overlay/root")?;
 
+    // Make /space a tmpfs with the necessary disk quotas
+    system::mount(
+        "none",
+        format!("{}/overlay/root/space", prefix),
+        "tmpfs",
+        system::MS_NOSUID,
+        Some(format!("size={},nr_inodes={}", quotas.space, quotas.max_inodes).as_ref()),
+    )
+    .with_context(|| format!("Mounting tmpfs on {}/overlay/root/space failed", prefix))?;
+
+    // Allow the sandbox user to write to /space
+    std::os::unix::fs::chown(
+        format!("{}/overlay/root/space", prefix),
+        Some(65534),
+        Some(65534),
+    )?;
+
+    // Initialize user directory.
+    for (from, to) in bound_files.iter() {
+        let to = format!("{}/overlay/root{}", prefix, to);
+
+        std::fs::write(&to, "").with_context(|| format!("Failed to create to {}", to))?;
+        system::bind_mount_opt(from, &to, system::MS_RDONLY)
+            .with_context(|| format!("Failed to bind-mount {:?} to {}", from, to))?;
+    }
+
     Ok(RootFS {
         removed: false,
         id,
-        fs_options,
+        bound_files,
         quotas,
     })
 }
@@ -307,42 +323,47 @@ pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
 
 impl RootFS {
     pub fn reset(&self) -> Result<(), errors::Error> {
-        let overlay = format!("/tmp/worker/rootfs/{}/overlay/root", self.id);
+        let space = format!("{}/space", self.overlay());
 
-        // Unmount old overlay
-        unmount_recursively(&overlay)?;
-        system::umount(&overlay).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to unmount {}: {:?}", overlay, e))
-        })?;
+        // Unmount everything under /space
+        unmount_recursively(&space)?;
 
-        // Clean up ephemeral
-        let ephemeral = format!("/tmp/worker/rootfs/{}/ephemeral", self.id);
-        unmount_recursively(&ephemeral)?;
-        std::fs::remove_dir_all(format!("{}/upper", ephemeral)).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to remove {}/upper: {:?}", ephemeral, e))
-        })?;
-        std::fs::remove_dir_all(format!("{}/work", ephemeral)).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to remove {}/work: {:?}", ephemeral, e))
-        })?;
-        std::fs::create_dir(format!("{}/upper", ephemeral)).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to create {}/upper: {:?}", ephemeral, e))
-        })?;
-        std::fs::create_dir(format!("{}/work", ephemeral)).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to create {}/work: {:?}", ephemeral, e))
-        })?;
+        // Remount /space
+        system::umount(&space)
+            .map_err(|e| errors::InvokerFailure(format!("Failed to unmount {}: {:?}", space, e)))?;
 
-        // Mount overlay
-        system::mount("overlay", &overlay, "overlay", 0, Some(&self.fs_options)).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to mount overlay at {}: {:?}", overlay, e))
+        system::mount(
+            "none",
+            &space,
+            "tmpfs",
+            system::MS_NOSUID,
+            Some(
+                format!(
+                    "size={},nr_inodes={}",
+                    self.quotas.space, self.quotas.max_inodes
+                )
+                .as_ref(),
+            ),
+        )
+        .map_err(|e| {
+            errors::InvokerFailure(format!("Mounting tmpfs on {} failed: {:?}", space, e))
         })?;
 
-        // Remount /dev
-        std::fs::create_dir(format!("{}/dev", overlay)).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to create {}/dev: {:?}", overlay, e))
-        })?;
-        system::bind_mount_opt("/tmp/dev", format!("{}/dev", overlay), system::MS_RDONLY).map_err(
-            |e| errors::InvokerFailure(format!("Failed to mount {}/dev: {:?}", overlay, e)),
-        )?;
+        std::os::unix::fs::chown(&space, Some(65534), Some(65534))
+            .map_err(|e| errors::InvokerFailure(format!("Failed to chown {}: {:?}", space, e)))?;
+
+        let overlay = self.overlay();
+        for (from, to) in self.bound_files.iter() {
+            let to = format!("{}{}", overlay, to);
+            std::fs::write(&to, "")
+                .map_err(|e| errors::InvokerFailure(format!("Failed to create {}: {:?}", to, e)))?;
+            system::bind_mount_opt(from, &to, system::MS_RDONLY).map_err(|e| {
+                errors::InvokerFailure(format!(
+                    "Failed to bind-mount {:?} to {}: {:?}",
+                    from, to, e
+                ))
+            })?;
+        }
 
         Ok(())
     }
@@ -355,13 +376,7 @@ impl RootFS {
         self.removed = true;
 
         let prefix = format!("/tmp/worker/rootfs/{}", self.id);
-
         unmount_recursively(&prefix)?;
-
-        // Remove directories
-        // rmdir .../overlay non-recursively first to make sure everything was really unmounted
-        let overlay = self.overlay();
-        std::fs::remove_dir(&overlay).with_context(|| format!("Failed to remove {}", overlay))?;
         std::fs::remove_dir_all(&prefix)
             .with_context(|| format!("Failed to remove {} recursively", prefix))?;
 
@@ -745,7 +760,7 @@ async fn isolated_entry<T: Object + 'static>(
     // anyway, and b) enables slightly more efficient mount namespace management and avoids
     // unnecessary locking.
     //
-    // 2. The resulting environment must be chrooted, because that preventß unshare(CLONE_NEWUSER)
+    // 2. The resulting environment must be chrooted, because that prevents unshare(CLONE_NEWUSER)
     // from succeeding inside the namespace. This is, in fact, the only way to do this without
     // spooky action at a distance, that I am aware of. This used to be an implementation detail of
     // the Linux kernel, but should perhaps be considered more stable now. The necessity to disable
