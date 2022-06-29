@@ -126,8 +126,8 @@ pub trait DeserializeBoxed<'a> {
     ) -> Box<dyn DeserializeBoxed<'a> + 'a>;
 }
 
-pub trait Object: Serialize + Deserialize {}
-impl<T: Serialize + Deserialize> Object for T {}
+pub trait Object: Serialize + Deserialize + Send + Sync {}
+impl<T: Serialize + Deserialize + Send + Sync> Object for T {}
 
-pub trait TraitObject: Serialize + for<'a> DeserializeBoxed<'a> + Send {}
-impl<T: Serialize + Deserialize + for<'a> DeserializeBoxed<'a> + Send> TraitObject for T {}
+pub trait TraitObject: Serialize + for<'a> DeserializeBoxed<'a> + Send + Sync {}
+impl<T: Serialize + Deserialize + for<'a> DeserializeBoxed<'a> + Send + Sync> TraitObject for T {}

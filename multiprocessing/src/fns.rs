@@ -38,12 +38,12 @@ impl<Args, T: Entrypoint<Args>> std::ops::FnMut<Args> for EntrypointWrapper<T> {
     }
 }
 
-pub trait FnOnce<Args>: std::ops::FnOnce<Args> + TraitObject + Sync {}
-pub trait Fn<Args>: std::ops::Fn<Args> + TraitObject + Sync {}
+pub trait FnOnce<Args>: std::ops::FnOnce<Args> + TraitObject {}
+pub trait Fn<Args>: std::ops::Fn<Args> + TraitObject {}
 pub trait FnMut<Args>: std::ops::FnMut<Args> + TraitObject {}
 
-impl<Args, T: std::ops::FnOnce<Args> + TraitObject + Sync> FnOnce<Args> for T {}
-impl<Args, T: std::ops::Fn<Args> + TraitObject + Sync> Fn<Args> for T {}
+impl<Args, T: std::ops::FnOnce<Args> + TraitObject> FnOnce<Args> for T {}
+impl<Args, T: std::ops::Fn<Args> + TraitObject> Fn<Args> for T {}
 impl<Args, T: std::ops::FnMut<Args> + TraitObject> FnMut<Args> for T {}
 
 pub trait Bind<Head: Object, Tail> {
