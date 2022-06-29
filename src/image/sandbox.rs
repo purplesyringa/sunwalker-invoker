@@ -269,7 +269,7 @@ pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
         .map_err(|e| errors::InvokerFailure(format!("Failed to create {}: {:?}", prefix, e)))?;
 
     (async move || {
-        for name in ["ipc", "user", "uts"] {
+        for name in ["ipc", "user", "uts", "net"] {
             let path = format!("{}/{}", prefix, name);
             std::fs::write(&path, "").map_err(|e| {
                 errors::InvokerFailure(format!("Failed to create {}: {:?}", path, e))
@@ -474,11 +474,63 @@ pub async fn run_isolated<T: Object + 'static>(
 #[multiprocessing::entrypoint]
 #[tokio::main(flavor = "current_thread")] // unshare requires a single thread
 async fn make_ns(mut duplex: multiprocessing::tokio::Duplex<(), ()>) -> Result<(), errors::Error> {
-    if unsafe { libc::unshare(CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWUTS | CLONE_SYSVSEM) } != 0 {
+    if unsafe {
+        libc::unshare(CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWUTS | CLONE_SYSVSEM | CLONE_NEWNET)
+    } != 0
+    {
         return Err(errors::InvokerFailure(format!(
             "Failed to unshare namespaces: {:?}",
             std::io::Error::last_os_error()
         )));
+    }
+
+    // Will a reasonable program ever use a local network interface? Theoretically, I can see a
+    // runtime with built-in multiprocessing support use a TCP socket on localhost for IPC, but
+    // practically, the chances are pretty low and getting the network up takes time, so I'm leaving
+    // it disabled for now.
+    //
+    // The second reason is that enabling it not as easy as flicking a switch. Linux collects
+    // statistics on network interfaces, so the the network interfaces have to be re-created every
+    // time to prevent data leaks. The lo interface is unique in the way that it always exists in
+    // the netns and can't be deleted or recreated, according to a comment in Linux kernel:
+    //     The loopback device is special if any other network devices
+    //     is present in a network namespace the loopback device must
+    //     be present. Since we now dynamically allocate and free the
+    //     loopback device ensure this invariant is maintained by
+    //     keeping the loopback device as the first device on the
+    //     list of network devices.  Ensuring the loopback devices
+    //     is the first device that appears and the last network device
+    //     that disappears.
+    //
+    // However, we can create a dummy interface and assign the local addresses to it rather than lo.
+    // It would still have to be re-created, though, and that takes precious time, 50 ms for me. And
+    // then there is a problem with IPv6--::1 cannot be assigned to anything but lo due to a quirk
+    // in the interpretation of the IPv6 RFC by the Linux kernel.
+
+    // Bring lo down
+    {
+        let (connection, handle, _) = rtnetlink::new_connection().map_err(|e| {
+            errors::InvokerFailure(format!("Failed to connect to rtnetlink: {:?}", e))
+        })?;
+        tokio::spawn(connection);
+
+        if let Some(link) = handle
+            .link()
+            .get()
+            .match_name("lo".to_string())
+            .execute()
+            .try_next()
+            .await
+            .map_err(|e| errors::InvokerFailure(format!("Failed to find lo link: {:?}", e)))?
+        {
+            handle
+                .link()
+                .set(link.header.index)
+                .down()
+                .execute()
+                .await
+                .map_err(|e| errors::InvokerFailure(format!("Failed to bring lo down: {:?}", e)))?;
+        }
     }
 
     // Stop ourselves
@@ -512,7 +564,7 @@ async fn isolated_entry<T: Object + 'static>(
 ) -> Result<T, errors::Error> {
     // Join prepared namespaces. They are old in the sense that they may contain stray information
     // from previous runs. It's necessary to clean it up to prevent communication between runs.
-    for name in ["ipc", "user", "uts"] {
+    for name in ["ipc", "user", "uts", "net"] {
         let path = format!("/tmp/worker/ns/{}/{}", ns_id, name);
         let file = std::fs::File::open(&path)
             .map_err(|e| errors::InvokerFailure(format!("Failed to open {}: {:?}", path, e)))?;
@@ -686,56 +738,11 @@ async fn isolated_entry<T: Object + 'static>(
     //   the child namespace, so we have to create a new mountns every time;
     // - A PID namespace it's not usable after init (the process with pid 1, that is) dies, and we
     //   can't make sure our init wasn't tampered with if we reuse the namespace;
-    // - Information can be passed via statistics of the always available lo interface (e.g. the
-    //   number of bytes transmitted), and I am not certain that no other vector exists, so we have
-    //   to recreate the interface. But lo is unique in the way that it always exists in the netns
-    //   and can't be deleted or recreated, so the only way is to create a new netns. This is from
-    //   a comment in Linux kernel:
-    //       The loopback device is special if any other network devices
-    //       is present in a network namespace the loopback device must
-    //       be present. Since we now dynamically allocate and free the
-    //       loopback device ensure this invariant is maintained by
-    //       keeping the loopback device as the first device on the
-    //       list of network devices.  Ensuring the loopback devices
-    //       is the first device that appears and the last network device
-    //       that disappears.
-
-    if unsafe { libc::unshare(CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET) } != 0 {
+    if unsafe { libc::unshare(CLONE_NEWNS | CLONE_NEWPID) } != 0 {
         return Err(errors::InvokerFailure(format!(
             "Failed to unshare mount namespace: {:?}",
             std::io::Error::last_os_error()
         )));
-    }
-
-    // Bring lo up. I'm not sure if lo is used anyway, but it might be necessary in some peculiar
-    // cases, so better do that.
-    {
-        let (connection, handle, _) = rtnetlink::new_connection().map_err(|e| {
-            errors::InvokerFailure(format!("Failed to connect to rtnetlink: {:?}", e))
-        })?;
-        tokio::spawn(connection);
-
-        if let Some(link) = handle
-            .link()
-            .get()
-            .match_name("lo".to_string())
-            .execute()
-            .try_next()
-            .await
-            .map_err(|e| errors::InvokerFailure(format!("Failed to search for lo link: {:?}", e)))?
-        {
-            handle
-                .link()
-                .set(link.header.index)
-                .up()
-                .execute()
-                .await
-                .map_err(|e| errors::InvokerFailure(format!("Failed to bring lo up: {:?}", e)))?;
-        } else {
-            return Err(errors::InvokerFailure(
-                "lo interface does not exist even though we have just unshared netns".to_string(),
-            ));
-        }
     }
 
     // Switch to fake root user
