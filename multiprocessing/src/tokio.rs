@@ -1,4 +1,7 @@
-use crate::{imp, Await, Deserialize, Deserializer, FnOnce, Object, Serialize, Serializer};
+use crate::{
+    imp, ipc::MAX_PACKET_SIZE, Await, Deserialize, Deserializer, FnOnce, Object, Serialize,
+    Serializer,
+};
 use std::io::{Error, ErrorKind, IoSlice, IoSliceMut, Result};
 use std::marker::PhantomData;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -61,37 +64,42 @@ impl<T: Serialize> Sender<T> {
         let mut s = Serializer::new();
         s.serialize(value);
 
-        // Send the size of data and pass file descriptors
         let fds = s.drain_fds();
-
         let serialized = s.into_vec();
-        let sz = serialized.len().to_ne_bytes();
 
         let mut ancillary_buffer = [0; 253];
-        let mut ancillary = SocketAncillary::new(&mut ancillary_buffer);
-        if !ancillary.add_fds(&fds) {
-            return Err(Error::new(ErrorKind::Other, "Too many fds to pass"));
-        }
 
-        let size = self
-            .fd
-            .send_vectored_with_ancillary(&[IoSlice::new(&sz)], &mut ancillary)
-            .await?;
-        if size != sz.len() {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!("Expected to send {} bytes, sent {} bytes", sz.len(), size),
-            ));
-        }
+        // Send the data and pass file descriptors
+        let mut buffer_pos: usize = 0;
+        let mut fds_pos: usize = 0;
 
-        // Send data itself
-        let mut serialized = &serialized[..];
-        while !serialized.is_empty() {
-            let n = self.fd.send(serialized).await?;
-            if n == 0 {
+        loop {
+            let buffer_end = serialized.len().min(buffer_pos + MAX_PACKET_SIZE - 1);
+            let fds_end = fds.len().min(fds_pos + 253);
+
+            let is_last = buffer_end == serialized.len() && fds_end == fds.len();
+
+            let mut ancillary = SocketAncillary::new(&mut ancillary_buffer);
+            if !ancillary.add_fds(&fds[fds_pos..fds_end]) {
+                return Err(Error::new(ErrorKind::Other, "Too many fds to pass"));
+            }
+
+            let n_written = self
+                .fd
+                .send_vectored_with_ancillary(
+                    &[
+                        IoSlice::new(&[is_last as u8]),
+                        IoSlice::new(&serialized[buffer_pos..buffer_end]),
+                    ],
+                    &mut ancillary,
+                )
+                .await?;
+            buffer_pos += n_written - 1;
+            fds_pos = fds_end;
+
+            if is_last {
                 break;
             }
-            serialized = &serialized[n..];
         }
 
         Ok(())
@@ -122,51 +130,68 @@ impl<T: Deserialize> Receiver<T> {
     }
 
     pub async fn recv(&mut self) -> Result<Option<T>> {
-        // Read size of data and the passed file descriptors
-        let mut sz = [0u8; std::mem::size_of::<usize>()];
+        // Read the data and the passed file descriptors
+        let mut serialized: Vec<u8> = Vec::new();
+        let mut buffer_pos: usize = 0;
 
         let mut ancillary_buffer = [0; 253];
-        let mut ancillary = SocketAncillary::new(&mut ancillary_buffer[..]);
-
-        let size = self
-            .fd
-            .recv_vectored_with_ancillary(&mut [IoSliceMut::new(&mut sz)], &mut ancillary)
-            .await?;
-        if size == 0 {
-            return Ok(None);
-        }
-
-        if size != sz.len() {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!("Expected to receive {} bytes, got {} bytes", sz.len(), size),
-            ));
-        }
-
         let mut received_fds: Vec<OwnedFd> = Vec::new();
-        for cmsg in ancillary.messages() {
-            if let Ok(AncillaryData::ScmRights(rights)) = cmsg {
-                for fd in rights {
-                    received_fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+
+        loop {
+            serialized.resize(buffer_pos + MAX_PACKET_SIZE - 1, 0);
+
+            let mut marker = [0];
+            let mut ancillary = SocketAncillary::new(&mut ancillary_buffer[..]);
+
+            let n_read = self
+                .fd
+                .recv_vectored_with_ancillary(
+                    &mut [
+                        IoSliceMut::new(&mut marker),
+                        IoSliceMut::new(&mut serialized[buffer_pos..]),
+                    ],
+                    &mut ancillary,
+                )
+                .await?;
+
+            for cmsg in ancillary.messages() {
+                if let Ok(AncillaryData::ScmRights(rights)) = cmsg {
+                    for fd in rights {
+                        received_fds.push(unsafe { OwnedFd::from_raw_fd(fd) });
+                    }
+                } else {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        format!("Unexpected kind of cmsg on stream"),
+                    ));
                 }
-            } else {
+            }
+
+            if ancillary.is_empty() && n_read == 0 {
+                if buffer_pos == 0 && received_fds.is_empty() {
+                    return Ok(None);
+                } else {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        format!("Unterminated data on stream"),
+                    ));
+                }
+            }
+
+            if n_read == 0 {
                 return Err(Error::new(
                     ErrorKind::Other,
-                    format!("Unexpected kind of cmsg on stream"),
+                    format!("Unexpected empty message on stream"),
                 ));
             }
-        }
 
-        let mut serialized = vec![0u8; usize::from_ne_bytes(sz)];
-
-        let mut buf = &mut serialized[..];
-        while !buf.is_empty() {
-            let n = self.fd.recv(buf).await?;
-            if n == 0 {
-                return Err(Error::new(ErrorKind::Other, format!("Unexpected EOF")));
+            buffer_pos += n_read - 1;
+            if marker[0] == 1 {
+                break;
             }
-            buf = &mut buf[n..];
         }
+
+        serialized.truncate(buffer_pos);
 
         let mut d = Deserializer::from(serialized, received_fds);
         Ok(Some(d.deserialize()))
