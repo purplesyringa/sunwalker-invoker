@@ -33,3 +33,6 @@ pub mod builtins;
 
 pub mod fns;
 pub use fns::*;
+
+pub mod delayed;
+pub use delayed::Delayed;

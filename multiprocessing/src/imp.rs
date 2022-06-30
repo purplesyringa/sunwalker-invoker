@@ -36,38 +36,25 @@ pub fn main() {
     let mut args = std::env::args();
     if let Some(s) = args.next() {
         if s == "_multiprocessing_" {
-            let entry_rx_fd: RawFd = args
+            let fd: RawFd = args
                 .next()
-                .expect("Expected three CLI arguments for multiprocessing")
+                .expect("Expected one CLI argument for multiprocessing")
                 .parse()
-                .expect("Expected the first CLI argument for multiprocessing to be an integer");
+                .expect("Expected the CLI argument for multiprocessing to be an integer");
 
-            let input_rx_fd: RawFd = args
-                .next()
-                .expect("Expected three CLI arguments for multiprocessing")
-                .parse()
-                .expect("Expected the second CLI argument for multiprocessing to be an integer");
+            enable_cloexec(fd).expect("Failed to set O_CLOEXEC for the file descriptor");
 
-            let output_tx_fd: RawFd = args
-                .next()
-                .expect("Expected three CLI arguments for multiprocessing")
-                .parse()
-                .expect("Expected the third CLI argument for multiprocessing to be an integer");
-
-            enable_cloexec(entry_rx_fd).expect("Failed to set O_CLOEXEC for entry_rx_fd");
-            enable_cloexec(input_rx_fd).expect("Failed to set O_CLOEXEC for input_rx_fd");
-            enable_cloexec(output_tx_fd).expect("Failed to set O_CLOEXEC for output_tx_fd");
-
-            let mut entry_rx = unsafe {
-                Receiver::<Box<dyn FnOnce<(RawFd, RawFd), Output = i32>>>::from_raw_fd(entry_rx_fd)
-            };
+            let mut entry_rx =
+                unsafe { Receiver::<Box<dyn FnOnce<(RawFd,), Output = i32>>>::from_raw_fd(fd) };
 
             let entry = entry_rx
                 .recv()
                 .expect("Failed to read entry for multiprocessing")
                 .expect("No entry passed");
 
-            std::process::exit(entry(input_rx_fd, output_tx_fd));
+            std::mem::forget(entry_rx);
+
+            std::process::exit(entry(fd));
         }
     }
     std::process::exit(MAIN_ENTRY

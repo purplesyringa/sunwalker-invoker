@@ -6,7 +6,7 @@ use std::pin::Pin;
 
 pub trait Entrypoint<Args>: Object {
     type Output;
-    fn call(args: Args) -> Self::Output;
+    fn call(self, args: Args) -> Self::Output;
 }
 
 #[derive(Object)]
@@ -22,19 +22,7 @@ impl<T: Object> Deref for EntrypointWrapper<T> {
 impl<Args, T: Entrypoint<Args>> std::ops::FnOnce<Args> for EntrypointWrapper<T> {
     type Output = T::Output;
     extern "rust-call" fn call_once(self, args: Args) -> Self::Output {
-        T::call(args)
-    }
-}
-
-impl<Args, T: Entrypoint<Args>> std::ops::Fn<Args> for EntrypointWrapper<T> {
-    extern "rust-call" fn call(&self, args: Args) -> Self::Output {
-        T::call(args)
-    }
-}
-
-impl<Args, T: Entrypoint<Args>> std::ops::FnMut<Args> for EntrypointWrapper<T> {
-    extern "rust-call" fn call_mut(&mut self, args: Args) -> Self::Output {
-        T::call(args)
+        self.0.call(args)
     }
 }
 

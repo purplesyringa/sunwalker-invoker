@@ -67,17 +67,17 @@ fn with_passed_trait(arg: Box<dyn Trait>) -> String {
 }
 
 #[multiprocessing::entrypoint]
-fn with_passed_fn(func: Box<dyn multiprocessing::Fn<(i32, i32), Output = i32>>) -> i32 {
+fn with_passed_fn(func: Box<dyn multiprocessing::FnOnce<(i32, i32), Output = i32>>) -> i32 {
     func(5, 7)
 }
 
 #[multiprocessing::entrypoint]
-fn with_passed_bound_fn(func: Box<dyn multiprocessing::Fn<(i32,), Output = i32>>) -> i32 {
+fn with_passed_bound_fn(func: Box<dyn multiprocessing::FnOnce<(i32,), Output = i32>>) -> i32 {
     func(7)
 }
 
 #[multiprocessing::entrypoint]
-fn with_passed_double_bound_fn(func: Box<dyn multiprocessing::Fn<(), Output = i32>>) -> i32 {
+fn with_passed_double_bound_fn(func: Box<dyn multiprocessing::FnOnce<(), Output = i32>>) -> i32 {
     func()
 }
 
