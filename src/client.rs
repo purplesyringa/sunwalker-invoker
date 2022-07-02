@@ -562,8 +562,8 @@ fn enter_sandbox() -> anyhow::Result<()> {
     // Prepare a copy of /dev
     std::fs::create_dir("/tmp/dev").with_context(|| "Creating /tmp/dev failed")?;
     for name in [
-        "null", "full", "zero", "urandom", "random", "stdin", "stdout", "stderr", "shm", "mqueue",
-        "ptmx", "pts", "fd",
+        "null", "full", "zero", "urandom", "random", "stdin", "stdout", "stderr", "ptmx", "pts",
+        "fd",
     ] {
         let source = format!("/dev/{}", name);
         let target = format!("/tmp/dev/{}", name);
@@ -583,6 +583,9 @@ fn enter_sandbox() -> anyhow::Result<()> {
         system::bind_mount(&source, &target)
             .with_context(|| format!("Bind-mounting {} -> {} failed", target, source))?;
     }
+
+    std::fs::create_dir("/tmp/dev/mqueue").with_context(|| "Cannot mkdir /tmp/dev/mqueue")?;
+    std::fs::create_dir("/tmp/dev/shm").with_context(|| "Cannot mkdir /tmp/dev/shm")?;
 
     Ok(())
 }

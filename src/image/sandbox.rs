@@ -6,10 +6,12 @@ use libc::{
     CLONE_SYSVSEM,
 };
 use multiprocessing::Object;
-use std::ffi::{CStr, OsString};
+use std::ffi::{CString, OsString};
 use std::io::BufRead;
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::{ffi::OsStrExt, io::AsRawFd};
+use std::os::unix::{
+    fs::MetadataExt,
+    {ffi::OsStringExt, io::AsRawFd},
+};
 use std::path::PathBuf;
 
 pub struct DiskQuotas {
@@ -158,14 +160,6 @@ pub fn make_rootfs(
     )
     .with_context(|| format!("Failed to mount overlay at {}/overlay/root", prefix))?;
 
-    // Mount /dev on overlay
-    system::bind_mount_opt(
-        "/tmp/dev",
-        format!("{}/overlay/root/dev", prefix),
-        system::MS_RDONLY,
-    )
-    .with_context(|| "Failed to mount /dev on .../overlay/root")?;
-
     // Make /space a tmpfs with the necessary disk quotas
     system::mount(
         "none",
@@ -175,6 +169,27 @@ pub fn make_rootfs(
         Some(format!("size={},nr_inodes={}", quotas.space, quotas.max_inodes).as_ref()),
     )
     .with_context(|| format!("Mounting tmpfs on {}/overlay/root/space failed", prefix))?;
+
+    // Mount /dev on overlay
+    system::bind_mount_opt(
+        "/tmp/dev",
+        format!("{}/overlay/root/dev", prefix),
+        system::MS_RDONLY,
+    )
+    .with_context(|| "Failed to mount /dev on .../overlay/root")?;
+
+    // Mount /dev/shm on overlay
+    std::fs::create_dir(format!("{}/overlay/root/space/.shm", prefix)).with_context(|| {
+        format!(
+            "Failed to create directory at {}/overlay/root/space/.shm",
+            prefix
+        )
+    })?;
+    system::bind_mount(
+        format!("{}/overlay/root/space/.shm", prefix),
+        format!("{}/overlay/root/dev/shm", prefix),
+    )
+    .with_context(|| "Failed to mount /dev/shm on .../overlay/root")?;
 
     // Allow the sandbox user to write to /space
     std::os::unix::fs::chown(
@@ -351,6 +366,27 @@ impl RootFS {
 
         std::os::unix::fs::chown(&space, Some(65534), Some(65534))
             .map_err(|e| errors::InvokerFailure(format!("Failed to chown {}: {:?}", space, e)))?;
+
+        // Remount /dev/shm
+        let space_shm = format!("{}/.shm", space);
+        let dev_shm = format!("{}/dev/shm", self.overlay());
+        std::fs::create_dir(&space_shm).map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to create directory at {}: {:?}",
+                space_shm, e
+            ))
+        })?;
+        system::umount(&dev_shm).map_err(|e| {
+            errors::InvokerFailure(format!("Failed to unmount {}: {:?}", dev_shm, e))
+        })?;
+        system::bind_mount(&space_shm, &dev_shm).map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to bind-mount {} to {}/dev/shm: {:?}",
+                space_shm,
+                self.overlay(),
+                e
+            ))
+        })?;
 
         let overlay = self.overlay();
         for (from, to) in self.bound_files.iter() {
@@ -716,22 +752,7 @@ async fn isolated_entry<T: Object + 'static>(
         }
     }
 
-    // Clean up POSIX message queues
-    for file in std::fs::read_dir("/dev/mqueue")
-        .map_err(|e| errors::InvokerFailure(format!("Failed to enumerate /dev/mqueue: {:?}", e)))?
-    {
-        let file = file.map_err(|e| {
-            errors::InvokerFailure(format!("Failed to enumerate /dev/mqueue: {:?}", e))
-        })?;
-        let mut mq_path = OsString::from("/");
-        mq_path.push(&file.file_name());
-        let mq_path = CStr::from_bytes_with_nul(mq_path.as_bytes())
-            .unwrap()
-            .to_owned();
-        nix::mqueue::mq_unlink(&mq_path).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to unlink queue {:?}: {:?}", mq_path, e))
-        })?;
-    }
+    // POSIX message queues are handled below
 
     // Unshare mount, PID, and network namespaces:
     // - We remount overlay in the parent, and new mounts in the parent namespace don't propagate to
@@ -808,6 +829,27 @@ async fn isolated_entry<T: Object + 'static>(
         .map_err(|e| errors::InvokerFailure(format!("Failed to chdir to /root: {:?}", e)))?;
     nix::unistd::chroot(".")
         .map_err(|e| errors::InvokerFailure(format!("Failed to chroot into /root: {:?}", e)))?;
+
+    // POSIX message queues are stored in /dev/mqueue, which we can simply remount. It is also sort
+    // of a necessity, because the IPC that the mqueuefs is related to depends on when it's mounted.
+    system::mount("mqueue", "/dev/mqueue", "mqueue", 0, None)
+        .map_err(|e| errors::InvokerFailure(format!("Failed to mount /dev/mqueue: {:?}", e)))?;
+
+    // Clean up POSIX message queues now, because we need to read /dev/mqueue from inside the
+    // filesystem sandbox
+    for file in std::fs::read_dir("/dev/mqueue")
+        .map_err(|e| errors::InvokerFailure(format!("Failed to enumerate /dev/mqueue: {:?}", e)))?
+    {
+        let file = file.map_err(|e| {
+            errors::InvokerFailure(format!("Failed to enumerate /dev/mqueue: {:?}", e))
+        })?;
+        let mut mq_path = OsString::from("/");
+        mq_path.push(&file.file_name());
+        let mq_path = CString::new(mq_path.into_vec()).unwrap();
+        nix::mqueue::mq_unlink(&mq_path).map_err(|e| {
+            errors::InvokerFailure(format!("Failed to unlink queue {:?}: {:?}", mq_path, e))
+        })?;
+    }
 
     // Expose defaults for environment variables
     std::env::set_var(
