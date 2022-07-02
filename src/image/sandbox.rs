@@ -2,7 +2,7 @@ use crate::{cgroups, errors, image::package, system};
 use anyhow::{bail, Context};
 use futures_util::TryStreamExt;
 use libc::{
-    CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, CLONE_NEWUTS,
+    c_char, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, CLONE_NEWUTS,
     CLONE_SYSVSEM,
 };
 use multiprocessing::Object;
@@ -516,6 +516,25 @@ async fn make_ns(mut duplex: multiprocessing::tokio::Duplex<(), ()>) -> Result<(
     {
         return Err(errors::InvokerFailure(format!(
             "Failed to unshare namespaces: {:?}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // Configure UTS namespace
+    let domain_name = "sunwalker";
+    if unsafe { libc::setdomainname(domain_name.as_ptr() as *const c_char, domain_name.len()) }
+        == -1
+    {
+        return Err(errors::InvokerFailure(format!(
+            "Failed to set domain name: {:?}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    let host_name = "invoker";
+    if unsafe { libc::sethostname(host_name.as_ptr() as *const c_char, host_name.len()) } == -1 {
+        return Err(errors::InvokerFailure(format!(
+            "Failed to set host name: {:?}",
             std::io::Error::last_os_error()
         )));
     }
