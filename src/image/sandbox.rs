@@ -1,5 +1,4 @@
 use crate::{cgroups, errors, image::package, system};
-use anyhow::{bail, Context};
 use futures_util::TryStreamExt;
 use libc::{
     c_char, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, CLONE_NEWUTS,
@@ -67,29 +66,51 @@ fn unmount_recursively(prefix: &str) -> Result<(), errors::Error> {
     Ok(())
 }
 
-pub fn enter_worker_space(core: u64) -> anyhow::Result<()> {
+pub fn enter_worker_space(core: u64) -> Result<(), errors::Error> {
     // Unshare namespaces
     unsafe {
         if libc::unshare(CLONE_NEWNS) != 0 {
-            bail!("Failed to unshare mount namespace");
+            return Err(errors::InvokerFailure(format!(
+                "Failed to unshare mount namespace: {:?}",
+                std::io::Error::last_os_error()
+            )));
         }
     }
 
     // Create per-worker tmpfs
-    system::mount("none", "/tmp/sunwalker_invoker/worker", "tmpfs", 0, None)
-        .with_context(|| "Mounting tmpfs on /tmp/sunwalker_invoker/worker failed")?;
+    system::mount("none", "/tmp/sunwalker_invoker/worker", "tmpfs", 0, None).map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to mount tmpfs on /tmp/sunwalker_invoker/worker: {:?}",
+            e
+        ))
+    })?;
 
-    std::fs::create_dir("/tmp/sunwalker_invoker/worker/rootfs")?;
-    std::fs::create_dir("/tmp/sunwalker_invoker/worker/ns")?;
-    std::fs::create_dir("/tmp/sunwalker_invoker/worker/aux")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/worker/rootfs").map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to create /tmp/sunwalker_invoker/worker/rootfs: {:?}",
+            e
+        ))
+    })?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/worker/ns").map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to create /tmp/sunwalker_invoker/worker/ns: {:?}",
+            e
+        ))
+    })?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/worker/aux").map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to create /tmp/sunwalker_invoker/worker/aux: {:?}",
+            e
+        ))
+    })?;
 
     // Switch to core
     let pid = unsafe { libc::getpid() };
-    cgroups::add_task_to_core(pid, core).with_context(|| {
-        format!(
-            "Failed to move current process (PID {}) to core {}",
-            pid, core
-        )
+    cgroups::add_task_to_core(pid, core).map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to move current process (PID {}) to core {}: {:?}",
+            pid, core, e
+        ))
     })?;
 
     Ok(())
@@ -100,7 +121,7 @@ pub fn make_rootfs(
     bound_files: Vec<(PathBuf, String)>,
     quotas: DiskQuotas,
     id: String,
-) -> anyhow::Result<RootFS> {
+) -> Result<RootFS, errors::Error> {
     // There are two (obvious) ways to mount an image in a writable way.
     //
     // First, we can mount a tmpfs that would store the ephemeral data, and then mount an overlayfs
@@ -129,16 +150,38 @@ pub fn make_rootfs(
 
     let prefix = format!("/tmp/sunwalker_invoker/worker/rootfs/{}", id);
 
-    std::fs::create_dir(&prefix)?;
-    std::fs::create_dir(format!("{}/ephemeral", prefix))?;
-    std::fs::create_dir(format!("{}/overlay", prefix))?;
-    std::fs::create_dir(format!("{}/overlay/root", prefix))?;
+    std::fs::create_dir(&prefix).map_err(|e| {
+        errors::InvokerFailure(format!("Failed to mount tmpfs on {}: {:?}", prefix, e))
+    })?;
+    std::fs::create_dir(format!("{}/ephemeral", prefix)).map_err(|e| {
+        errors::InvokerFailure(format!("Failed to create {}/ephemeral: {:?}", prefix, e))
+    })?;
+    std::fs::create_dir(format!("{}/overlay", prefix)).map_err(|e| {
+        errors::InvokerFailure(format!("Failed to create {}/overlay: {:?}", prefix, e))
+    })?;
+    std::fs::create_dir(format!("{}/overlay/root", prefix)).map_err(|e| {
+        errors::InvokerFailure(format!("Failed to create {}/overlay/root: {:?}", prefix, e))
+    })?;
 
     // Create a lowerdir for /space and /dev
-    system::mount("none", format!("{}/ephemeral", prefix), "tmpfs", 0, None)
-        .with_context(|| format!("Mounting tmpfs on {}/ephemeral failed", prefix))?;
-    std::fs::create_dir(format!("{}/ephemeral/space", prefix))?;
-    std::fs::create_dir(format!("{}/ephemeral/dev", prefix))?;
+    system::mount("none", format!("{}/ephemeral", prefix), "tmpfs", 0, None).map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to mount tmpfs on {}/ephemeral: {:?}",
+            prefix, e
+        ))
+    })?;
+    std::fs::create_dir(format!("{}/ephemeral/space", prefix)).map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to create {}/ephemeral/space: {:?}",
+            prefix, e
+        ))
+    })?;
+    std::fs::create_dir(format!("{}/ephemeral/dev", prefix)).map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to create {}/ephemeral/dev: {:?}",
+            prefix, e
+        ))
+    })?;
 
     // Mount overlay
     let fs_options = format!(
@@ -147,7 +190,7 @@ pub fn make_rootfs(
             .image
             .mountpoint
             .to_str()
-            .with_context(|| "Mountpoint must be a string")?,
+            .ok_or_else(|| errors::InvokerFailure("Mountpoint must be a string".to_string()))?,
         package.name,
         prefix,
     );
@@ -158,7 +201,12 @@ pub fn make_rootfs(
         0,
         Some(&fs_options),
     )
-    .with_context(|| format!("Failed to mount overlay at {}/overlay/root", prefix))?;
+    .map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to mount overlay at {}/overlay/root: {:?}",
+            prefix, e
+        ))
+    })?;
 
     // Make /space a tmpfs with the necessary disk quotas
     system::mount(
@@ -168,7 +216,12 @@ pub fn make_rootfs(
         system::MS_NOSUID,
         Some(format!("size={},nr_inodes={}", quotas.space, quotas.max_inodes).as_ref()),
     )
-    .with_context(|| format!("Mounting tmpfs on {}/overlay/root/space failed", prefix))?;
+    .map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to mount tmpfs on {}/overlay/root/space: {:?}",
+            prefix, e
+        ))
+    })?;
 
     // Mount /dev on overlay
     system::bind_mount_opt(
@@ -176,35 +229,53 @@ pub fn make_rootfs(
         format!("{}/overlay/root/dev", prefix),
         system::MS_RDONLY,
     )
-    .with_context(|| "Failed to mount /dev on .../overlay/root")?;
+    .map_err(|e| {
+        errors::InvokerFailure(format!("Failed to mount /dev on .../overlay/root: {:?}", e))
+    })?;
 
     // Mount /dev/shm on overlay
-    std::fs::create_dir(format!("{}/overlay/root/space/.shm", prefix)).with_context(|| {
-        format!(
-            "Failed to create directory at {}/overlay/root/space/.shm",
-            prefix
-        )
+    std::fs::create_dir(format!("{}/overlay/root/space/.shm", prefix)).map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to create directory at {}/overlay/root/space/.shm: {:?}",
+            prefix, e
+        ))
     })?;
     system::bind_mount(
         format!("{}/overlay/root/space/.shm", prefix),
         format!("{}/overlay/root/dev/shm", prefix),
     )
-    .with_context(|| "Failed to mount /dev/shm on .../overlay/root")?;
+    .map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to mount /dev/shm on .../overlay/root: {:?}",
+            e
+        ))
+    })?;
 
     // Allow the sandbox user to write to /space
     std::os::unix::fs::chown(
         format!("{}/overlay/root/space", prefix),
         Some(65534),
         Some(65534),
-    )?;
+    )
+    .map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to chown {}/overlay/root/space: {:?}",
+            prefix, e
+        ))
+    })?;
 
     // Initialize user directory.
     for (from, to) in bound_files.iter() {
         let to = format!("{}/overlay/root{}", prefix, to);
 
-        std::fs::write(&to, "").with_context(|| format!("Failed to create to {}", to))?;
-        system::bind_mount_opt(from, &to, system::MS_RDONLY)
-            .with_context(|| format!("Failed to bind-mount {:?} to {}", from, to))?;
+        std::fs::write(&to, "")
+            .map_err(|e| errors::InvokerFailure(format!("Failed to create {}: {:?}", to, e)))?;
+        system::bind_mount_opt(from, &to, system::MS_RDONLY).map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to bind-mount {:?} to {}: {:?}",
+                from, to, e
+            ))
+        })?;
     }
 
     Ok(RootFS {
@@ -404,7 +475,7 @@ impl RootFS {
         Ok(())
     }
 
-    fn _remove(&mut self) -> anyhow::Result<()> {
+    fn _remove(&mut self) -> Result<(), errors::Error> {
         if self.removed {
             return Ok(());
         }
@@ -413,8 +484,9 @@ impl RootFS {
 
         let prefix = format!("/tmp/sunwalker_invoker/worker/rootfs/{}", self.id);
         unmount_recursively(&prefix)?;
-        std::fs::remove_dir_all(&prefix)
-            .with_context(|| format!("Failed to remove {} recursively", prefix))?;
+        std::fs::remove_dir_all(&prefix).map_err(|e| {
+            errors::InvokerFailure(format!("Failed to remove {} recursively: {:?}", prefix, e))
+        })?;
 
         Ok(())
     }
@@ -451,7 +523,7 @@ impl RootFS {
         })
     }
 
-    pub fn remove(mut self) -> anyhow::Result<()> {
+    pub fn remove(mut self) -> Result<(), errors::Error> {
         self._remove()
     }
 }
