@@ -591,7 +591,7 @@ async fn isolated_entry<T: Object + 'static>(
             let line = line.map_err(|e| {
                 errors::InvokerFailure(format!("Failed to read /proc/sysvipc/msg: {:?}", e))
             })?;
-            let mut it = line.split(" ");
+            let mut it = line.trim().split_ascii_whitespace();
 
             it.next().ok_or_else(|| {
                 errors::InvokerFailure("Invalid format of /proc/sysvipc/msg".to_string())
@@ -637,7 +637,7 @@ async fn isolated_entry<T: Object + 'static>(
             let line = line.map_err(|e| {
                 errors::InvokerFailure(format!("Failed to read /proc/sysvipc/sem: {:?}", e))
             })?;
-            let mut it = line.split(" ");
+            let mut it = line.trim().split_ascii_whitespace();
 
             it.next().ok_or_else(|| {
                 errors::InvokerFailure("Invalid format of /proc/sysvipc/sem".to_string())
@@ -683,7 +683,7 @@ async fn isolated_entry<T: Object + 'static>(
             let line = line.map_err(|e| {
                 errors::InvokerFailure(format!("Failed to read /proc/sysvipc/shm: {:?}", e))
             })?;
-            let mut it = line.split(" ");
+            let mut it = line.trim().split_ascii_whitespace();
 
             it.next().ok_or_else(|| {
                 errors::InvokerFailure("Invalid format of /proc/sysvipc/shm".to_string())
