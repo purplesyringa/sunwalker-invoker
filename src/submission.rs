@@ -34,7 +34,7 @@ impl Submission {
         problem_revision: Arc<problem::ProblemRevision>,
         language: language::Language,
     ) -> Result<Submission, errors::Error> {
-        let root = format!("/tmp/submissions/{}", id);
+        let root = format!("/tmp/sunwalker_invoker/submissions/{}", id);
         std::fs::create_dir(&root).map_err(|e| {
             errors::InvokerFailure(format!(
                 "Failed to create a directory for submission {} at {}: {:?}",
@@ -56,7 +56,7 @@ impl Submission {
     }
 
     pub fn add_source_file(&mut self, name: &str, content: &[u8]) -> Result<(), errors::Error> {
-        let path = format!("/tmp/submissions/{}/{}", self.id, name);
+        let path = format!("/tmp/sunwalker_invoker/submissions/{}/{}", self.id, name);
         std::fs::write(&path, content).map_err(|e| {
             errors::InvokerFailure(format!(
                 "Failed to write a source code file for submission {} at {}: {:?}",

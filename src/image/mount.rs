@@ -17,7 +17,7 @@ impl ImageMounter {
 
     fn get_mountpoint(&mut self) -> std::path::PathBuf {
         self.inc += 1;
-        std::path::PathBuf::from("/tmp/image-".to_owned() + &self.inc.to_string())
+        std::path::PathBuf::from("/tmp/sunwalker_invoker/image-".to_owned() + &self.inc.to_string())
     }
 
     pub fn mount<'a, P: AsRef<std::path::Path>>(

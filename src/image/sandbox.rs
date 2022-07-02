@@ -76,12 +76,12 @@ pub fn enter_worker_space(core: u64) -> anyhow::Result<()> {
     }
 
     // Create per-worker tmpfs
-    system::mount("none", "/tmp/worker", "tmpfs", 0, None)
-        .with_context(|| "Mounting tmpfs on /tmp/worker failed")?;
+    system::mount("none", "/tmp/sunwalker_invoker/worker", "tmpfs", 0, None)
+        .with_context(|| "Mounting tmpfs on /tmp/sunwalker_invoker/worker failed")?;
 
-    std::fs::create_dir("/tmp/worker/rootfs")?;
-    std::fs::create_dir("/tmp/worker/ns")?;
-    std::fs::create_dir("/tmp/worker/aux")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/worker/rootfs")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/worker/ns")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/worker/aux")?;
 
     // Switch to core
     let pid = unsafe { libc::getpid() };
@@ -127,7 +127,7 @@ pub fn make_rootfs(
     // /space and /dev are in the *second* lowerdir, so that the tmpfs doesn't have to handle all
     // the accesses to the permanent files just to return ENOENT.
 
-    let prefix = format!("/tmp/worker/rootfs/{}", id);
+    let prefix = format!("/tmp/sunwalker_invoker/worker/rootfs/{}", id);
 
     std::fs::create_dir(&prefix)?;
     std::fs::create_dir(format!("{}/ephemeral", prefix))?;
@@ -172,7 +172,7 @@ pub fn make_rootfs(
 
     // Mount /dev on overlay
     system::bind_mount_opt(
-        "/tmp/dev",
+        "/tmp/sunwalker_invoker/dev",
         format!("{}/overlay/root/dev", prefix),
         system::MS_RDONLY,
     )
@@ -279,7 +279,7 @@ pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
         ))
     })?;
 
-    let prefix = &format!("/tmp/worker/ns/{}", id);
+    let prefix = &format!("/tmp/sunwalker_invoker/worker/ns/{}", id);
     std::fs::create_dir(prefix)
         .map_err(|e| errors::InvokerFailure(format!("Failed to create {}: {:?}", prefix, e)))?;
 
@@ -411,7 +411,7 @@ impl RootFS {
 
         self.removed = true;
 
-        let prefix = format!("/tmp/worker/rootfs/{}", self.id);
+        let prefix = format!("/tmp/sunwalker_invoker/worker/rootfs/{}", self.id);
         unmount_recursively(&prefix)?;
         std::fs::remove_dir_all(&prefix)
             .with_context(|| format!("Failed to remove {} recursively", prefix))?;
@@ -420,7 +420,10 @@ impl RootFS {
     }
 
     pub fn overlay(&self) -> String {
-        format!("/tmp/worker/rootfs/{}/overlay/root", self.id)
+        format!(
+            "/tmp/sunwalker_invoker/worker/rootfs/{}/overlay/root",
+            self.id
+        )
     }
 
     pub fn read(&self, path: &str) -> Result<Vec<u8>, errors::Error> {
@@ -461,7 +464,7 @@ impl Namespace {
 
         self.removed = true;
 
-        let prefix = format!("/tmp/worker/ns/{}", self.id);
+        let prefix = format!("/tmp/sunwalker_invoker/worker/ns/{}", self.id);
         unmount_recursively(&prefix)?;
         std::fs::remove_dir_all(&prefix).map_err(|e| {
             errors::InvokerFailure(format!("Failed to remove {} recursively: {:?}", prefix, e))
@@ -620,7 +623,7 @@ async fn isolated_entry<T: Object + 'static>(
     // Join prepared namespaces. They are old in the sense that they may contain stray information
     // from previous runs. It's necessary to clean it up to prevent communication between runs.
     for name in ["ipc", "user", "uts", "net"] {
-        let path = format!("/tmp/worker/ns/{}/{}", ns_id, name);
+        let path = format!("/tmp/sunwalker_invoker/worker/ns/{}/{}", ns_id, name);
         let file = std::fs::File::open(&path)
             .map_err(|e| errors::InvokerFailure(format!("Failed to open {}: {:?}", path, e)))?;
         nix::sched::setns(file.as_raw_fd(), nix::sched::CloneFlags::empty())
@@ -822,7 +825,7 @@ async fn isolated_entry<T: Object + 'static>(
     // onto itself. Note that if we pivot_root'ed into .../overlay/root, we'd need to bind-mount
     // itself anyway because the kernel marks .../overlay/root as MNT_LOCKED as a safety restriction
     // due to the use of user namespaces.
-    let overlay = format!("/tmp/worker/rootfs/{}/overlay", rootfs_id);
+    let overlay = format!("/tmp/sunwalker_invoker/worker/rootfs/{}/overlay", rootfs_id);
 
     system::bind_mount_opt(&overlay, &overlay, system::MS_REC).map_err(|e| {
         errors::InvokerFailure(format!(

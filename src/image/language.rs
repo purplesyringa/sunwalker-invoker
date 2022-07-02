@@ -156,8 +156,9 @@ impl LanguageImpl {
         })?;
         let ns = sandbox::make_namespace("build".to_string()).await?;
 
-        // Add /space/artifacts -> /tmp/artifacts/{build_id}
-        let artifacts_path = PathBuf::from(format!("/tmp/artifacts/{}", build_id));
+        // Add /space/artifacts -> /tmp/sunwalker_invoker/artifacts/{build_id}
+        let artifacts_path =
+            PathBuf::from(format!("/tmp/sunwalker_invoker/artifacts/{}", build_id));
         let overlay_artifacts_path = format!("{}/space/artifacts", rootfs.overlay());
         std::fs::create_dir(&artifacts_path).map_err(|e| {
             errors::InvokerFailure(format!("Failed to create {:?}: {:?}", artifacts_path, e))

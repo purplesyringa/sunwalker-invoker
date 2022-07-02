@@ -51,17 +51,20 @@ pub fn main() -> Result<()> {
 
     let cli_parse = CLIArgs::parse();
 
+    std::fs::create_dir_all("/tmp/sunwalker_invoker")
+        .expect("Failed to create /tmp/sunwalker_invoker directory");
+
     // Acquire a lock
     let lock_fd = fcntl::open(
-        "/tmp/sunwalker_invoker.lock",
+        "/tmp/sunwalker_invoker/invoker.lock",
         fcntl::OFlag::O_CREAT | fcntl::OFlag::O_RDWR,
         nix::sys::stat::Mode::from_bits(0o600).unwrap(),
     )
-    .expect("Failed to open /tmp/sunwalker_invoker.lock");
+    .expect("Failed to open /tmp/sunwalker_invoker/invoker.lock");
 
     fcntl::flock(lock_fd, fcntl::FlockArg::LockExclusiveNonblock).expect(
-        "/tmp/sunwalker_invoker.lock is already locked by another process (is sunwalker already \
-         running?)",
+        "/tmp/sunwalker_invoker/invoker.lock is already locked by another process (is sunwalker \
+         already running?)",
     );
 
     // Spawn a watchdog
@@ -80,6 +83,6 @@ pub fn main() -> Result<()> {
     } else {
         watchdog_main(child_pid)?;
         fcntl::flock(lock_fd, fcntl::FlockArg::Unlock)
-            .with_context(|| "Failed to unlock /tmp/sunwalker_invoker.lock")
+            .with_context(|| "Failed to unlock /tmp/sunwalker_invoker/invoker.lock")
     }
 }

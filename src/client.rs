@@ -551,22 +551,26 @@ fn enter_sandbox() -> anyhow::Result<()> {
         .with_context(|| "Setting propagation of / to private recursively failed")?;
 
     // Mount tmpfs
-    system::mount("none", "/tmp", "tmpfs", 0, None)
-        .with_context(|| "Mounting tmpfs on /tmp failed")?;
+    system::mount("none", "/tmp/sunwalker_invoker", "tmpfs", 0, None)
+        .with_context(|| "Mounting tmpfs on /tmp/sunwalker_invoker failed")?;
 
     // Make various temporary directories
-    std::fs::create_dir("/tmp/worker").with_context(|| "Creating /tmp/worker failed")?;
-    std::fs::create_dir("/tmp/submissions").with_context(|| "Creating /tmp/submissions failed")?;
-    std::fs::create_dir("/tmp/artifacts").with_context(|| "Creating /tmp/artifacts failed")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/worker")
+        .with_context(|| "Creating /tmp/sunwalker_invoker/worker failed")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/submissions")
+        .with_context(|| "Creating /tmp/sunwalker_invoker/submissions failed")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/artifacts")
+        .with_context(|| "Creating /tmp/sunwalker_invoker/artifacts failed")?;
 
     // Prepare a copy of /dev
-    std::fs::create_dir("/tmp/dev").with_context(|| "Creating /tmp/dev failed")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/dev")
+        .with_context(|| "Creating /tmp/sunwalker_invoker/dev failed")?;
     for name in [
         "null", "full", "zero", "urandom", "random", "stdin", "stdout", "stderr", "ptmx", "pts",
         "fd",
     ] {
         let source = format!("/dev/{}", name);
-        let target = format!("/tmp/dev/{}", name);
+        let target = format!("/tmp/sunwalker_invoker/dev/{}", name);
         let metadata = std::fs::symlink_metadata(&source)
             .with_context(|| format!("{} does not exist (or oculd not be accessed)", source))?;
         if metadata.is_symlink() {
@@ -584,8 +588,13 @@ fn enter_sandbox() -> anyhow::Result<()> {
             .with_context(|| format!("Bind-mounting {} -> {} failed", target, source))?;
     }
 
-    std::fs::create_dir("/tmp/dev/mqueue").with_context(|| "Cannot mkdir /tmp/dev/mqueue")?;
-    std::fs::create_dir("/tmp/dev/shm").with_context(|| "Cannot mkdir /tmp/dev/shm")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/dev/mqueue")
+        .with_context(|| "Cannot mkdir /tmp/sunwalker_invoker/dev/mqueue")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/dev/shm")
+        .with_context(|| "Cannot mkdir /tmp/sunwalker_invoker/dev/shm")?;
+
+    Ok(())
+}
 
     Ok(())
 }

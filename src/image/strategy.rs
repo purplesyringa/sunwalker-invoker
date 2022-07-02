@@ -466,7 +466,7 @@ impl Strategy {
         build_id: String,
         test_path: PathBuf,
     ) -> Result<verdict::TestJudgementResult, errors::Error> {
-        let aux = format!("/tmp/worker/aux/{}", build_id);
+        let aux = format!("/tmp/sunwalker_invoker/worker/aux/{}", build_id);
 
         std::fs::create_dir(&aux).map_err(|e| {
             errors::InvokerFailure(format!(
