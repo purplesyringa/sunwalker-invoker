@@ -8,7 +8,7 @@ use multiprocessing::Object;
 use std::ffi::{CString, OsString};
 use std::io::BufRead;
 use std::os::unix::{
-    fs::MetadataExt,
+    fs::{MetadataExt, PermissionsExt},
     {ffi::OsStringExt, io::AsRawFd},
 };
 use std::path::PathBuf;
@@ -240,6 +240,17 @@ pub fn make_rootfs(
             prefix, e
         ))
     })?;
+    // rwxrwxrwt
+    std::fs::set_permissions(
+        format!("{}/overlay/root/space/.shm", prefix),
+        std::fs::Permissions::from_mode(0o1777),
+    )
+    .map_err(|e| {
+        errors::InvokerFailure(format!(
+            "Failed to make {}/overlay/root/space/.shm world-writable: {:?}",
+            prefix, e
+        ))
+    })?;
     system::bind_mount(
         format!("{}/overlay/root/space/.shm", prefix),
         format!("{}/overlay/root/dev/shm", prefix),
@@ -252,17 +263,14 @@ pub fn make_rootfs(
     })?;
 
     // Allow the sandbox user to write to /space
-    std::os::unix::fs::chown(
-        format!("{}/overlay/root/space", prefix),
-        Some(65534),
-        Some(65534),
-    )
-    .map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to chown {}/overlay/root/space: {:?}",
-            prefix, e
-        ))
-    })?;
+    std::os::unix::fs::chown(format!("{}/overlay/root/space", prefix), Some(1), Some(1)).map_err(
+        |e| {
+            errors::InvokerFailure(format!(
+                "Failed to chown {}/overlay/root/space: {:?}",
+                prefix, e
+            ))
+        },
+    )?;
 
     // Initialize user directory.
     for (from, to) in bound_files.iter() {
@@ -323,7 +331,8 @@ pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
     // Fill uid/gid maps and switch to
     std::fs::write(
         format!("/proc/{}/uid_map", child.id()),
-        format!("0 65534 1\n"),
+        // Global root stays root, the user is 1000, and nobody is bound just in case
+        format!("0 0 1\n1000 1 1\n65534 65534 1\n"),
     )
     .map_err(|e| {
         errors::InvokerFailure(format!(
@@ -341,7 +350,7 @@ pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
 
     std::fs::write(
         format!("/proc/{}/gid_map", child.id()),
-        format!("0 65534 1\n"),
+        format!("0 0 1\n1000 1 1\n65534 65534 1\n"),
     )
     .map_err(|e| {
         errors::InvokerFailure(format!(
@@ -435,7 +444,7 @@ impl RootFS {
             errors::InvokerFailure(format!("Mounting tmpfs on {} failed: {:?}", space, e))
         })?;
 
-        std::os::unix::fs::chown(&space, Some(65534), Some(65534))
+        std::os::unix::fs::chown(&space, Some(1), Some(1))
             .map_err(|e| errors::InvokerFailure(format!("Failed to chown {}: {:?}", space, e)))?;
 
         // Remount /dev/shm
@@ -860,7 +869,7 @@ async fn isolated_entry<T: Object + 'static>(
         )));
     }
 
-    // Switch to fake root user
+    // Switch to root user
     if unsafe { libc::setuid(0) } != 0 {
         return Err(errors::InvokerFailure(format!(
             "setuid(0) failed while entering sandbox: {:?}",
@@ -924,26 +933,20 @@ async fn isolated_entry<T: Object + 'static>(
     nix::unistd::chroot(".")
         .map_err(|e| errors::InvokerFailure(format!("Failed to chroot into /root: {:?}", e)))?;
 
-    // POSIX message queues are stored in /dev/mqueue, which we can simply remount. It is also sort
-    // of a necessity, because the IPC that the mqueuefs is related to depends on when it's mounted.
+    // POSIX message queues are stored in /dev/mqueue, which we can simply remount instead of
+    // cleaning up queue-by-queue. It is also sort of a necessity, because the IPC that the mqueuefs
+    // is related to depends on when it's mounted.
     system::mount("mqueue", "/dev/mqueue", "mqueue", 0, None)
         .map_err(|e| errors::InvokerFailure(format!("Failed to mount /dev/mqueue: {:?}", e)))?;
-
-    // Clean up POSIX message queues now, because we need to read /dev/mqueue from inside the
-    // filesystem sandbox
-    for file in std::fs::read_dir("/dev/mqueue")
-        .map_err(|e| errors::InvokerFailure(format!("Failed to enumerate /dev/mqueue: {:?}", e)))?
-    {
-        let file = file.map_err(|e| {
-            errors::InvokerFailure(format!("Failed to enumerate /dev/mqueue: {:?}", e))
-        })?;
-        let mut mq_path = OsString::from("/");
-        mq_path.push(&file.file_name());
-        let mq_path = CString::new(mq_path.into_vec()).unwrap();
-        nix::mqueue::mq_unlink(&mq_path).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to unlink queue {:?}: {:?}", mq_path, e))
-        })?;
-    }
+    // rwxrwxrwt
+    std::fs::set_permissions("/dev/mqueue", std::fs::Permissions::from_mode(0o1777)).map_err(
+        |e| {
+            errors::InvokerFailure(format!(
+                "Failed to make /dev/mqueue world-writable: {:?}",
+                e
+            ))
+        },
+    )?;
 
     // Expose defaults for environment variables
     std::env::set_var(
@@ -983,6 +986,20 @@ async fn isolated_entry<T: Object + 'static>(
         let (name, value) = line.split_at(idx);
         let value = &value[1..];
         std::env::set_var(name, value);
+    }
+
+    // Switch to fake user
+    if unsafe { libc::setgid(1000) } != 0 {
+        return Err(errors::InvokerFailure(format!(
+            "setgid(1000) failed while entering sandbox: {:?}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    if unsafe { libc::setuid(1000) } != 0 {
+        return Err(errors::InvokerFailure(format!(
+            "setuid(1000) failed while entering sandbox: {:?}",
+            std::io::Error::last_os_error()
+        )));
     }
 
     f()

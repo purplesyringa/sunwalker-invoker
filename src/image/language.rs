@@ -177,14 +177,12 @@ impl LanguageImpl {
         })?;
 
         // Allow the sandbox user to access data
-        std::os::unix::fs::chown(&overlay_artifacts_path, Some(65534), Some(65534)).map_err(
-            |e| {
-                errors::InvokerFailure(format!(
-                    "Failed to chown {}: {:?}",
-                    overlay_artifacts_path, e
-                ))
-            },
-        )?;
+        std::os::unix::fs::chown(&overlay_artifacts_path, Some(1), Some(1)).map_err(|e| {
+            errors::InvokerFailure(format!(
+                "Failed to chown {}: {:?}",
+                overlay_artifacts_path, e
+            ))
+        })?;
 
         // Enter the sandbox in another process
         let (pattern, log) = sandbox::run_isolated(
