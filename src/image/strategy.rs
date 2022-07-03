@@ -1,5 +1,6 @@
 use crate::{
     errors,
+    errors::ToResult,
     image::{program, sandbox},
     problem::verdict,
     system,
@@ -468,11 +469,11 @@ impl Strategy {
     ) -> Result<verdict::TestJudgementResult, errors::Error> {
         let aux = format!("/tmp/sunwalker_invoker/worker/aux/{}", build_id);
 
-        std::fs::create_dir(&aux).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to create directory {} to start running a strategy: {}",
-                aux, e
-            ))
+        std::fs::create_dir(&aux).with_context_invoker(|| {
+            format!(
+                "Failed to create directory {} to start running a strategy",
+                aux,
+            )
         })?;
 
         (StrategyRun {
@@ -500,20 +501,16 @@ impl<'a> StrategyRun<'a> {
                         format!("{}/{}", self.aux, name).as_ref(),
                         nix::sys::stat::Mode::from_bits_truncate(0666),
                     )
-                    .map_err(|e| {
-                        errors::InvokerFailure(format!(
-                            "Failed to mkfifo {}/{} to start running a strategy: {}",
-                            self.aux, name, e
-                        ))
+                    .with_context_invoker(|| {
+                        format!(
+                            "Failed to mkfifo {}/{} to start running a strategy",
+                            self.aux, name,
+                        )
                     })?;
                 }
                 FileType::Pipe => {
-                    let (rx, tx) = nix::unistd::pipe().map_err(|e| {
-                        errors::InvokerFailure(format!(
-                            "Failed to create a pipe to start running a strategy: {}",
-                            e
-                        ))
-                    })?;
+                    let (rx, tx) = nix::unistd::pipe()
+                        .context_invoker("Failed to create a pipe to start running a strategy")?;
                     pipes.insert(name.to_string(), unsafe {
                         (OwnedFd::from_raw_fd(rx), OwnedFd::from_raw_fd(tx))
                     });
@@ -531,11 +528,8 @@ impl<'a> StrategyRun<'a> {
                 let program = &self.strategy.invocable_programs[*block_id];
 
                 // Clean up
-                program.rootfs.reset().map_err(|e| {
-                    errors::InvokerFailure(format!(
-                        "Failed to reset rootfs for {}: {:?}",
-                        block.command, e
-                    ))
+                program.rootfs.reset().with_context_invoker(|| {
+                    format!("Failed to reset rootfs for {}", block.command)
                 })?;
 
                 // Create regular files that are written by this block
@@ -545,15 +539,13 @@ impl<'a> StrategyRun<'a> {
                         // Regular files are to be created inside the filesystem of the block that
                         // writes to it
                         let overlay = program.rootfs.overlay();
-                        std::fs::write(format!("{}/space/.file-{}", overlay, name), b"").map_err(
-                            |e| {
-                                errors::InvokerFailure(format!(
-                                    "Failed to touch file {}/.file-{} to start running a \
-                                     strategy: {}",
-                                    overlay, name, e
-                                ))
-                            },
-                        )?;
+                        std::fs::write(format!("{}/space/.file-{}", overlay, name), b"")
+                            .with_context_invoker(|| {
+                                format!(
+                                    "Failed to touch file {}/.file-{} to start running a strategy",
+                                    overlay, name,
+                                )
+                            })?;
                     }
                 }
 
@@ -561,9 +553,8 @@ impl<'a> StrategyRun<'a> {
                 for (filename, binding) in block.bindings.iter() {
                     let outer_path = self.resolve_outer_path(&binding.source, None)?;
                     let inner_path = format!("{}/space/{}", program.rootfs.overlay(), filename);
-                    std::fs::write(&inner_path, "").map_err(|e| {
-                        errors::InvokerFailure(format!("Failed to create {}: {:?}", inner_path, e))
-                    })?;
+                    std::fs::write(&inner_path, "")
+                        .with_context_invoker(|| format!("Failed to create {}", inner_path))?;
                     system::bind_mount_opt(
                         &outer_path,
                         &inner_path,
@@ -573,11 +564,8 @@ impl<'a> StrategyRun<'a> {
                             0
                         },
                     )
-                    .map_err(|e| {
-                        errors::InvokerFailure(format!(
-                            "Failed to bind-mount {:?} to {}: {:?}",
-                            outer_path, inner_path, e
-                        ))
+                    .with_context_invoker(|| {
+                        format!("Failed to bind-mount {:?} to {}", outer_path, inner_path,)
                     })?;
                 }
 
@@ -593,17 +581,12 @@ impl<'a> StrategyRun<'a> {
 
                     let outer_path = self.resolve_outer_path(&arg, None)?;
                     let inner_path = format!("{}/space/.arg-{}", program.rootfs.overlay(), i);
-                    std::fs::write(&inner_path, "").map_err(|e| {
-                        errors::InvokerFailure(format!("Failed to create {}: {:?}", inner_path, e))
-                    })?;
-                    system::bind_mount_opt(&outer_path, &inner_path, system::MS_RDONLY).map_err(
-                        |e| {
-                            errors::InvokerFailure(format!(
-                                "Failed to bind-mount {:?} to {}: {:?}",
-                                outer_path, inner_path, e
-                            ))
-                        },
-                    )?;
+                    std::fs::write(&inner_path, "")
+                        .with_context_invoker(|| format!("Failed to create {}", inner_path))?;
+                    system::bind_mount_opt(&outer_path, &inner_path, system::MS_RDONLY)
+                        .with_context_invoker(|| {
+                            format!("Failed to bind-mount {:?} to {}", outer_path, inner_path,)
+                        })?;
 
                     patched_argv.push(format!("/space/.arg-{}", i));
                 }
@@ -629,12 +612,7 @@ impl<'a> StrategyRun<'a> {
                                     *stream = Some(
                                         (if writable { tx } else { rx })
                                             .try_clone()
-                                            .map_err(|e| {
-                                                errors::InvokerFailure(format!(
-                                                    "Failed to dup(2) a file descriptor: {:?}",
-                                                    e
-                                                ))
-                                            })?
+                                            .context_invoker("Failed to dup(2) a file descriptor")?
                                             .into(),
                                     );
                                     continue;
@@ -648,11 +626,8 @@ impl<'a> StrategyRun<'a> {
                             .read(!writable)
                             .write(writable)
                             .open(&outer_path)
-                            .map_err(|e| {
-                                errors::InvokerFailure(format!(
-                                    "Failed to redirect {} to {:?}: {:?}",
-                                    name, outer_path, e
-                                ))
+                            .with_context_invoker(|| {
+                                format!("Failed to redirect {} to {:?}", name, outer_path,)
                             })?,
                     );
                 }
@@ -737,11 +712,11 @@ impl<'a> StrategyRun<'a> {
 
         // Cleanup
         self.removed = true;
-        std::fs::remove_dir_all(&self.aux).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to remove {} recursively while finishing a strategy: {}",
-                self.aux, e
-            ))
+        std::fs::remove_dir_all(&self.aux).with_context_invoker(|| {
+            format!(
+                "Failed to remove {} recursively while finishing a strategy",
+                self.aux,
+            )
         })?;
 
         Ok(verdict::TestJudgementResult {
@@ -808,8 +783,7 @@ fn execute(
     stdout: std::fs::File,
     stderr: std::fs::File,
 ) -> Result<verdict::ExitStatus, errors::Error> {
-    std::env::set_current_dir("/space")
-        .map_err(|e| errors::InvokerFailure(format!("Failed to chdir to /space: {:?}", e)))?;
+    std::env::set_current_dir("/space").context_invoker("Failed to chdir to /space")?;
 
     let exit_status = std::process::Command::new(&argv[0])
         .args(&argv[1..])
@@ -817,11 +791,9 @@ fn execute(
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
-        .map_err(|e| errors::InvokerFailure(format!("Failed to spawn {:?}: {:?}", argv, e)))?
+        .with_context_invoker(|| format!("Failed to spawn {:?}", argv))?
         .wait()
-        .map_err(|e| {
-            errors::InvokerFailure(format!("Failed to get exit code of {:?}: {:?}", argv, e))
-        })?;
+        .with_context_invoker(|| format!("Failed to get exit code of {:?}", argv))?;
 
     Ok(exit_status.into())
 }

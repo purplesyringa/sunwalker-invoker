@@ -1,4 +1,9 @@
-use crate::{cgroups, errors, image::package, system};
+use crate::{
+    cgroups, errors,
+    errors::{ToError, ToResult},
+    image::package,
+    system,
+};
 use futures_util::TryStreamExt;
 use libc::{
     c_char, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS, CLONE_NEWPID, CLONE_NEWUSER, CLONE_NEWUTS,
@@ -34,33 +39,25 @@ pub struct Namespace {
 fn unmount_recursively(prefix: &str) -> Result<(), errors::Error> {
     let prefix_slash = format!("{}/", prefix);
 
-    let file = std::fs::File::open("/proc/self/mounts").map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to open /proc/self/mounts for reading: {:?}",
-            e
-        ))
-    })?;
+    let file = std::fs::File::open("/proc/self/mounts")
+        .context_invoker("Failed to open /proc/self/mounts for reading")?;
 
     let mut vec = Vec::new();
     for line in std::io::BufReader::new(file).lines() {
-        let line = line.map_err(|e| {
-            errors::InvokerFailure(format!("Failed to read /proc/self/mounts: {:?}", e))
-        })?;
+        let line = line.context_invoker("Failed to read /proc/self/mounts")?;
         let mut it = line.split(" ");
-        it.next().ok_or_else(|| {
-            errors::InvokerFailure("Invalid format of /proc/self/mounts".to_string())
-        })?;
-        let target_path = it.next().ok_or_else(|| {
-            errors::InvokerFailure("Invalid format of /proc/self/mounts".to_string())
-        })?;
+        it.next()
+            .context_invoker("Invalid format of /proc/self/mounts")?;
+        let target_path = it
+            .next()
+            .context_invoker("Invalid format of /proc/self/mounts")?;
         if target_path.starts_with(&prefix_slash) {
             vec.push(target_path.to_string());
         }
     }
 
     for path in vec.into_iter().rev() {
-        system::umount(&path)
-            .map_err(|e| errors::InvokerFailure(format!("Failed to unmount {}: {:?}", path, e)))?;
+        system::umount(&path).with_context_invoker(|| format!("Failed to unmount {}", path))?;
     }
 
     Ok(())
@@ -70,47 +67,29 @@ pub fn enter_worker_space(core: u64) -> Result<(), errors::Error> {
     // Unshare namespaces
     unsafe {
         if libc::unshare(CLONE_NEWNS) != 0 {
-            return Err(errors::InvokerFailure(format!(
-                "Failed to unshare mount namespace: {:?}",
-                std::io::Error::last_os_error()
-            )));
+            return Err(std::io::Error::last_os_error()
+                .context_invoker("Failed to unshare mount namespace"));
         }
     }
 
     // Create per-worker tmpfs
-    system::mount("none", "/tmp/sunwalker_invoker/worker", "tmpfs", 0, None).map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to mount tmpfs on /tmp/sunwalker_invoker/worker: {:?}",
-            e
-        ))
-    })?;
+    system::mount("none", "/tmp/sunwalker_invoker/worker", "tmpfs", 0, None)
+        .context_invoker("Failed to mount tmpfs on /tmp/sunwalker_invoker/worker")?;
 
-    std::fs::create_dir("/tmp/sunwalker_invoker/worker/rootfs").map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to create /tmp/sunwalker_invoker/worker/rootfs: {:?}",
-            e
-        ))
-    })?;
-    std::fs::create_dir("/tmp/sunwalker_invoker/worker/ns").map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to create /tmp/sunwalker_invoker/worker/ns: {:?}",
-            e
-        ))
-    })?;
-    std::fs::create_dir("/tmp/sunwalker_invoker/worker/aux").map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to create /tmp/sunwalker_invoker/worker/aux: {:?}",
-            e
-        ))
-    })?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/worker/rootfs")
+        .context_invoker("Failed to create /tmp/sunwalker_invoker/worker/rootfs")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/worker/ns")
+        .context_invoker("Failed to create /tmp/sunwalker_invoker/worker/ns")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/worker/aux")
+        .context_invoker("Failed to create /tmp/sunwalker_invoker/worker/aux")?;
 
     // Switch to core
     let pid = unsafe { libc::getpid() };
-    cgroups::add_task_to_core(pid, core).map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to move current process (PID {}) to core {}: {:?}",
-            pid, core, e
-        ))
+    cgroups::add_task_to_core(pid, core).with_context_invoker(|| {
+        format!(
+            "Failed to move current process (PID {}) to core {}",
+            pid, core
+        )
     })?;
 
     Ok(())
@@ -150,38 +129,21 @@ pub fn make_rootfs(
 
     let prefix = format!("/tmp/sunwalker_invoker/worker/rootfs/{}", id);
 
-    std::fs::create_dir(&prefix).map_err(|e| {
-        errors::InvokerFailure(format!("Failed to mount tmpfs on {}: {:?}", prefix, e))
-    })?;
-    std::fs::create_dir(format!("{}/ephemeral", prefix)).map_err(|e| {
-        errors::InvokerFailure(format!("Failed to create {}/ephemeral: {:?}", prefix, e))
-    })?;
-    std::fs::create_dir(format!("{}/overlay", prefix)).map_err(|e| {
-        errors::InvokerFailure(format!("Failed to create {}/overlay: {:?}", prefix, e))
-    })?;
-    std::fs::create_dir(format!("{}/overlay/root", prefix)).map_err(|e| {
-        errors::InvokerFailure(format!("Failed to create {}/overlay/root: {:?}", prefix, e))
-    })?;
+    std::fs::create_dir(&prefix).context_invoker("Failed to create directory <prefix>")?;
+    std::fs::create_dir(format!("{}/ephemeral", prefix))
+        .context_invoker("Failed to create directory <prefix>/ephemeral")?;
+    std::fs::create_dir(format!("{}/overlay", prefix))
+        .context_invoker("Failed to create directory <prefix>/overlay")?;
+    std::fs::create_dir(format!("{}/overlay/root", prefix))
+        .context_invoker("Failed to create directory <prefix>/overlay/root")?;
 
     // Create a lowerdir for /space and /dev
-    system::mount("none", format!("{}/ephemeral", prefix), "tmpfs", 0, None).map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to mount tmpfs on {}/ephemeral: {:?}",
-            prefix, e
-        ))
-    })?;
-    std::fs::create_dir(format!("{}/ephemeral/space", prefix)).map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to create {}/ephemeral/space: {:?}",
-            prefix, e
-        ))
-    })?;
-    std::fs::create_dir(format!("{}/ephemeral/dev", prefix)).map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to create {}/ephemeral/dev: {:?}",
-            prefix, e
-        ))
-    })?;
+    system::mount("none", format!("{}/ephemeral", prefix), "tmpfs", 0, None)
+        .context_invoker("Failed to mount tmpfs on <prefix>/ephemeral")?;
+    std::fs::create_dir(format!("{}/ephemeral/space", prefix))
+        .context_invoker("Failed to create <prefix>/ephemeral/space")?;
+    std::fs::create_dir(format!("{}/ephemeral/dev", prefix))
+        .context_invoker("Failed to create <prefix>/ephemeral/dev")?;
 
     // Mount overlay
     let fs_options = format!(
@@ -190,7 +152,7 @@ pub fn make_rootfs(
             .image
             .mountpoint
             .to_str()
-            .ok_or_else(|| errors::InvokerFailure("Mountpoint must be a string".to_string()))?,
+            .context_invoker("Mountpoint must be a string")?,
         package.name,
         prefix,
     );
@@ -201,12 +163,7 @@ pub fn make_rootfs(
         0,
         Some(&fs_options),
     )
-    .map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to mount overlay at {}/overlay/root: {:?}",
-            prefix, e
-        ))
-    })?;
+    .context_invoker("Failed to mount overlay on <prefix>/overlay/root")?;
 
     // Make /space a tmpfs with the necessary disk quotas
     system::mount(
@@ -216,12 +173,7 @@ pub fn make_rootfs(
         system::MS_NOSUID,
         Some(format!("size={},nr_inodes={}", quotas.space, quotas.max_inodes).as_ref()),
     )
-    .map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to mount tmpfs on {}/overlay/root/space: {:?}",
-            prefix, e
-        ))
-    })?;
+    .context_invoker("Failed to mount tmpfs on <prefix>/overlay/root/space")?;
 
     // Mount /dev on overlay
     system::bind_mount_opt(
@@ -229,60 +181,38 @@ pub fn make_rootfs(
         format!("{}/overlay/root/dev", prefix),
         system::MS_RDONLY,
     )
-    .map_err(|e| {
-        errors::InvokerFailure(format!("Failed to mount /dev on .../overlay/root: {:?}", e))
-    })?;
+    .context_invoker("Failed to mount /dev on <prefix>/overlay/root")?;
 
     // Mount /dev/shm on overlay
-    std::fs::create_dir(format!("{}/overlay/root/space/.shm", prefix)).map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to create directory at {}/overlay/root/space/.shm: {:?}",
-            prefix, e
-        ))
-    })?;
+    std::fs::create_dir(format!("{}/overlay/root/space/.shm", prefix))
+        .context_invoker("Failed to create directory at <prefix>/overlay/root/space/.shm")?;
     // rwxrwxrwt
     std::fs::set_permissions(
         format!("{}/overlay/root/space/.shm", prefix),
         std::fs::Permissions::from_mode(0o1777),
     )
-    .map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to make {}/overlay/root/space/.shm world-writable: {:?}",
-            prefix, e
-        ))
-    })?;
+    .context_invoker("Failed to make <prefix>/overlay/root/space/.shm")?;
     system::bind_mount(
         format!("{}/overlay/root/space/.shm", prefix),
         format!("{}/overlay/root/dev/shm", prefix),
     )
-    .map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to mount /dev/shm on .../overlay/root: {:?}",
-            e
-        ))
-    })?;
+    .context_invoker("Failed to mount /dev/shm on <prefix>/overlay/root")?;
 
     // Allow the sandbox user to write to /space
-    std::os::unix::fs::chown(format!("{}/overlay/root/space", prefix), Some(1), Some(1)).map_err(
-        |e| {
-            errors::InvokerFailure(format!(
-                "Failed to chown {}/overlay/root/space: {:?}",
-                prefix, e
-            ))
-        },
-    )?;
+    std::os::unix::fs::chown(format!("{}/overlay/root/space", prefix), Some(1), Some(1))
+        .context_invoker("Failed to chown <prefix>/overlay/root/space")?;
 
     // Initialize user directory.
     for (from, to) in bound_files.iter() {
-        let to = format!("{}/overlay/root{}", prefix, to);
+        let to_path = format!("{}/overlay/root{}", prefix, to);
 
-        std::fs::write(&to, "")
-            .map_err(|e| errors::InvokerFailure(format!("Failed to create {}: {:?}", to, e)))?;
-        system::bind_mount_opt(from, &to, system::MS_RDONLY).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to bind-mount {:?} to {}: {:?}",
-                from, to, e
-            ))
+        std::fs::write(&to_path, "")
+            .with_context_invoker(|| format!("Failed to create <prefix>/overlay/root{}", to))?;
+        system::bind_mount_opt(from, &to_path, system::MS_RDONLY).with_context_invoker(|| {
+            format!(
+                "Failed to bind-mount {:?} to <prefix>/overlay/root{}",
+                from, to
+            )
         })?;
     }
 
@@ -295,37 +225,27 @@ pub fn make_rootfs(
 }
 
 pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
-    let (mut upstream, downstream) = multiprocessing::tokio::duplex::<(), ()>().map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to create duplex connection to an isolated subprocess: {:?}",
-            e
-        ))
-    })?;
+    let (mut upstream, downstream) = multiprocessing::tokio::duplex::<(), ()>()
+        .context_invoker("Failed to create duplex connection to an isolated subprocess")?;
 
-    let mut child = make_ns.spawn_tokio(downstream).await.map_err(|e| {
-        errors::InvokerFailure(format!("Failed to start an isolated subprocess: {:?}", e))
-    })?;
+    let mut child = make_ns
+        .spawn_tokio(downstream)
+        .await
+        .context_invoker("Failed to start an isolated subprocess")?;
 
-    let res = upstream.recv().await.map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to read start confirmation from the isolated subprocess: {:?}",
-            e
-        ))
-    })?;
+    let res = upstream
+        .recv()
+        .await
+        .context_invoker("Failed to read start confirmation from the isolated subprocess")?;
     if res.is_none() {
-        let res = child.join().await.map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Isolated process didn't terminate gracefully: {:?}",
-                e
-            ))
-        })?;
+        let res = child
+            .join()
+            .await
+            .context_invoker("Isolated process didn't terminate gracefully")?;
         let err = res
             .err()
             .unwrap_or_else(|| errors::InvokerFailure("(no error reported)".to_string()));
-        return Err(errors::InvokerFailure(format!(
-            "Isolated process failed to start isolation: {:?}",
-            err
-        )));
+        return Err(err.context_invoker("Isolated process failed to start isolation"));
     }
 
     // Fill uid/gid maps and switch to
@@ -334,67 +254,40 @@ pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
         // Global root stays root, the user is 1000, and nobody is bound just in case
         format!("0 0 1\n1000 1 1\n65534 65534 1\n"),
     )
-    .map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to create uid_map for the isolated subprocess: {:?}",
-            e
-        ))
-    })?;
+    .context_invoker("Failed to create uid_map for the isolated subprocess")?;
 
-    std::fs::write(format!("/proc/{}/setgroups", child.id()), "deny\n").map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to create setgroups for the isolated subprocess: {:?}",
-            e
-        ))
-    })?;
+    std::fs::write(format!("/proc/{}/setgroups", child.id()), "deny\n")
+        .context_invoker("Failed to create setgroups for the isolated subprocess")?;
 
     std::fs::write(
         format!("/proc/{}/gid_map", child.id()),
         format!("0 0 1\n1000 1 1\n65534 65534 1\n"),
     )
-    .map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to create gid_map for the isolated subprocess: {:?}",
-            e
-        ))
-    })?;
+    .context_invoker("Failed to create gid_map for the isolated subprocess")?;
 
     let prefix = &format!("/tmp/sunwalker_invoker/worker/ns/{}", id);
-    std::fs::create_dir(prefix)
-        .map_err(|e| errors::InvokerFailure(format!("Failed to create {}: {:?}", prefix, e)))?;
+    std::fs::create_dir(prefix).context_invoker("Failed to create <prefix>")?;
 
     (async move || {
         for name in ["ipc", "user", "uts", "net"] {
+            let orig_path = &format!("/proc/{}/ns/{}", child.id(), name);
             let path = format!("{}/{}", prefix, name);
-            std::fs::write(&path, "").map_err(|e| {
-                errors::InvokerFailure(format!("Failed to create {}: {:?}", path, e))
+            std::fs::write(&path, "")
+                .with_context_invoker(|| format!("Failed to create <prefix>/{}", name))?;
+            system::bind_mount(&orig_path, &path).with_context_invoker(|| {
+                format!("Failed to bind-mount {} to <prefix>/{}", orig_path, name)
             })?;
-            system::bind_mount(&format!("/proc/{}/ns/{}", child.id(), name), &path).map_err(
-                |e| {
-                    errors::InvokerFailure(format!(
-                        "Failed to bind-mount /proc/{}/ns/{} to {}: {:?}",
-                        child.id(),
-                        name,
-                        path,
-                        e
-                    ))
-                },
-            )?;
         }
 
-        upstream.send(&()).await.map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to tell the isolated subprocess to terminate: {:?}",
-                e
-            ))
-        })?;
+        upstream
+            .send(&())
+            .await
+            .context_invoker("Failed to tell the isolated subprocess to terminate")?;
 
-        child.join().await.map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Isolated process didn't terminate gracefully: {:?}",
-                e
-            ))
-        })?
+        child
+            .join()
+            .await
+            .context_invoker("Isolated process didn't terminate gracefully")?
     })()
     .await
     .map_err(|e| {
@@ -424,8 +317,7 @@ impl RootFS {
         unmount_recursively(&space)?;
 
         // Remount /space
-        system::umount(&space)
-            .map_err(|e| errors::InvokerFailure(format!("Failed to unmount {}: {:?}", space, e)))?;
+        system::umount(&space).with_context_invoker(|| format!("Failed to unmount {}", space))?;
 
         system::mount(
             "none",
@@ -440,45 +332,32 @@ impl RootFS {
                 .as_ref(),
             ),
         )
-        .map_err(|e| {
-            errors::InvokerFailure(format!("Mounting tmpfs on {} failed: {:?}", space, e))
-        })?;
+        .with_context_invoker(|| format!("Mounting tmpfs on {} failed", space))?;
 
         std::os::unix::fs::chown(&space, Some(1), Some(1))
-            .map_err(|e| errors::InvokerFailure(format!("Failed to chown {}: {:?}", space, e)))?;
+            .with_context_invoker(|| format!("Failed to chown {}", space))?;
 
         // Remount /dev/shm
         let space_shm = format!("{}/.shm", space);
         let dev_shm = format!("{}/dev/shm", self.overlay());
-        std::fs::create_dir(&space_shm).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to create directory at {}: {:?}",
-                space_shm, e
-            ))
-        })?;
-        system::umount(&dev_shm).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to unmount {}: {:?}", dev_shm, e))
-        })?;
-        system::bind_mount(&space_shm, &dev_shm).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to bind-mount {} to {}/dev/shm: {:?}",
+        std::fs::create_dir(&space_shm)
+            .with_context_invoker(|| format!("Failed to create directory at {}", space_shm,))?;
+        system::umount(&dev_shm)
+            .with_context_invoker(|| format!("Failed to unmount {}", dev_shm))?;
+        system::bind_mount(&space_shm, &dev_shm).with_context_invoker(|| {
+            format!(
+                "Failed to bind-mount {} to {}/dev/shm",
                 space_shm,
                 self.overlay(),
-                e
-            ))
+            )
         })?;
 
         let overlay = self.overlay();
         for (from, to) in self.bound_files.iter() {
             let to = format!("{}{}", overlay, to);
-            std::fs::write(&to, "")
-                .map_err(|e| errors::InvokerFailure(format!("Failed to create {}: {:?}", to, e)))?;
-            system::bind_mount_opt(from, &to, system::MS_RDONLY).map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Failed to bind-mount {:?} to {}: {:?}",
-                    from, to, e
-                ))
-            })?;
+            std::fs::write(&to, "").with_context_invoker(|| format!("Failed to create {}", to))?;
+            system::bind_mount_opt(from, &to, system::MS_RDONLY)
+                .with_context_invoker(|| format!("Failed to bind-mount {:?} to {}", from, to,))?;
         }
 
         Ok(())
@@ -493,9 +372,8 @@ impl RootFS {
 
         let prefix = format!("/tmp/sunwalker_invoker/worker/rootfs/{}", self.id);
         unmount_recursively(&prefix)?;
-        std::fs::remove_dir_all(&prefix).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to remove {} recursively: {:?}", prefix, e))
-        })?;
+        std::fs::remove_dir_all(&prefix)
+            .with_context_invoker(|| format!("Failed to remove {} recursively", prefix))?;
 
         Ok(())
     }
@@ -547,9 +425,8 @@ impl Namespace {
 
         let prefix = format!("/tmp/sunwalker_invoker/worker/ns/{}", self.id);
         unmount_recursively(&prefix)?;
-        std::fs::remove_dir_all(&prefix).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to remove {} recursively: {:?}", prefix, e))
-        })?;
+        std::fs::remove_dir_all(&prefix)
+            .with_context_invoker(|| format!("Failed to remove {} recursively", prefix))?;
 
         Ok(())
     }
@@ -579,16 +456,12 @@ pub async fn run_isolated<T: Object + 'static>(
     let mut child = isolated_entry
         .spawn_tokio(f, rootfs.id.clone(), ns.id.clone())
         .await
-        .map_err(|e| {
-            errors::InvokerFailure(format!("Failed to start an isolated subprocess: {:?}", e))
-        })?;
+        .context_invoker("Failed to start an isolated subprocess")?;
 
-    child.join().await.map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Isolated process didn't terminate gracefully: {:?}",
-            e
-        ))
-    })?
+    child
+        .join()
+        .await
+        .context_invoker("Isolated process didn't terminate gracefully")?
 }
 
 #[multiprocessing::entrypoint]
@@ -598,10 +471,7 @@ async fn make_ns(mut duplex: multiprocessing::tokio::Duplex<(), ()>) -> Result<(
         libc::unshare(CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWUTS | CLONE_SYSVSEM | CLONE_NEWNET)
     } != 0
     {
-        return Err(errors::InvokerFailure(format!(
-            "Failed to unshare namespaces: {:?}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(std::io::Error::last_os_error().context_invoker("Failed to unshare namespaces"));
     }
 
     // Configure UTS namespace
@@ -609,18 +479,12 @@ async fn make_ns(mut duplex: multiprocessing::tokio::Duplex<(), ()>) -> Result<(
     if unsafe { libc::setdomainname(domain_name.as_ptr() as *const c_char, domain_name.len()) }
         == -1
     {
-        return Err(errors::InvokerFailure(format!(
-            "Failed to set domain name: {:?}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(std::io::Error::last_os_error().context_invoker("Failed to set domain name"));
     }
 
     let host_name = "invoker";
     if unsafe { libc::sethostname(host_name.as_ptr() as *const c_char, host_name.len()) } == -1 {
-        return Err(errors::InvokerFailure(format!(
-            "Failed to set host name: {:?}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(std::io::Error::last_os_error().context_invoker("Failed to set host name"));
     }
 
     // Will a reasonable program ever use a local network interface? Theoretically, I can see a
@@ -648,9 +512,8 @@ async fn make_ns(mut duplex: multiprocessing::tokio::Duplex<(), ()>) -> Result<(
 
     // Bring lo down
     {
-        let (connection, handle, _) = rtnetlink::new_connection().map_err(|e| {
-            errors::InvokerFailure(format!("Failed to connect to rtnetlink: {:?}", e))
-        })?;
+        let (connection, handle, _) =
+            rtnetlink::new_connection().context_invoker("Failed to connect to rtnetlink")?;
         tokio::spawn(connection);
 
         if let Some(link) = handle
@@ -660,7 +523,7 @@ async fn make_ns(mut duplex: multiprocessing::tokio::Duplex<(), ()>) -> Result<(
             .execute()
             .try_next()
             .await
-            .map_err(|e| errors::InvokerFailure(format!("Failed to find lo link: {:?}", e)))?
+            .context_invoker("Failed to find lo link")?
         {
             handle
                 .link()
@@ -668,28 +531,20 @@ async fn make_ns(mut duplex: multiprocessing::tokio::Duplex<(), ()>) -> Result<(
                 .down()
                 .execute()
                 .await
-                .map_err(|e| errors::InvokerFailure(format!("Failed to bring lo down: {:?}", e)))?;
+                .context_invoker("Failed to bring lo down")?;
         }
     }
 
     // Stop ourselves
-    duplex.send(&()).await.map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to read notify the parent about successful unshare: {:?}",
-            e
-        ))
-    })?;
+    duplex
+        .send(&())
+        .await
+        .context_invoker("Failed to read notify the parent about successful unshare")?;
     duplex
         .recv()
         .await
-        .map_err(|e| {
-            errors::InvokerFailure(format!("Failed to get stop signal from parent: {:?}", e))
-        })?
-        .ok_or_else(|| {
-            errors::InvokerFailure(
-                "Parent died before sending stop signal to the isolated process".to_string(),
-            )
-        })?;
+        .context_invoker("Failed to get stop signal from parent")?
+        .context_invoker("Parent died before sending stop signal to the isolated process")?;
 
     Ok(())
 }
@@ -706,9 +561,9 @@ async fn isolated_entry<T: Object + 'static>(
     for name in ["ipc", "user", "uts", "net"] {
         let path = format!("/tmp/sunwalker_invoker/worker/ns/{}/{}", ns_id, name);
         let file = std::fs::File::open(&path)
-            .map_err(|e| errors::InvokerFailure(format!("Failed to open {}: {:?}", path, e)))?;
+            .with_context_invoker(|| format!("Failed to open {}", path))?;
         nix::sched::setns(file.as_raw_fd(), nix::sched::CloneFlags::empty())
-            .map_err(|e| errors::InvokerFailure(format!("Failed to setns {}: {:?}", path, e)))?;
+            .with_context_invoker(|| format!("Failed to setns {}", path))?;
     }
 
     // IPC namespace. This is critical to clean up correctly, because creating an IPC namespace in
@@ -719,138 +574,99 @@ async fn isolated_entry<T: Object + 'static>(
 
     // Clean up System V message queues
     {
-        let file = std::fs::File::open("/proc/sysvipc/msg").map_err(|e| {
-            errors::InvokerFailure(format!("Failed to open /proc/sysvipc/msg: {:?}", e))
-        })?;
+        let file = std::fs::File::open("/proc/sysvipc/msg")
+            .context_invoker("Failed to open /proc/sysvipc/msg")?;
 
         let mut msqids: Vec<libc::c_int> = Vec::new();
 
         // Skip header
         for line in std::io::BufReader::new(file).lines().skip(1) {
-            let line = line.map_err(|e| {
-                errors::InvokerFailure(format!("Failed to read /proc/sysvipc/msg: {:?}", e))
-            })?;
+            let line = line.context_invoker("Failed to read /proc/sysvipc/msg")?;
             let mut it = line.trim().split_ascii_whitespace();
 
-            it.next().ok_or_else(|| {
-                errors::InvokerFailure("Invalid format of /proc/sysvipc/msg".to_string())
-            })?;
+            it.next()
+                .context_invoker("Invalid format of /proc/sysvipc/msg")?;
 
             let msqid = it
                 .next()
-                .ok_or_else(|| {
-                    errors::InvokerFailure("Invalid format of /proc/sysvipc/msg".to_string())
-                })?
+                .context_invoker("Invalid format of /proc/sysvipc/msg")?
                 .parse()
-                .map_err(|e| {
-                    errors::InvokerFailure(format!(
-                        "Invalid format of msqid in /proc/sysvipc/msg: {:?}",
-                        e
-                    ))
-                })?;
+                .context_invoker("Invalid format of msqid in /proc/sysvipc/msg")?;
 
             msqids.push(msqid);
         }
 
         for msqid in msqids {
             if unsafe { libc::msgctl(msqid, libc::IPC_RMID, std::ptr::null_mut()) } == -1 {
-                return Err(errors::InvokerFailure(format!(
-                    "Failed to delete System V message queue #{}: {:?}",
-                    msqid,
-                    std::io::Error::last_os_error()
-                )));
+                return Err(std::io::Error::last_os_error().with_context_invoker(|| {
+                    format!("Failed to delete System V message queue #{}", msqid,)
+                }));
             }
         }
     }
 
     // Clean up System V semaphores sets
     {
-        let file = std::fs::File::open("/proc/sysvipc/sem").map_err(|e| {
-            errors::InvokerFailure(format!("Failed to open /proc/sysvipc/sem: {:?}", e))
-        })?;
+        let file = std::fs::File::open("/proc/sysvipc/sem")
+            .context_invoker("Failed to open /proc/sysvipc/sem")?;
 
         let mut semids: Vec<libc::c_int> = Vec::new();
 
         // Skip header
         for line in std::io::BufReader::new(file).lines().skip(1) {
-            let line = line.map_err(|e| {
-                errors::InvokerFailure(format!("Failed to read /proc/sysvipc/sem: {:?}", e))
-            })?;
+            let line = line.context_invoker("Failed to read /proc/sysvipc/sem")?;
             let mut it = line.trim().split_ascii_whitespace();
 
-            it.next().ok_or_else(|| {
-                errors::InvokerFailure("Invalid format of /proc/sysvipc/sem".to_string())
-            })?;
+            it.next()
+                .context_invoker("Invalid format of /proc/sysvipc/sem")?;
 
             let semid = it
                 .next()
-                .ok_or_else(|| {
-                    errors::InvokerFailure("Invalid format of /proc/sysvipc/sem".to_string())
-                })?
+                .context_invoker("Invalid format of /proc/sysvipc/sem")?
                 .parse()
-                .map_err(|e| {
-                    errors::InvokerFailure(format!(
-                        "Invalid format of semid in /proc/sysvipc/sem: {:?}",
-                        e
-                    ))
-                })?;
+                .context_invoker("Invalid format of semid in /proc/sysvipc/sem")?;
 
             semids.push(semid);
         }
 
         for semid in semids {
             if unsafe { libc::semctl(semid, 0, libc::IPC_RMID) } == -1 {
-                return Err(errors::InvokerFailure(format!(
-                    "Failed to delete System V semaphore #{}: {:?}",
-                    semid,
-                    std::io::Error::last_os_error()
-                )));
+                return Err(std::io::Error::last_os_error().with_context_invoker(|| {
+                    format!("Failed to delete System V semaphore #{}", semid,)
+                }));
             }
         }
     }
 
     // Clean up System V shared memory segments
     {
-        let file = std::fs::File::open("/proc/sysvipc/shm").map_err(|e| {
-            errors::InvokerFailure(format!("Failed to open /proc/sysvipc/shm: {:?}", e))
-        })?;
+        let file = std::fs::File::open("/proc/sysvipc/shm")
+            .context_invoker("Failed to open /proc/sysvipc/shm")?;
 
         let mut shmids: Vec<libc::c_int> = Vec::new();
 
         // Skip header
         for line in std::io::BufReader::new(file).lines().skip(1) {
-            let line = line.map_err(|e| {
-                errors::InvokerFailure(format!("Failed to read /proc/sysvipc/shm: {:?}", e))
-            })?;
+            let line = line.context_invoker("Failed to read /proc/sysvipc/shm")?;
             let mut it = line.trim().split_ascii_whitespace();
 
-            it.next().ok_or_else(|| {
-                errors::InvokerFailure("Invalid format of /proc/sysvipc/shm".to_string())
-            })?;
+            it.next()
+                .context_invoker("Invalid format of /proc/sysvipc/shm")?;
 
             let shmid = it
                 .next()
-                .ok_or_else(|| {
-                    errors::InvokerFailure("Invalid format of /proc/sysvipc/shm".to_string())
-                })?
+                .context_invoker("Invalid format of /proc/sysvipc/shm")?
                 .parse()
-                .map_err(|e| {
-                    errors::InvokerFailure(format!(
-                        "Invalid format of shmid in /proc/sysvipc/shm: {:?}",
-                        e
-                    ))
-                })?;
+                .context_invoker("Invalid format of shmid in /proc/sysvipc/shm")?;
 
             shmids.push(shmid);
         }
 
         for shmid in shmids {
             if unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) } == -1 {
-                return Err(errors::InvokerFailure(format!(
-                    "Failed to delete System V shared memory #{}: {:?}",
-                    shmid,
-                    std::io::Error::last_os_error()
-                )));
+                return Err(std::io::Error::last_os_error().with_context_invoker(|| {
+                    format!("Failed to delete System V shared memory #{}", shmid,)
+                }));
             }
         }
     }
@@ -863,24 +679,19 @@ async fn isolated_entry<T: Object + 'static>(
     // - A PID namespace it's not usable after init (the process with pid 1, that is) dies, and we
     //   can't make sure our init wasn't tampered with if we reuse the namespace;
     if unsafe { libc::unshare(CLONE_NEWNS | CLONE_NEWPID) } != 0 {
-        return Err(errors::InvokerFailure(format!(
-            "Failed to unshare mount namespace: {:?}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(
+            std::io::Error::last_os_error().context_invoker("Failed to unshare mount namespace")
+        );
     }
 
     // Switch to root user
     if unsafe { libc::setuid(0) } != 0 {
-        return Err(errors::InvokerFailure(format!(
-            "setuid(0) failed while entering sandbox: {:?}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(std::io::Error::last_os_error()
+            .context_invoker("setuid(0) failed while entering sandbox"));
     }
     if unsafe { libc::setgid(0) } != 0 {
-        return Err(errors::InvokerFailure(format!(
-            "setgid(0) failed while entering sandbox: {:?}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(std::io::Error::last_os_error()
+            .context_invoker("setgid(0) failed while entering sandbox"));
     }
 
     // Instead of pivot_root'ing directly into .../overlay/root, we pivot_root into .../overlay
@@ -908,45 +719,27 @@ async fn isolated_entry<T: Object + 'static>(
     // due to the use of user namespaces.
     let overlay = format!("/tmp/sunwalker_invoker/worker/rootfs/{}/overlay", rootfs_id);
 
-    system::bind_mount_opt(&overlay, &overlay, system::MS_REC).map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to bind-mount {} onto itself: {:?}",
-            overlay, e
-        ))
-    })?;
+    system::bind_mount_opt(&overlay, &overlay, system::MS_REC)
+        .with_context_invoker(|| format!("Failed to bind-mount {} onto itself", overlay))?;
 
     // Change root to .../overlay
-    std::env::set_current_dir(&overlay).map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to chdir to new root at {}: {:?}",
-            overlay, e
-        ))
-    })?;
-    nix::unistd::pivot_root(".", ".")
-        .map_err(|e| errors::InvokerFailure(format!("Failed to pivot_root: {:?}", e)))?;
-    system::umount_opt(".", system::MNT_DETACH)
-        .map_err(|e| errors::InvokerFailure(format!("Failed to unmount self: {:?}", e)))?;
+    std::env::set_current_dir(&overlay)
+        .with_context_invoker(|| format!("Failed to chdir to new root at {}", overlay,))?;
+    nix::unistd::pivot_root(".", ".").context_invoker("Failed to pivot_root")?;
+    system::umount_opt(".", system::MNT_DETACH).context_invoker("Failed to unmount self")?;
 
     // Chroot into .../overlay/root
-    std::env::set_current_dir("/root")
-        .map_err(|e| errors::InvokerFailure(format!("Failed to chdir to /root: {:?}", e)))?;
-    nix::unistd::chroot(".")
-        .map_err(|e| errors::InvokerFailure(format!("Failed to chroot into /root: {:?}", e)))?;
+    std::env::set_current_dir("/root").context_invoker("Failed to chdir to /root")?;
+    nix::unistd::chroot(".").context_invoker("Failed to chroot into /root")?;
 
     // POSIX message queues are stored in /dev/mqueue, which we can simply remount instead of
     // cleaning up queue-by-queue. It is also sort of a necessity, because the IPC that the mqueuefs
     // is related to depends on when it's mounted.
     system::mount("mqueue", "/dev/mqueue", "mqueue", 0, None)
-        .map_err(|e| errors::InvokerFailure(format!("Failed to mount /dev/mqueue: {:?}", e)))?;
+        .context_invoker("Failed to mount /dev/mqueue")?;
     // rwxrwxrwt
-    std::fs::set_permissions("/dev/mqueue", std::fs::Permissions::from_mode(0o1777)).map_err(
-        |e| {
-            errors::InvokerFailure(format!(
-                "Failed to make /dev/mqueue world-writable: {:?}",
-                e
-            ))
-        },
-    )?;
+    std::fs::set_permissions("/dev/mqueue", std::fs::Permissions::from_mode(0o1777))
+        .context_invoker("Failed to make /dev/mqueue world-writable")?;
 
     // Expose defaults for environment variables
     std::env::set_var(
@@ -990,16 +783,12 @@ async fn isolated_entry<T: Object + 'static>(
 
     // Switch to fake user
     if unsafe { libc::setgid(1000) } != 0 {
-        return Err(errors::InvokerFailure(format!(
-            "setgid(1000) failed while entering sandbox: {:?}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(std::io::Error::last_os_error()
+            .context_invoker("setgid(1000) failed while entering sandbox"));
     }
     if unsafe { libc::setuid(1000) } != 0 {
-        return Err(errors::InvokerFailure(format!(
-            "setuid(1000) failed while entering sandbox: {:?}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(std::io::Error::last_os_error()
+            .context_invoker("setuid(1000) failed while entering sandbox"));
     }
 
     f()

@@ -1,5 +1,6 @@
 use crate::{
     errors,
+    errors::{ToError, ToResult},
     image::{config, package, program, sandbox},
     system,
 };
@@ -32,12 +33,7 @@ impl LanguageImpl {
             },
             "identify".to_string(),
         )
-        .map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to make sandbox for identification: {:?}",
-                e
-            ))
-        })?;
+        .context_invoker("Failed to make sandbox for identification")?;
         let ns = sandbox::make_namespace("identify".to_string()).await?;
 
         // Enter the sandbox in another process
@@ -54,12 +50,9 @@ impl LanguageImpl {
             ));
         }
 
-        rootfs
-            .remove()
-            .map_err(|e| errors::InvokerFailure(format!("Failed to remove rootfs: {:?}", e)))?;
+        rootfs.remove().context_invoker("Failed to remove rootfs")?;
 
-        ns.remove()
-            .map_err(|e| errors::InvokerFailure(format!("Failed to remove namespace: {:?}", e)))?;
+        ns.remove().context_invoker("Failed to remove namespace")?;
 
         Ok(identification)
     }
@@ -151,38 +144,23 @@ impl LanguageImpl {
             },
             "build".to_string(),
         )
-        .map_err(|e| {
-            errors::InvokerFailure(format!("Failed to make sandbox for build: {:?}", e))
-        })?;
+        .context_invoker("Failed to make sandbox for build")?;
         let ns = sandbox::make_namespace("build".to_string()).await?;
 
         // Add /space/artifacts -> /tmp/sunwalker_invoker/artifacts/{build_id}
         let artifacts_path =
             PathBuf::from(format!("/tmp/sunwalker_invoker/artifacts/{}", build_id));
         let overlay_artifacts_path = format!("{}/space/artifacts", rootfs.overlay());
-        std::fs::create_dir(&artifacts_path).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to create {:?}: {:?}", artifacts_path, e))
-        })?;
-        std::fs::create_dir(&overlay_artifacts_path).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to create {}: {:?}",
-                overlay_artifacts_path, e
-            ))
-        })?;
-        system::bind_mount(&artifacts_path, &overlay_artifacts_path).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to bind-mount {:?}: {:?}",
-                artifacts_path, e
-            ))
-        })?;
+        std::fs::create_dir(&artifacts_path)
+            .with_context_invoker(|| format!("Failed to create {:?}", artifacts_path))?;
+        std::fs::create_dir(&overlay_artifacts_path)
+            .with_context_invoker(|| format!("Failed to create {}", overlay_artifacts_path))?;
+        system::bind_mount(&artifacts_path, &overlay_artifacts_path)
+            .with_context_invoker(|| format!("Failed to bind-mount {:?}", artifacts_path))?;
 
         // Allow the sandbox user to access data
-        std::os::unix::fs::chown(&overlay_artifacts_path, Some(1), Some(1)).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to chown {}: {:?}",
-                overlay_artifacts_path, e
-            ))
-        })?;
+        std::os::unix::fs::chown(&overlay_artifacts_path, Some(1), Some(1))
+            .with_context_invoker(|| format!("Failed to chown {}", overlay_artifacts_path))?;
 
         // Enter the sandbox in another process
         let (pattern, log) = sandbox::run_isolated(
@@ -199,12 +177,9 @@ impl LanguageImpl {
         )
         .await?;
 
-        rootfs
-            .remove()
-            .map_err(|e| errors::InvokerFailure(format!("Failed to remove rootfs: {:?}", e)))?;
+        rootfs.remove().context_invoker("Failed to remove rootfs")?;
 
-        ns.remove()
-            .map_err(|e| errors::InvokerFailure(format!("Failed to remove namespace: {:?}", e)))?;
+        ns.remove().context_invoker("Failed to remove namespace")?;
 
         let prerequisites: Vec<String> = lisp::evaluate(
             config.run.prerequisites.clone(),
@@ -257,16 +232,14 @@ impl Language {
             .config
             .packages
             .get(&package.name)
-            .ok_or_else(|| {
-                errors::InvokerFailure(format!("Package {} not found in the image", package.name))
-            })?
+            .with_context_invoker(|| format!("Package {} not found in the image", package.name))?
             .languages
             .get(name)
-            .ok_or_else(|| {
-                errors::InvokerFailure(format!(
+            .with_context_invoker(|| {
+                format!(
                     "Packages {} does not provide language {}",
                     package.name, name
-                ))
+                )
             })?;
 
         Ok(Language {
@@ -378,14 +351,9 @@ fn mv(call: lisp::CallTerm, state: &lisp::State) -> Result<lisp::TypedRef, lisp:
 #[multiprocessing::entrypoint]
 fn identify(term: lisp::Term) -> Result<String, errors::Error> {
     lisp::evaluate(term, &lisp::State::new())
-        .map_err(|e| errors::InvokerFailure(format!("Failed to identify: {:?}", e)))?
+        .context_invoker("Failed to identify")?
         .to_native()
-        .map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to interpret identify result as a string: {:?}",
-                e
-            ))
-        })
+        .context_invoker("Failed to interpret identify result as a string")
 }
 
 #[multiprocessing::entrypoint]
@@ -399,37 +367,26 @@ fn build(
         config.base_rule.clone(),
         &lisp::State::new().var("$base".to_string(), pre_pattern.clone()),
     )
-    .map_err(|e| errors::InvokerFailure(format!("Failed to evaluate pattern: {:?}", e)))?
+    .context_invoker("Failed to evaluate pattern")?
     .to_native()
-    .map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to parse the pattern generated by the schema as a string: {:?}",
-            e
-        ))
-    })?;
+    .context_invoker("Failed to parse the pattern generated by the schema as a string")?;
 
     if pre_pattern != pattern {
         // Rename files according to new pattern
         for pattern in patterns {
             let old_path = Path::new("/space").join(pattern.replace("%", &pre_pattern));
             let new_path = Path::new("/space").join(pattern.replace("%", &pattern));
-            std::fs::write(&new_path, "").map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Failed to create file {:?} on overlay: {:?}",
-                    new_path, e
-                ))
+            std::fs::write(&new_path, "").with_context_invoker(|| {
+                format!("Failed to create file {:?} on overlay", new_path)
             })?;
-            system::move_mount(&old_path, &new_path).map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Failed to move mount {:?} -> {:?} on overlay: {:?}",
-                    &old_path, new_path, e
-                ))
+            system::move_mount(&old_path, &new_path).with_context_invoker(|| {
+                format!(
+                    "Failed to move mount {:?} -> {:?} on overlay",
+                    &old_path, new_path
+                )
             })?;
-            std::fs::remove_file(&old_path).map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Failed to remove old file {:?} on overlay: {:?}",
-                    old_path, e
-                ))
+            std::fs::remove_file(&old_path).with_context_invoker(|| {
+                format!("Failed to remove old file {:?} on overlay", old_path)
             })?;
         }
     }
@@ -441,28 +398,18 @@ fn build(
             if e.message.starts_with("Process failed: ") {
                 errors::UserFailure(e.message)
             } else {
-                errors::InvokerFailure(format!("Failed to build the program: {:?}", e))
+                e.context_invoker("Failed to build the program")
             }
         })?
         .to_native()
-        .map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to parse compilation log as a string: {:?}",
-                e
-            ))
-        })?;
+        .context_invoker("Failed to parse compilation log as a string")?;
 
     let run_prerequisites: Vec<String> = lisp::evaluate(config.run.prerequisites.clone(), &state)
-        .map_err(|e| {
-            errors::InvokerFailure(format!("Failed to evaluate run.prerequisites: {:?}", e))
-        })?
+        .context_invoker("Failed to evaluate run.prerequisites")?
         .to_native()
-        .map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to parse prerequisites generated by the schema as vector of strings: {:?}",
-                e
-            ))
-        })?;
+        .context_invoker(
+            "Failed to parse prerequisites generated by the schema as vector of strings",
+        )?;
 
     // Copy run prerequisites to artifacts.
     // TODO: this can be optimized further. If a prerequisite is an artifact of the build
@@ -471,11 +418,11 @@ fn build(
     for rel_path in run_prerequisites.into_iter() {
         let from = Path::new("/space").join(&rel_path);
         let to = Path::new("/space/artifacts").join(&rel_path);
-        std::fs::copy(&from, &to).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to copy artifact {} from {:?} to {:?}: {:?}",
-                rel_path, from, to, e
-            ))
+        std::fs::copy(&from, &to).with_context_invoker(|| {
+            format!(
+                "Failed to copy artifact {} from {:?} to {:?}",
+                rel_path, from, to
+            )
         })?;
     }
 

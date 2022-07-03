@@ -1,4 +1,4 @@
-use crate::{errors, image::strategy};
+use crate::{errors, errors::ToResult, image::strategy};
 use multiprocessing::Object;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -30,11 +30,11 @@ pub struct ProblemRevisionData {
 
 impl ProblemRevision {
     pub fn load_from_cache(path: &Path) -> Result<Self, errors::Error> {
-        let config = std::fs::read(path.join("judging.msgpack")).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Could not read judging.msgpack to load problem from cache at {:?}: {:?}",
-                path, e
-            ))
+        let config = std::fs::read(path.join("judging.msgpack")).with_context_invoker(|| {
+            format!(
+                "Could not read judging.msgpack to load problem from cache at {:?}",
+                path
+            )
         })?;
 
         let mut config: Self = rmp_serde::from_slice(&config).map_err(|e| {

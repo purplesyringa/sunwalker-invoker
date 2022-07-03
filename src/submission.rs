@@ -1,5 +1,6 @@
 use crate::{
     errors,
+    errors::ToResult,
     image::{language, program},
     problem::{problem, verdict},
     worker,
@@ -35,11 +36,8 @@ impl Submission {
         language: language::Language,
     ) -> Result<Submission, errors::Error> {
         let root = format!("/tmp/sunwalker_invoker/submissions/{}", id);
-        std::fs::create_dir(&root).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to create a directory for submission {} at {}: {:?}",
-                id, root, e
-            ))
+        std::fs::create_dir(&root).with_context_invoker(|| {
+            format!("Failed to create a directory for submission at {}", root)
         })?;
 
         Ok(Submission {
@@ -57,11 +55,11 @@ impl Submission {
 
     pub fn add_source_file(&mut self, name: &str, content: &[u8]) -> Result<(), errors::Error> {
         let path = format!("/tmp/sunwalker_invoker/submissions/{}/{}", self.id, name);
-        std::fs::write(&path, content).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to write a source code file for submission {} at {}: {:?}",
-                self.id, path, e
-            ))
+        std::fs::write(&path, content).with_context_invoker(|| {
+            format!(
+                "Failed to write a source code file for submission at {}",
+                path
+            )
         })?;
         self.source_files.push(path);
         Ok(())

@@ -1,4 +1,4 @@
-use crate::{client, errors, problem::problem};
+use crate::{client, errors, errors::ToResult, problem::problem};
 use anyhow::{bail, Context};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -48,18 +48,18 @@ impl ProblemStore {
             let _guard = mutex.lock().await;
 
             if !root_path.exists() {
-                std::fs::create_dir_all(&root_path).map_err(|e| {
-                    errors::InvokerFailure(format!(
-                        "Failed to create directory {:?}: {:?}",
-                        root_path, e
-                    ))
+                std::fs::create_dir_all(&root_path).with_context_invoker(|| {
+                    format!("Failed to create directory {:?}", root_path)
                 })?;
             }
 
             if !root_path.join(".ready").exists() {
                 self.communicator
                     .download_archive(&topic, root_path.as_ref())
-                    .await?;
+                    .await
+                    .with_context_invoker(|| {
+                        format!("Failed to load archive for topic {}", topic)
+                    })?;
             }
         }
 

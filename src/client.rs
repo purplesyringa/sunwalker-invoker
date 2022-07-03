@@ -1,4 +1,6 @@
-use crate::{cgroups, config, errors, image, init, message, problem, submission, system};
+use crate::{
+    cgroups, config, errors, errors::ToResult, image, init, message, problem, submission, system,
+};
 use anyhow::Context;
 use futures::stream::{SplitSink, SplitStream};
 use futures_util::SinkExt;
@@ -84,12 +86,8 @@ impl Communicator {
         ))
         .await?;
 
-        rx.await.map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Did not receive response to request of file {}: {:?}",
-                hash, e
-            ))
-        })?
+        rx.await
+            .context_invoker("Did not receive response to request of file")?
     }
 
     pub async fn download_archive(
@@ -98,11 +96,13 @@ impl Communicator {
         target_path: &Path,
     ) -> Result<(), errors::Error> {
         std::fs::remove_dir_all(target_path);
-        std::fs::create_dir_all(target_path).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to create {:?}: {:?}", target_path, e))
-        })?;
+        std::fs::create_dir_all(target_path)
+            .context_invoker("Failed to create target directory")?;
 
-        let manifest = self.request_file(&format!("manifest/{}", topic)).await?;
+        let manifest = self
+            .request_file(&format!("manifest/{}", topic))
+            .await
+            .context_invoker("Failed to load manifest")?;
 
         let manifest = std::str::from_utf8(&manifest).map_err(|e| {
             errors::ConfigurationFailure(format!("Invalid manifest for topic {}: {:?}", topic, e))
@@ -112,9 +112,8 @@ impl Communicator {
             if line.ends_with('/') {
                 // Directory
                 let dir_path = target_path.join(&line);
-                std::fs::create_dir(&dir_path).map_err(|e| {
-                    errors::InvokerFailure(format!("Failed to create {:?}: {:?}", dir_path, e))
-                })?;
+                std::fs::create_dir(&dir_path)
+                    .with_context_invoker(|| format!("Failed to create {:?}", dir_path))?;
             } else {
                 // File
                 let mut executable = false;
@@ -124,54 +123,41 @@ impl Communicator {
                 }
 
                 // TODO: deduplication
-                let (hash, file) = line.split_once(' ').ok_or_else(|| {
-                    errors::InvokerFailure(format!(
-                        "Invalid manifest for topic {}: invalid line format",
-                        topic
-                    ))
-                })?;
+                let (hash, file) = line
+                    .split_once(' ')
+                    .context_invoker("Invalid manifest: invalid line format")?;
 
                 // TODO: stream directly to file without loading to RAM
-                let data = self.request_file(hash).await.map_err(|e| {
-                    errors::InvokerFailure(format!(
-                        "Failed to download file {} from package {}: {:?}",
-                        file, topic, e
-                    ))
-                })?;
+                let data = self
+                    .request_file(hash)
+                    .await
+                    .with_context_invoker(|| format!("Failed to download file {}", file))?;
 
                 let file_path = target_path.join(&file);
-                std::fs::write(&file_path, data).map_err(|e| {
-                    errors::InvokerFailure(format!("Failed to write to {:?}: {:?}", file_path, e))
-                })?;
+                std::fs::write(&file_path, data)
+                    .with_context_invoker(|| format!("Failed to write to {:?}", file_path))?;
 
                 if executable {
                     let mut permissions = file_path
                         .metadata()
-                        .map_err(|e| {
-                            errors::InvokerFailure(format!(
-                                "Failed to get metadata of {:?}: {:?}",
-                                file_path, e
-                            ))
+                        .with_context_invoker(|| {
+                            format!("Failed to get metadata of {:?}", file_path)
                         })?
                         .permissions();
 
                     // Whoever can read can also execute
                     permissions.set_mode(permissions.mode() | ((permissions.mode() & 0o444) >> 2));
 
-                    std::fs::set_permissions(&file_path, permissions).map_err(|e| {
-                        errors::InvokerFailure(format!(
-                            "Failed to make {:?} executable: {:?}",
-                            file_path, e
-                        ))
-                    })?
+                    std::fs::set_permissions(&file_path, permissions).with_context_invoker(
+                        || format!("Failed to make {:?} executable", file_path),
+                    )?
                 }
             }
         }
 
         let ready_path = target_path.join(".ready");
-        std::fs::write(&ready_path, b"").map_err(|e| {
-            errors::InvokerFailure(format!("Failed to write to {:?}: {:?}", ready_path, e))
-        })?;
+        std::fs::write(&ready_path, b"")
+            .with_context_invoker(|| format!("Failed to write to {:?}", ready_path))?;
 
         Ok(())
     }
@@ -532,10 +518,10 @@ async fn supply_file(
             ))
         })?;
 
-    tx.send(Ok(message.contents)).map_err(|e| {
+    tx.send(Ok(message.contents)).map_err(|_| {
         errors::InvokerFailure(format!(
-            "Conductor sent reply to message #{}, but its handler is dead: {:?}",
-            message.request_id, e
+            "Conductor sent reply to message #{}, but its handler is dead",
+            message.request_id
         ))
     })
 }

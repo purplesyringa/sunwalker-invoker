@@ -1,5 +1,6 @@
 use crate::{
     errors,
+    errors::ToResult,
     image::{language, program, sandbox, strategy},
     problem::{problem, verdict},
     submission,
@@ -44,15 +45,11 @@ impl Worker {
         strategy_factory: strategy::StrategyFactory,
         problem_revision_data: problem::ProblemRevisionData,
     ) -> Result<Worker, errors::Error> {
-        let (tx_i2w_command, rx_i2w_command) = channel().map_err(|e| {
-            errors::InvokerFailure(format!("Failed to create an IPC channel: {:?}", e))
-        })?;
-        let (tx_i2w_urgent, rx_i2w_urgent) = channel().map_err(|e| {
-            errors::InvokerFailure(format!("Failed to create an IPC channel: {:?}", e))
-        })?;
-        let (tx_w2i, rx_w2i) = channel().map_err(|e| {
-            errors::InvokerFailure(format!("Failed to create an IPC channel: {:?}", e))
-        })?;
+        let (tx_i2w_command, rx_i2w_command) =
+            channel().context_invoker("Failed to create an IPC channel")?;
+        let (tx_i2w_urgent, rx_i2w_urgent) =
+            channel().context_invoker("Failed to create an IPC channel")?;
+        let (tx_w2i, rx_w2i) = channel().context_invoker("Failed to create an IPC channel")?;
 
         let child = subprocess_main
             .spawn_tokio(
@@ -68,9 +65,7 @@ impl Worker {
                 problem_revision_data,
             )
             .await
-            .map_err(|e| {
-                errors::InvokerFailure(format!("Failed to spawn a worker subprocess: {:?}", e))
-            })?;
+            .context_invoker("Failed to spawn a worker subprocess")?;
 
         Ok(Worker {
             tx_i2w_command: Some(Arc::new(Mutex::new(tx_i2w_command))),
@@ -88,11 +83,7 @@ impl Worker {
         let tx_i2w_command = self
             .tx_i2w_command
             .as_ref()
-            .ok_or_else(|| {
-                errors::InvokerFailure(
-                    "Cannot execute command on worker after finalization".to_string(),
-                )
-            })?
+            .context_invoker("Cannot execute command on worker after finalization")?
             .clone();
 
         let rx_w2i = self.rx_w2i.clone();
@@ -109,29 +100,14 @@ impl Worker {
                     .await
                     .send(&command)
                     .await
-                    .map_err(|e| {
-                        errors::InvokerFailure(format!(
-                            "Failed to send command to the worker: {:?}",
-                            e
-                        ))
-                    })?;
+                    .context_invoker("Failed to send command to the worker")?;
 
                 for _ in 0..n_messages {
                     let msg = rx_w2i
                         .recv()
                         .await
-                        .map_err(|e| {
-                            errors::InvokerFailure(format!(
-                                "Failed to receive response to {:?} from the worker: {:?}",
-                                command, e
-                            ))
-                        })?
-                        .ok_or_else(|| {
-                            errors::InvokerFailure(format!(
-                                "No response to {:?} from the worker",
-                                command
-                            ))
-                        })?;
+                        .context_invoker("Failed to receive response from the worker")?
+                        .context_invoker("No response from the worker: preemptive termination")?;
                     if let Err(e) = tx.send(msg) {
                         println!("Response to a command is ignored: {:?}", e);
                     }
@@ -149,19 +125,12 @@ impl Worker {
     pub async fn add_failed_tests(&self, tests: Vec<u64>) -> Result<(), errors::Error> {
         self.tx_i2w_urgent
             .as_ref()
-            .ok_or_else(|| {
-                errors::InvokerFailure("Cannot add failed tests after finalization".to_string())
-            })?
+            .context_invoker("Cannot add failed tests after finalization")?
             .lock()
             .await
             .send(&I2WUrgentCommand::AddFailedTests(tests))
             .await
-            .map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Failed to notify the worker subprocess about failed tests: {:?}",
-                    e
-                ))
-            })
+            .context_invoker("Failed to notify the worker subprocess about failed tests")
     }
 
     pub async fn finalize(&mut self) -> Result<(), errors::Error> {
@@ -217,9 +186,7 @@ pub async fn subprocess_main(
     problem_revision_data: problem::ProblemRevisionData,
 ) -> Result<(), errors::Error> {
     let mut tx_w2i = {
-        sandbox::enter_worker_space(core).map_err(|e| {
-            errors::InvokerFailure(format!("Failed to enter worker space: {:?}", e))
-        })?;
+        sandbox::enter_worker_space(core).context_invoker("Failed to enter worker space")?;
 
         let strategy = match program {
             Some(ref program) => Some(strategy_factory.make(program).await?),
@@ -242,9 +209,11 @@ pub async fn subprocess_main(
                 problem_revision_data,
             };
 
-            while let Some(command) = rx_i2w_command.recv().await.map_err(|e| {
-                errors::InvokerFailure(format!("Failed to receive command from invoker: {:?}", e))
-            })? {
+            while let Some(command) = rx_i2w_command
+                .recv()
+                .await
+                .context_invoker("Failed to receive command from invoker")?
+            {
                 proc.handle_core_command(command.clone(), &mut main).await?;
             }
 
@@ -252,34 +221,31 @@ pub async fn subprocess_main(
         });
 
         let urgent_commands_future = tokio::spawn(async move {
-            while let Some(command) = rx_i2w_urgent.recv().await.map_err(|e| {
-                errors::InvokerFailure(format!(
-                    "Failed to receive urgent command from invoker: {:?}",
-                    e
-                ))
-            })? {
+            while let Some(command) = rx_i2w_urgent
+                .recv()
+                .await
+                .context_invoker("Failed to receive urgent command from invoker")?
+            {
                 subprocess.handle_urgent_command(command).await?;
             }
             Ok(())
         });
 
-        let tx_w2i = commands_future.await.map_err(|e| {
-            errors::InvokerFailure(format!("Worker main loop returned error: {:?}", e))
-        })??;
+        let tx_w2i = commands_future
+            .await
+            .context_invoker("Worker main loop returned error")??;
 
-        urgent_commands_future.await.map_err(|e| {
-            errors::InvokerFailure(format!("Worker urgent returned error: {:?}", e))
-        })??;
+        urgent_commands_future
+            .await
+            .context_invoker("Worker urgent loop returned error")??;
 
         tx_w2i
     };
 
-    tx_w2i.send(&W2IMessage::Finalized).await.map_err(|e| {
-        errors::InvokerFailure(format!(
-            "Failed to send finalization notification to invoker: {:?}",
-            e
-        ))
-    })?;
+    tx_w2i
+        .send(&W2IMessage::Finalized)
+        .await
+        .context_invoker("Failed to send finalization notification to invoker")?;
 
     Ok(())
 }
@@ -304,12 +270,10 @@ impl Subprocess {
                     W2IMessage::CompilationResult(program, log)
                 };
                 let res = res.unwrap_or_else(|e| W2IMessage::Failure(e));
-                main.tx_w2i.send(&res).await.map_err(|e| {
-                    errors::InvokerFailure(format!(
-                        "Failed to send command result to invoker: {:?}",
-                        e
-                    ))
-                })
+                main.tx_w2i
+                    .send(&res)
+                    .await
+                    .context_invoker("Failed to send command result to invoker")
             }
 
             submission::Command::Test(tests) => {
@@ -320,12 +284,10 @@ impl Subprocess {
                         .await
                         .is_test_enabled(test)
                     {
-                        main.tx_w2i.send(&W2IMessage::Aborted).await.map_err(|e| {
-                            errors::InvokerFailure(format!(
-                                "Failed to send command result to invoker: {:?}",
-                                e
-                            ))
-                        })?;
+                        main.tx_w2i
+                            .send(&W2IMessage::Aborted)
+                            .await
+                            .context_invoker("Failed to send command result to invoker")?;
                         continue;
                     }
 
@@ -364,25 +326,20 @@ impl Subprocess {
 
                     let message = result.unwrap_or(W2IMessage::Aborted);
 
-                    main.tx_w2i.send(&message).await.map_err(|e| {
-                        errors::InvokerFailure(format!(
-                            "Failed to send command result to invoker: {:?}",
-                            e
-                        ))
-                    })?;
+                    main.tx_w2i
+                        .send(&message)
+                        .await
+                        .context_invoker("Failed to send command result to invoker")?;
                 }
 
                 Ok(())
             }
 
-            submission::Command::Finalize => {
-                main.tx_w2i.send(&W2IMessage::Finalized).await.map_err(|e| {
-                    errors::InvokerFailure(format!(
-                        "Failed to send command result to invoker: {:?}",
-                        e
-                    ))
-                })
-            }
+            submission::Command::Finalize => main
+                .tx_w2i
+                .send(&W2IMessage::Finalized)
+                .await
+                .context_invoker("Failed to send command result to invoker"),
         }
     }
 

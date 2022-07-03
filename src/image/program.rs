@@ -1,5 +1,6 @@
 use crate::{
     errors,
+    errors::ToResult,
     image::{image, package, sandbox},
 };
 use multiprocessing::Object;
@@ -80,13 +81,11 @@ impl Program {
             },
             id.clone(),
         )
-        .map_err(|e| {
-            errors::InvokerFailure(format!("Failed to make rootfs for running: {:?}", e))
-        })?;
+        .context_invoker("Failed to make rootfs for running")?;
 
-        let namespace = sandbox::make_namespace(id).await.map_err(|e| {
-            errors::InvokerFailure(format!("Failed to make namespace for running: {:?}", e))
-        })?;
+        let namespace = sandbox::make_namespace(id)
+            .await
+            .context_invoker("Failed to make namespace for running")?;
 
         Ok(InvocableProgram {
             program: self,
@@ -96,11 +95,11 @@ impl Program {
     }
 
     pub fn remove(self) -> Result<(), errors::Error> {
-        std::fs::remove_dir_all(&self.artifacts_path).map_err(|e| {
-            errors::InvokerFailure(format!(
-                "Failed to remove program artifacts at {:?}: {:?}",
-                self.artifacts_path, e
-            ))
+        std::fs::remove_dir_all(&self.artifacts_path).with_context_invoker(|| {
+            format!(
+                "Failed to remove program artifacts at {:?}",
+                self.artifacts_path
+            )
         })
     }
 }
