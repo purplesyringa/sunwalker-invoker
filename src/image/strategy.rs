@@ -8,7 +8,10 @@ use crate::{
 use multiprocessing::{Bind, Object};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::os::unix::io::{FromRawFd, OwnedFd};
+use std::os::unix::{
+    fs::OpenOptionsExt,
+    io::{FromRawFd, OwnedFd},
+};
 use std::path::PathBuf;
 
 #[derive(Clone, Object, Deserialize, Serialize)]
@@ -477,9 +480,10 @@ impl<'a> StrategyRun<'a> {
                     // Handled later
                 }
                 FileType::Fifo => {
+                    let path = format!("{}/{name}", self.aux);
                     nix::unistd::mkfifo::<str>(
-                        format!("{}/{name}", self.aux).as_ref(),
-                        nix::sys::stat::Mode::from_bits_truncate(0666),
+                        &path,
+                        nix::sys::stat::Mode::from_bits_truncate(0600),
                     )
                     .with_context_invoker(|| {
                         format!(
@@ -487,10 +491,16 @@ impl<'a> StrategyRun<'a> {
                             self.aux
                         )
                     })?;
+                    std::os::unix::fs::chown(&path, Some(1), Some(1))
+                        .with_context_invoker(|| format!("Failed to chown {path}"))?;
                 }
                 FileType::Pipe => {
                     let (rx, tx) = nix::unistd::pipe()
                         .context_invoker("Failed to create a pipe to start running a strategy")?;
+                    nix::sys::stat::fchmod(rx, nix::sys::stat::Mode::from_bits_truncate(0444))
+                        .context_invoker("Failed to make a pipe world-readable")?;
+                    nix::sys::stat::fchmod(tx, nix::sys::stat::Mode::from_bits_truncate(0222))
+                        .context_invoker("Failed to make a pipe world-writable")?;
                     pipes.insert(name.to_string(), unsafe {
                         (OwnedFd::from_raw_fd(rx), OwnedFd::from_raw_fd(tx))
                     });
@@ -520,9 +530,11 @@ impl<'a> StrategyRun<'a> {
                         // writes to it
                         let overlay = program.rootfs.overlay();
                         let path = format!("{overlay}/space/.file-{name}");
-                        std::fs::write(&path, b"").with_context_invoker(|| {
+                        std::fs::write(&path, "").with_context_invoker(|| {
                             format!("Failed to touch file {path} to start running a strategy")
                         })?;
+                        std::os::unix::fs::chown(&path, Some(1), Some(1))
+                            .with_context_invoker(|| format!("Failed to chown {path}"))?;
                     }
                 }
 
