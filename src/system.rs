@@ -14,12 +14,8 @@ use std::path::Path;
 use std::ptr::null;
 
 pub fn to_cstring(data: &[u8]) -> Result<CString> {
-    CString::new(data).map_err(|e| {
-        Error::new(
-            ErrorKind::InvalidData,
-            format!("CString::new failed: {}", e),
-        )
-    })
+    CString::new(data)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("CString::new failed: {e}")))
 }
 
 pub fn mount<S: AsRef<Path>, T: AsRef<Path>>(

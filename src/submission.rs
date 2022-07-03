@@ -35,9 +35,9 @@ impl Submission {
         problem_revision: Arc<problem::ProblemRevision>,
         language: language::Language,
     ) -> Result<Submission, errors::Error> {
-        let root = format!("/tmp/sunwalker_invoker/submissions/{}", id);
+        let root = format!("/tmp/sunwalker_invoker/submissions/{id}");
         std::fs::create_dir(&root).with_context_invoker(|| {
-            format!("Failed to create a directory for submission at {}", root)
+            format!("Failed to create a directory for submission at {root}")
         })?;
 
         Ok(Submission {
@@ -54,12 +54,9 @@ impl Submission {
     }
 
     pub fn add_source_file(&mut self, name: &str, content: &[u8]) -> Result<(), errors::Error> {
-        let path = format!("/tmp/sunwalker_invoker/submissions/{}/{}", self.id, name);
+        let path = format!("/tmp/sunwalker_invoker/submissions/{}/{name}", self.id);
         std::fs::write(&path, content).with_context_invoker(|| {
-            format!(
-                "Failed to write a source code file for submission at {}",
-                path
-            )
+            format!("Failed to write a source code file for submission at {path}")
         })?;
         self.source_files.push(path);
         Ok(())
@@ -116,8 +113,7 @@ impl Submission {
             }
             Some(worker::W2IMessage::Failure(e)) => Err(e),
             _ => Err(errors::InvokerFailure(format!(
-                "Unexpected response to compilation request: {:?}",
-                response
+                "Unexpected response to compilation request: {response:?}"
             ))),
         }
     }
@@ -149,16 +145,14 @@ impl Submission {
                     worker::W2IMessage::TestResult(result) => Ok(result),
                     worker::W2IMessage::Failure(e) => Err(e),
                     _ => Err(errors::InvokerFailure(format!(
-                        "Unexpected response to judgement request: {:?}",
-                        judgement_result
+                        "Unexpected response to judgement request: {judgement_result:?}"
                     ))),
                 };
                 (
                     test,
                     judgement_result.unwrap_or_else(|e| verdict::TestJudgementResult {
                         verdict: verdict::TestVerdict::Bug(format!(
-                            "Failed to evaluate test: {:?}",
-                            e
+                            "Failed to evaluate test: {e:?}"
                         )),
                         logs: HashMap::new(),
                         real_time: std::time::Duration::ZERO,

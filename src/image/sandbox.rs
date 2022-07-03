@@ -37,7 +37,7 @@ pub struct Namespace {
 
 // Unmount everything beneath prefix recursively. Does not unmount prefix itself.
 fn unmount_recursively(prefix: &str) -> Result<(), errors::Error> {
-    let prefix_slash = format!("{}/", prefix);
+    let prefix_slash = format!("{prefix}/");
 
     let file = std::fs::File::open("/proc/self/mounts")
         .context_invoker("Failed to open /proc/self/mounts for reading")?;
@@ -57,7 +57,7 @@ fn unmount_recursively(prefix: &str) -> Result<(), errors::Error> {
     }
 
     for path in vec.into_iter().rev() {
-        system::umount(&path).with_context_invoker(|| format!("Failed to unmount {}", path))?;
+        system::umount(&path).with_context_invoker(|| format!("Failed to unmount {path}"))?;
     }
 
     Ok(())
@@ -86,10 +86,7 @@ pub fn enter_worker_space(core: u64) -> Result<(), errors::Error> {
     // Switch to core
     let pid = unsafe { libc::getpid() };
     cgroups::add_task_to_core(pid, core).with_context_invoker(|| {
-        format!(
-            "Failed to move current process (PID {}) to core {}",
-            pid, core
-        )
+        format!("Failed to move current process (PID {pid}) to core {core}")
     })?;
 
     Ok(())
@@ -127,38 +124,37 @@ pub fn make_rootfs(
     // /space and /dev are in the *second* lowerdir, so that the tmpfs doesn't have to handle all
     // the accesses to the permanent files just to return ENOENT.
 
-    let prefix = format!("/tmp/sunwalker_invoker/worker/rootfs/{}", id);
+    let prefix = format!("/tmp/sunwalker_invoker/worker/rootfs/{id}");
 
     std::fs::create_dir(&prefix).context_invoker("Failed to create directory <prefix>")?;
-    std::fs::create_dir(format!("{}/ephemeral", prefix))
+    std::fs::create_dir(format!("{prefix}/ephemeral"))
         .context_invoker("Failed to create directory <prefix>/ephemeral")?;
-    std::fs::create_dir(format!("{}/overlay", prefix))
+    std::fs::create_dir(format!("{prefix}/overlay"))
         .context_invoker("Failed to create directory <prefix>/overlay")?;
-    std::fs::create_dir(format!("{}/overlay/root", prefix))
+    std::fs::create_dir(format!("{prefix}/overlay/root"))
         .context_invoker("Failed to create directory <prefix>/overlay/root")?;
 
     // Create a lowerdir for /space and /dev
-    system::mount("none", format!("{}/ephemeral", prefix), "tmpfs", 0, None)
+    system::mount("none", format!("{prefix}/ephemeral"), "tmpfs", 0, None)
         .context_invoker("Failed to mount tmpfs on <prefix>/ephemeral")?;
-    std::fs::create_dir(format!("{}/ephemeral/space", prefix))
+    std::fs::create_dir(format!("{prefix}/ephemeral/space"))
         .context_invoker("Failed to create <prefix>/ephemeral/space")?;
-    std::fs::create_dir(format!("{}/ephemeral/dev", prefix))
+    std::fs::create_dir(format!("{prefix}/ephemeral/dev"))
         .context_invoker("Failed to create <prefix>/ephemeral/dev")?;
 
     // Mount overlay
     let fs_options = format!(
-        "lowerdir={}/{}:{}/ephemeral",
+        "lowerdir={}/{}:{prefix}/ephemeral",
         package
             .image
             .mountpoint
             .to_str()
             .context_invoker("Mountpoint must be a string")?,
-        package.name,
-        prefix,
+        package.name
     );
     system::mount(
         "overlay",
-        format!("{}/overlay/root", prefix),
+        format!("{prefix}/overlay/root"),
         "overlay",
         0,
         Some(&fs_options),
@@ -168,7 +164,7 @@ pub fn make_rootfs(
     // Make /space a tmpfs with the necessary disk quotas
     system::mount(
         "none",
-        format!("{}/overlay/root/space", prefix),
+        format!("{prefix}/overlay/root/space"),
         "tmpfs",
         system::MS_NOSUID,
         Some(format!("size={},nr_inodes={}", quotas.space, quotas.max_inodes).as_ref()),
@@ -178,41 +174,38 @@ pub fn make_rootfs(
     // Mount /dev on overlay
     system::bind_mount_opt(
         "/tmp/sunwalker_invoker/dev",
-        format!("{}/overlay/root/dev", prefix),
+        format!("{prefix}/overlay/root/dev"),
         system::MS_RDONLY,
     )
     .context_invoker("Failed to mount /dev on <prefix>/overlay/root")?;
 
     // Mount /dev/shm on overlay
-    std::fs::create_dir(format!("{}/overlay/root/space/.shm", prefix))
+    std::fs::create_dir(format!("{prefix}/overlay/root/space/.shm"))
         .context_invoker("Failed to create directory at <prefix>/overlay/root/space/.shm")?;
     // rwxrwxrwt
     std::fs::set_permissions(
-        format!("{}/overlay/root/space/.shm", prefix),
+        format!("{prefix}/overlay/root/space/.shm"),
         std::fs::Permissions::from_mode(0o1777),
     )
     .context_invoker("Failed to make <prefix>/overlay/root/space/.shm")?;
     system::bind_mount(
-        format!("{}/overlay/root/space/.shm", prefix),
-        format!("{}/overlay/root/dev/shm", prefix),
+        format!("{prefix}/overlay/root/space/.shm"),
+        format!("{prefix}/overlay/root/dev/shm"),
     )
     .context_invoker("Failed to mount /dev/shm on <prefix>/overlay/root")?;
 
     // Allow the sandbox user to write to /space
-    std::os::unix::fs::chown(format!("{}/overlay/root/space", prefix), Some(1), Some(1))
+    std::os::unix::fs::chown(format!("{prefix}/overlay/root/space"), Some(1), Some(1))
         .context_invoker("Failed to chown <prefix>/overlay/root/space")?;
 
     // Initialize user directory.
     for (from, to) in bound_files.iter() {
-        let to_path = format!("{}/overlay/root{}", prefix, to);
+        let to_path = format!("{prefix}/overlay/root{to}");
 
         std::fs::write(&to_path, "")
-            .with_context_invoker(|| format!("Failed to create <prefix>/overlay/root{}", to))?;
+            .with_context_invoker(|| format!("Failed to create <prefix>/overlay/root{to}"))?;
         system::bind_mount_opt(from, &to_path, system::MS_RDONLY).with_context_invoker(|| {
-            format!(
-                "Failed to bind-mount {:?} to <prefix>/overlay/root{}",
-                from, to
-            )
+            format!("Failed to bind-mount {from:?} to <prefix>/overlay/root{to}")
         })?;
     }
 
@@ -261,21 +254,21 @@ pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
 
     std::fs::write(
         format!("/proc/{}/gid_map", child.id()),
-        format!("0 0 1\n1000 1 1\n65534 65534 1\n"),
+        "0 0 1\n1000 1 1\n65534 65534 1\n",
     )
     .context_invoker("Failed to create gid_map for the isolated subprocess")?;
 
-    let prefix = &format!("/tmp/sunwalker_invoker/worker/ns/{}", id);
+    let prefix = &format!("/tmp/sunwalker_invoker/worker/ns/{id}");
     std::fs::create_dir(prefix).context_invoker("Failed to create <prefix>")?;
 
     (async move || {
         for name in ["ipc", "user", "uts", "net"] {
-            let orig_path = &format!("/proc/{}/ns/{}", child.id(), name);
-            let path = format!("{}/{}", prefix, name);
+            let orig_path = format!("/proc/{}/ns/{name}", child.id());
+            let path = format!("{prefix}/{name}");
             std::fs::write(&path, "")
-                .with_context_invoker(|| format!("Failed to create <prefix>/{}", name))?;
+                .with_context_invoker(|| format!("Failed to create <prefix>/{name}"))?;
             system::bind_mount(&orig_path, &path).with_context_invoker(|| {
-                format!("Failed to bind-mount {} to <prefix>/{}", orig_path, name)
+                format!("Failed to bind-mount {orig_path} to <prefix>/{name}")
             })?;
         }
 
@@ -291,13 +284,13 @@ pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
     })()
     .await
     .map_err(|e| {
-        if let Err(e) = unmount_recursively(&prefix) {
+        if let Err(e) = unmount_recursively(prefix) {
             println!(
                 "Failed to unmount {} recursively after unsuccessful initialization: {:?}",
                 prefix, e
             );
         }
-        if let Err(e) = std::fs::remove_dir_all(&prefix) {
+        if let Err(e) = std::fs::remove_dir_all(prefix) {
             println!(
                 "Failed to rm -r {} after unsuccessful initialization: {:?}",
                 prefix, e
@@ -317,7 +310,7 @@ impl RootFS {
         unmount_recursively(&space)?;
 
         // Remount /space
-        system::umount(&space).with_context_invoker(|| format!("Failed to unmount {}", space))?;
+        system::umount(&space).with_context_invoker(|| format!("Failed to unmount {space}"))?;
 
         system::mount(
             "none",
@@ -332,32 +325,30 @@ impl RootFS {
                 .as_ref(),
             ),
         )
-        .with_context_invoker(|| format!("Mounting tmpfs on {} failed", space))?;
+        .with_context_invoker(|| format!("Mounting tmpfs on {space} failed"))?;
 
         std::os::unix::fs::chown(&space, Some(1), Some(1))
-            .with_context_invoker(|| format!("Failed to chown {}", space))?;
+            .with_context_invoker(|| format!("Failed to chown {space}"))?;
 
         // Remount /dev/shm
-        let space_shm = format!("{}/.shm", space);
+        let space_shm = format!("{space}/.shm");
         let dev_shm = format!("{}/dev/shm", self.overlay());
         std::fs::create_dir(&space_shm)
-            .with_context_invoker(|| format!("Failed to create directory at {}", space_shm,))?;
-        system::umount(&dev_shm)
-            .with_context_invoker(|| format!("Failed to unmount {}", dev_shm))?;
+            .with_context_invoker(|| format!("Failed to create directory at {space_shm}"))?;
+        system::umount(&dev_shm).with_context_invoker(|| format!("Failed to unmount {dev_shm}"))?;
         system::bind_mount(&space_shm, &dev_shm).with_context_invoker(|| {
             format!(
-                "Failed to bind-mount {} to {}/dev/shm",
-                space_shm,
-                self.overlay(),
+                "Failed to bind-mount {space_shm} to {}/dev/shm",
+                self.overlay()
             )
         })?;
 
         let overlay = self.overlay();
         for (from, to) in self.bound_files.iter() {
-            let to = format!("{}{}", overlay, to);
-            std::fs::write(&to, "").with_context_invoker(|| format!("Failed to create {}", to))?;
+            let to = format!("{overlay}{to}");
+            std::fs::write(&to, "").with_context_invoker(|| format!("Failed to create {to}"))?;
             system::bind_mount_opt(from, &to, system::MS_RDONLY)
-                .with_context_invoker(|| format!("Failed to bind-mount {:?} to {}", from, to,))?;
+                .with_context_invoker(|| format!("Failed to bind-mount {from:?} to {to}"))?;
         }
 
         Ok(())
@@ -373,7 +364,7 @@ impl RootFS {
         let prefix = format!("/tmp/sunwalker_invoker/worker/rootfs/{}", self.id);
         unmount_recursively(&prefix)?;
         std::fs::remove_dir_all(&prefix)
-            .with_context_invoker(|| format!("Failed to remove {} recursively", prefix))?;
+            .with_context_invoker(|| format!("Failed to remove {prefix} recursively"))?;
 
         Ok(())
     }
@@ -386,28 +377,25 @@ impl RootFS {
     }
 
     pub fn read(&self, path: &str) -> Result<Vec<u8>, errors::Error> {
-        let path = format!("{}/{}", self.overlay(), path);
+        let path = format!("{}/{path}", self.overlay());
 
         let metadata = std::fs::symlink_metadata(&path)
-            .map_err(|e| errors::UserFailure(format!("Failed to stat {:?}: {:?}", path, e)))?;
+            .map_err(|e| errors::UserFailure(format!("Failed to stat {path:?}: {e:?}")))?;
 
         if !metadata.is_file() {
             return Err(errors::UserFailure(format!(
-                "{:?} is not a regular file",
-                path
+                "{path:?} is not a regular file"
             )));
         }
 
         if metadata.size() > self.quotas.space {
             return Err(errors::UserFailure(format!(
-                "Size of {:?} is more than the maximum size of the filesystem",
-                path
+                "Size of {path:?} is more than the maximum size of the filesystem"
             )));
         }
 
-        std::fs::read(&path).map_err(|e| {
-            errors::UserFailure(format!("Failed to open {:?} for reading: {:?}", path, e))
-        })
+        std::fs::read(&path)
+            .map_err(|e| errors::UserFailure(format!("Failed to open {path:?} for reading: {e:?}")))
     }
 
     pub fn remove(mut self) -> Result<(), errors::Error> {
@@ -426,7 +414,7 @@ impl Namespace {
         let prefix = format!("/tmp/sunwalker_invoker/worker/ns/{}", self.id);
         unmount_recursively(&prefix)?;
         std::fs::remove_dir_all(&prefix)
-            .with_context_invoker(|| format!("Failed to remove {} recursively", prefix))?;
+            .with_context_invoker(|| format!("Failed to remove {prefix} recursively"))?;
 
         Ok(())
     }
@@ -559,11 +547,11 @@ async fn isolated_entry<T: Object + 'static>(
     // Join prepared namespaces. They are old in the sense that they may contain stray information
     // from previous runs. It's necessary to clean it up to prevent communication between runs.
     for name in ["ipc", "user", "uts", "net"] {
-        let path = format!("/tmp/sunwalker_invoker/worker/ns/{}/{}", ns_id, name);
-        let file = std::fs::File::open(&path)
-            .with_context_invoker(|| format!("Failed to open {}", path))?;
+        let path = format!("/tmp/sunwalker_invoker/worker/ns/{ns_id}/{name}");
+        let file =
+            std::fs::File::open(&path).with_context_invoker(|| format!("Failed to open {path}"))?;
         nix::sched::setns(file.as_raw_fd(), nix::sched::CloneFlags::empty())
-            .with_context_invoker(|| format!("Failed to setns {}", path))?;
+            .with_context_invoker(|| format!("Failed to setns {path}"))?;
     }
 
     // IPC namespace. This is critical to clean up correctly, because creating an IPC namespace in
@@ -599,7 +587,7 @@ async fn isolated_entry<T: Object + 'static>(
         for msqid in msqids {
             if unsafe { libc::msgctl(msqid, libc::IPC_RMID, std::ptr::null_mut()) } == -1 {
                 return Err(std::io::Error::last_os_error().with_context_invoker(|| {
-                    format!("Failed to delete System V message queue #{}", msqid,)
+                    format!("Failed to delete System V message queue #{msqid}")
                 }));
             }
         }
@@ -632,7 +620,7 @@ async fn isolated_entry<T: Object + 'static>(
         for semid in semids {
             if unsafe { libc::semctl(semid, 0, libc::IPC_RMID) } == -1 {
                 return Err(std::io::Error::last_os_error().with_context_invoker(|| {
-                    format!("Failed to delete System V semaphore #{}", semid,)
+                    format!("Failed to delete System V semaphore #{semid}")
                 }));
             }
         }
@@ -665,7 +653,7 @@ async fn isolated_entry<T: Object + 'static>(
         for shmid in shmids {
             if unsafe { libc::shmctl(shmid, libc::IPC_RMID, std::ptr::null_mut()) } == -1 {
                 return Err(std::io::Error::last_os_error().with_context_invoker(|| {
-                    format!("Failed to delete System V shared memory #{}", shmid,)
+                    format!("Failed to delete System V shared memory #{shmid}")
                 }));
             }
         }
@@ -717,14 +705,14 @@ async fn isolated_entry<T: Object + 'static>(
     // onto itself. Note that if we pivot_root'ed into .../overlay/root, we'd need to bind-mount
     // itself anyway because the kernel marks .../overlay/root as MNT_LOCKED as a safety restriction
     // due to the use of user namespaces.
-    let overlay = format!("/tmp/sunwalker_invoker/worker/rootfs/{}/overlay", rootfs_id);
+    let overlay = format!("/tmp/sunwalker_invoker/worker/rootfs/{rootfs_id}/overlay");
 
     system::bind_mount_opt(&overlay, &overlay, system::MS_REC)
-        .with_context_invoker(|| format!("Failed to bind-mount {} onto itself", overlay))?;
+        .with_context_invoker(|| format!("Failed to bind-mount {overlay} onto itself"))?;
 
     // Change root to .../overlay
     std::env::set_current_dir(&overlay)
-        .with_context_invoker(|| format!("Failed to chdir to new root at {}", overlay,))?;
+        .with_context_invoker(|| format!("Failed to chdir to new root at {overlay}"))?;
     nix::unistd::pivot_root(".", ".").context_invoker("Failed to pivot_root")?;
     system::umount_opt(".", system::MNT_DETACH).context_invoker("Failed to unmount self")?;
 
@@ -761,19 +749,15 @@ async fn isolated_entry<T: Object + 'static>(
 
     // Use environment from the package
     let file = std::fs::File::open("/.sunwalker/env").map_err(|e| {
-        errors::ConfigurationFailure(format!(
-            "Failed to open /.sunwalker/env for reading: {:?}",
-            e
-        ))
+        errors::ConfigurationFailure(format!("Failed to open /.sunwalker/env for reading: {e:?}"))
     })?;
     for line in std::io::BufReader::new(file).lines() {
         let line = line.map_err(|e| {
-            errors::ConfigurationFailure(format!("Failed to read from /.sunwalker/env: {:?}", e))
+            errors::ConfigurationFailure(format!("Failed to read from /.sunwalker/env: {e:?}"))
         })?;
         let idx = line.find('=').ok_or_else(|| {
             errors::ConfigurationFailure(format!(
-                "'=' not found in a line of /.sunwalker/env: {}",
-                line
+                "'=' not found in a line of /.sunwalker/env: {line}"
             ))
         })?;
         let (name, value) = line.split_at(idx);

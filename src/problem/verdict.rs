@@ -119,7 +119,7 @@ impl From<std::process::ExitStatus> for ExitStatus {
 //             Self::InQueue => "PD".to_string(),
 //             Self::Compiling => "CG".to_string(),
 //             Self::CompilationError(_) => "CE".to_string(),
-//             Self::Running(test) => format!("RU {}", test),
+//             Self::Running(test) => format!("RU {test}"),
 
 //             Self::Accepted => "AC".to_string(),
 //             Self::PartialSolution(points) => format!("PT {}", (*points as f64) / 10000.0),
@@ -130,13 +130,13 @@ impl From<std::process::ExitStatus> for ExitStatus {
 
 //             Self::Bug(_) => "CF".to_string(),
 
-//             Self::WrongAnswer(test) => format!("WA {}", test),
-//             Self::RuntimeError(test) => format!("RE {}", test),
-//             Self::TimeLimitExceeded(test) => format!("TL {}", test),
-//             Self::MemoryLimitExceeded(test) => format!("ML {}", test),
-//             Self::PresentationError(test) => format!("PE {}", test),
-//             Self::IdlenessLimitExceeded(test) => format!("IL {}", test),
-//             Self::CheckerFailed(test) => format!("FL {}", test),
+//             Self::WrongAnswer(test) => format!("WA {test}"),
+//             Self::RuntimeError(test) => format!("RE {test}"),
+//             Self::TimeLimitExceeded(test) => format!("TL {test}"),
+//             Self::MemoryLimitExceeded(test) => format!("ML {test}"),
+//             Self::PresentationError(test) => format!("PE {test}"),
+//             Self::IdlenessLimitExceeded(test) => format!("IL {test}"),
+//             Self::CheckerFailed(test) => format!("FL {test}"),
 //         }
 //     }
 // }
@@ -190,10 +190,7 @@ impl TestVerdict {
                     let points = match std::str::from_utf8(points) {
                         Ok(points) => points,
                         Err(e) => {
-                            return Self::Bug(format!(
-                                "{:?} is not a UTF-8 string: {:?}",
-                                points, e
-                            ))
+                            return Self::Bug(format!("{points:?} is not a UTF-8 string: {e:?}"))
                         }
                     };
 
@@ -201,27 +198,25 @@ impl TestVerdict {
                         Ok(points) => points,
                         Err(_) => {
                             return Self::Bug(format!(
-                                "Testlib exit code is 7 (PT) and stderr starts with 'points {}', \
-                                 but '{}' is not a number convertible to f64",
-                                points, points
+                                "Testlib exit code is 7 (PT) and stderr starts with 'points \
+                                 {points}', but '{points}' is not a number convertible to f64"
                             ))
                         }
                     };
 
                     if !points.is_finite() {
                         return Self::Bug(format!(
-                            "Partial result must be a finite number, not {}",
-                            points
+                            "Partial result must be a finite number, not {points}"
                         ));
                     }
 
                     Self::PartialSolution((points * 10000.0).round() as u64)
                 }
                 8 => Self::PresentationError,
-                _ => Self::Bug(format!("Unknown testlib exit code: {}", code)),
+                _ => Self::Bug(format!("Unknown testlib exit code: {code}")),
             },
             ExitStatus::Signal(signal) => {
-                Self::Bug(format!("Testlib terminated by signal {}", signal))
+                Self::Bug(format!("Testlib terminated by signal {signal}"))
             }
         }
     }

@@ -17,8 +17,8 @@ impl Package {
             Ok(Package { image, name })
         } else {
             Err(errors::ConfigurationFailure(format!(
-                "Image {:?} does not contain package {}",
-                image.mountpoint, name
+                "Image {:?} does not contain package {name}",
+                image.mountpoint
             )))
         }
     }

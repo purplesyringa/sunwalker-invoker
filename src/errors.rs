@@ -27,10 +27,10 @@ pub trait ToError {
 
 impl<E: std::fmt::Display> ToError for E {
     fn context_invoker(self, message: &str) -> Error {
-        Error::InvokerFailure(format!("{}: {}", message, self))
+        Error::InvokerFailure(format!("{message}: {self}"))
     }
     fn with_context_invoker<F: FnOnce() -> String>(self, f: F) -> Error {
-        Error::InvokerFailure(format!("{}: {}", f(), self))
+        Error::InvokerFailure(format!("{}: {self}", f()))
     }
 }
 

@@ -85,15 +85,13 @@ impl StrategyFactory {
                         Some(file_type) => {
                             if let FileType::Pipe = file_type {
                                 return Err(errors::ConfigurationFailure(format!(
-                                    "Pipe %{} is bound to a file; this is not allowed",
-                                    filename
+                                    "Pipe %{filename} is bound to a file; this is not allowed"
                                 )));
                             }
                         }
                         None => {
                             return Err(errors::ConfigurationFailure(format!(
-                                "Use of undeclared file %{}",
-                                filename
+                                "Use of undeclared file %{filename}"
                             )));
                         }
                     },
@@ -109,8 +107,7 @@ impl StrategyFactory {
                         // External files cannot be written to
                         if binding.writable {
                             return Err(errors::ConfigurationFailure(format!(
-                                "External file {} is written to; this is not allowed",
-                                text
+                                "External file {text} is written to; this is not allowed"
                             )));
                         }
                     }
@@ -123,15 +120,13 @@ impl StrategyFactory {
                         Some(file_type) => {
                             if let FileType::Pipe = file_type {
                                 return Err(errors::ConfigurationFailure(format!(
-                                    "Pipe %{} is used as an argument; this is not allowed",
-                                    filename
+                                    "Pipe %{filename} is used as an argument; this is not allowed"
                                 )));
                             }
                         }
                         None => {
                             return Err(errors::ConfigurationFailure(format!(
-                                "Use of undeclared file %{}",
-                                filename
+                                "Use of undeclared file %{filename}"
                             )));
                         }
                     }
@@ -152,8 +147,7 @@ impl StrategyFactory {
                     Some(Pattern::File(ref filename)) => {
                         if !self.files.contains_key(filename) {
                             return Err(errors::ConfigurationFailure(format!(
-                                "Use of undeclared file %{}",
-                                filename
+                                "Use of undeclared file %{filename}"
                             )));
                         }
                     }
@@ -161,29 +155,27 @@ impl StrategyFactory {
                         if text.contains('$') {
                             if *writable {
                                 return Err(errors::ConfigurationFailure(format!(
-                                    "{} is redirected to an external file {}; this is not allowed",
-                                    name, text
+                                    "{name} is redirected to an external file {text}; this is not \
+                                     allowed"
                                 )));
                             }
                         } else {
                             let binding = block.bindings.get(text).ok_or_else(|| {
                                 errors::ConfigurationFailure(format!(
-                                    "{} is redirected to unbound file {}; this is not allowed",
-                                    name, text
+                                    "{name} is redirected to unbound file {text}; this is not \
+                                     allowed"
                                 ))
                             })?;
                             if *writable && !binding.writable {
                                 return Err(errors::ConfigurationFailure(format!(
-                                    "{} is redirected to file {}, which is bound read-only; this \
-                                     is not allowed",
-                                    name, text
+                                    "{name} is redirected to file {text}, which is bound \
+                                     read-only; this is not allowed"
                                 )));
                             }
                             if !writable && !binding.readable {
                                 return Err(errors::ConfigurationFailure(format!(
-                                    "{} is redirected from file {}, which is bound write-only; \
-                                     this is not allowed",
-                                    name, text
+                                    "{name} is redirected from file {text}, which is bound \
+                                     write-only; this is not allowed"
                                 )));
                             }
                         }
@@ -219,8 +211,7 @@ impl StrategyFactory {
                             _ => {
                                 return Err(errors::ConfigurationFailure(format!(
                                     "stderr of testlib must be redirected to a regular file, not \
-                                     {:?}",
-                                    file_type
+                                     {file_type:?}"
                                 )))
                             }
                         }
@@ -243,9 +234,8 @@ impl StrategyFactory {
                         if let Some(x) = *writer {
                             if x != i {
                                 return Err(errors::ConfigurationFailure(format!(
-                                    "File %{} is written to by multiple blocks; this is not \
-                                     allowed",
-                                    name
+                                    "File %{name} is written to by multiple blocks; this is not \
+                                     allowed"
                                 )));
                             }
                         }
@@ -268,8 +258,7 @@ impl StrategyFactory {
                 if let Some(x) = *writer {
                     if x != i {
                         return Err(errors::ConfigurationFailure(format!(
-                            "File %{} is written to by multiple blocks; this is not allowed",
-                            name
+                            "File %{name} is written to by multiple blocks; this is not allowed"
                         )));
                     }
                 }
@@ -280,8 +269,7 @@ impl StrategyFactory {
                 if let Some(x) = writer {
                     if *x != i {
                         return Err(errors::ConfigurationFailure(format!(
-                            "File %{} is written to by multiple blocks; this is not allowed",
-                            name
+                            "File %{name} is written to by multiple blocks; this is not allowed"
                         )));
                     }
                 }
@@ -305,13 +293,11 @@ impl StrategyFactory {
             } else {
                 if readers.is_empty() {
                     return Err(errors::ConfigurationFailure(format!(
-                        "File %{} is neither read from nor written to; this is not allowed",
-                        name
+                        "File %{name} is neither read from nor written to; this is not allowed"
                     )));
                 } else {
                     return Err(errors::ConfigurationFailure(format!(
-                        "File %{} is read from but not written to; this is not allowed",
-                        name
+                        "File %{name} is read from but not written to; this is not allowed"
                     )));
                 }
             }
@@ -381,10 +367,9 @@ impl StrategyFactory {
                         }
                         if component_of_block[*reader] == writer_component {
                             return Err(errors::ConfigurationFailure(format!(
-                                "Regular file %{} is written to by block #{} and read from by \
-                                 block #{}, but these blocks are executed concurrently; such \
-                                 races are not allowed",
-                                name, writer, reader
+                                "Regular file %{name} is written to by block #{writer} and read \
+                                 from by block #{reader}, but these blocks are executed \
+                                 concurrently; such races are not allowed"
                             )));
                         }
                     }
@@ -392,24 +377,22 @@ impl StrategyFactory {
                 FileType::Fifo | FileType::Pipe => {
                     if readers.is_empty() {
                         return Err(errors::ConfigurationFailure(format!(
-                            "Pipe %{} is never read from; this is not allowed, because pipes are \
-                             not logged",
-                            name,
+                            "Pipe %{name} is never read from; this is not allowed, because pipes \
+                             are not logged"
                         )));
                     }
                     if readers.len() > 1 {
                         return Err(errors::ConfigurationFailure(format!(
-                            "Pipe %{} is read by multiple blocks; this data race is not allowed",
-                            name,
+                            "Pipe %{name} is read by multiple blocks; this data race is not \
+                             allowed"
                         )));
                     }
                     let reader = readers[0];
                     if component_of_block[reader] != writer_component {
                         return Err(errors::ConfigurationFailure(format!(
-                            "Pipe %{} is written to by block #{} and read from by block #{}, but \
-                             these blocks are not executed concurrently, which will lead to \
-                             blocking; this is not allowed",
-                            name, writer, reader
+                            "Pipe %{name} is written to by block #{writer} and read from by block \
+                             #{reader}, but these blocks are not executed concurrently, which \
+                             will lead to blocking; this is not allowed"
                         )));
                     }
                 }
@@ -439,7 +422,7 @@ impl StrategyFactory {
                     user_program.package.image.clone(),
                 )?;
             }
-            invocable_programs.push(program.into_invocable(format!("block-{}", i)).await?);
+            invocable_programs.push(program.into_invocable(format!("block-{i}")).await?);
         }
 
         let mut writer_by_file = HashMap::new();
@@ -467,13 +450,10 @@ impl Strategy {
         build_id: String,
         test_path: PathBuf,
     ) -> Result<verdict::TestJudgementResult, errors::Error> {
-        let aux = format!("/tmp/sunwalker_invoker/worker/aux/{}", build_id);
+        let aux = format!("/tmp/sunwalker_invoker/worker/aux/{build_id}");
 
         std::fs::create_dir(&aux).with_context_invoker(|| {
-            format!(
-                "Failed to create directory {} to start running a strategy",
-                aux,
-            )
+            format!("Failed to create directory {aux} to start running a strategy")
         })?;
 
         (StrategyRun {
@@ -498,13 +478,13 @@ impl<'a> StrategyRun<'a> {
                 }
                 FileType::Fifo => {
                     nix::unistd::mkfifo::<str>(
-                        format!("{}/{}", self.aux, name).as_ref(),
+                        format!("{}/{name}", self.aux).as_ref(),
                         nix::sys::stat::Mode::from_bits_truncate(0666),
                     )
                     .with_context_invoker(|| {
                         format!(
-                            "Failed to mkfifo {}/{} to start running a strategy",
-                            self.aux, name,
+                            "Failed to mkfifo {}/{name} to start running a strategy",
+                            self.aux
                         )
                     })?;
                 }
@@ -539,22 +519,19 @@ impl<'a> StrategyRun<'a> {
                         // Regular files are to be created inside the filesystem of the block that
                         // writes to it
                         let overlay = program.rootfs.overlay();
-                        std::fs::write(format!("{}/space/.file-{}", overlay, name), b"")
-                            .with_context_invoker(|| {
-                                format!(
-                                    "Failed to touch file {}/.file-{} to start running a strategy",
-                                    overlay, name,
-                                )
-                            })?;
+                        let path = format!("{overlay}/space/.file-{name}");
+                        std::fs::write(&path, b"").with_context_invoker(|| {
+                            format!("Failed to touch file {path} to start running a strategy")
+                        })?;
                     }
                 }
 
                 // Filesystem bindings
                 for (filename, binding) in block.bindings.iter() {
                     let outer_path = self.resolve_outer_path(&binding.source, None)?;
-                    let inner_path = format!("{}/space/{}", program.rootfs.overlay(), filename);
+                    let inner_path = format!("{}/space/{filename}", program.rootfs.overlay());
                     std::fs::write(&inner_path, "")
-                        .with_context_invoker(|| format!("Failed to create {}", inner_path))?;
+                        .with_context_invoker(|| format!("Failed to create {inner_path}"))?;
                     system::bind_mount_opt(
                         &outer_path,
                         &inner_path,
@@ -565,7 +542,7 @@ impl<'a> StrategyRun<'a> {
                         },
                     )
                     .with_context_invoker(|| {
-                        format!("Failed to bind-mount {:?} to {}", outer_path, inner_path,)
+                        format!("Failed to bind-mount {outer_path:?} to {inner_path}")
                     })?;
                 }
 
@@ -580,15 +557,15 @@ impl<'a> StrategyRun<'a> {
                     }
 
                     let outer_path = self.resolve_outer_path(&arg, None)?;
-                    let inner_path = format!("{}/space/.arg-{}", program.rootfs.overlay(), i);
+                    let inner_path = format!("{}/space/.arg-{i}", program.rootfs.overlay());
                     std::fs::write(&inner_path, "")
-                        .with_context_invoker(|| format!("Failed to create {}", inner_path))?;
+                        .with_context_invoker(|| format!("Failed to create {inner_path}"))?;
                     system::bind_mount_opt(&outer_path, &inner_path, system::MS_RDONLY)
                         .with_context_invoker(|| {
-                            format!("Failed to bind-mount {:?} to {}", outer_path, inner_path,)
+                            format!("Failed to bind-mount {outer_path:?} to {inner_path}")
                         })?;
 
-                    patched_argv.push(format!("/space/.arg-{}", i));
+                    patched_argv.push(format!("/space/.arg-{i}"));
                 }
 
                 // Prepare streams
@@ -627,7 +604,7 @@ impl<'a> StrategyRun<'a> {
                             .write(writable)
                             .open(&outer_path)
                             .with_context_invoker(|| {
-                                format!("Failed to redirect {} to {:?}", name, outer_path,)
+                                format!("Failed to redirect {name} to {outer_path:?}")
                             })?,
                     );
                 }
@@ -684,7 +661,7 @@ impl<'a> StrategyRun<'a> {
                         }
                     };
                     let testlib_stderr =
-                        program.rootfs.read(&format!("/space/.file-{}", filename))?;
+                        program.rootfs.read(&format!("/space/.file-{filename}"))?;
 
                     let current_verdict =
                         verdict::TestVerdict::from_testlib(*result, &testlib_stderr);
@@ -705,7 +682,7 @@ impl<'a> StrategyRun<'a> {
             if let FileType::Regular = file_type {
                 let block_id = self.strategy.writer_by_file[filename];
                 let program = &self.strategy.invocable_programs[block_id];
-                let data = program.rootfs.read(&format!("/space/.file-{}", filename))?;
+                let data = program.rootfs.read(&format!("/space/.file-{filename}"))?;
                 logs.insert(filename.to_string(), data);
             }
         }
@@ -738,30 +715,28 @@ impl<'a> StrategyRun<'a> {
             Pattern::File(ref name) => {
                 if let FileType::Regular = self.strategy.files[name] {
                     Ok(format!(
-                        "{}/space/.file-{}",
+                        "{}/space/.file-{name}",
                         self.strategy.invocable_programs[self.strategy.writer_by_file[name]]
                             .rootfs
-                            .overlay(),
-                        name
+                            .overlay()
                     )
                     .into())
                 } else {
-                    Ok(format!("{}/{}", self.aux, name).into())
+                    Ok(format!("{}/{name}", self.aux).into())
                 }
             }
             Pattern::VariableText(ref text) => {
                 if text.contains('$') {
                     if !text.starts_with("$test") || text.matches('$').count() > 1 {
                         return Err(errors::ConfigurationFailure(format!(
-                            "Path {} is invalid: it must start with $test",
-                            text
+                            "Path {text} is invalid: it must start with $test"
                         )));
                     }
                     let mut path = self.test_path.as_os_str().to_owned();
                     path.push(&text[5..]);
                     Ok(path.into())
                 } else {
-                    Ok(format!("{}/space/{}", root.unwrap(), text).into())
+                    Ok(format!("{}/space/{text}", root.unwrap()).into())
                 }
             }
         }
@@ -791,9 +766,9 @@ fn execute(
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
-        .with_context_invoker(|| format!("Failed to spawn {:?}", argv))?
+        .with_context_invoker(|| format!("Failed to spawn {argv:?}"))?
         .wait()
-        .with_context_invoker(|| format!("Failed to get exit code of {:?}", argv))?;
+        .with_context_invoker(|| format!("Failed to get exit code of {argv:?}"))?;
 
     Ok(exit_status.into())
 }

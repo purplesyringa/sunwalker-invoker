@@ -33,9 +33,8 @@ impl ImageMounter {
         })?;
 
         let mountpoint = self.get_mountpoint();
-        std::fs::create_dir(&mountpoint).with_context(|| {
-            format!("Unable to create temporary mountpoint at {:?}", &mountpoint)
-        })?;
+        std::fs::create_dir(&mountpoint)
+            .with_context(|| format!("Unable to create temporary mountpoint at {mountpoint:?}"))?;
 
         let file_type = attr.file_type();
 
@@ -66,9 +65,8 @@ impl ImageMounter {
 
             // if !output.status.success() {
             //     bail!(format!(
-            //         "squashfuse for {:?} -> {:?} returned {}",
+            //         "squashfuse for {:?} -> {mountpoint:?} returned {}",
             //         source_path.as_ref(),
-            //         &mountpoint,
             //         output.status
             //     ));
             // }
@@ -83,7 +81,7 @@ impl ImageMounter {
             // let mut package_path = mountpoint.clone();
             // package_path.push(package_name);
             // let meta = std::fs::metadata(package_path)
-            //     .with_context(|| format!("The image does not provide package {}", package_name))?;
+            //     .with_context(|| format!("The image does not provide package {package_name}"))?;
             // if !meta.is_dir() {
             //     bail!("Package {} requires the image to contain a subdirectory named {}, but it is not a directory", package_name, package_name);
             // }

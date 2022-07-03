@@ -145,8 +145,7 @@ impl Worker {
             Some(W2IMessage::Finalized) => Ok(()),
             Some(W2IMessage::Failure(e)) => Err(e),
             _ => Err(errors::InvokerFailure(format!(
-                "Unexpected response to finalization request: {:?}",
-                response
+                "Unexpected response to finalization request: {response:?}"
             ))),
         }
     }

@@ -39,14 +39,14 @@ impl Program {
             let prerequisite_path = path.join("artifacts").join(prerequisite);
             let metadata = std::fs::metadata(&prerequisite_path).map_err(|e| {
                 errors::ConfigurationFailure(format!(
-                    "Prerequisite {} was specified, but could not be stat'ed at path {:?}: {:?}",
-                    prerequisite, prerequisite_path, e
+                    "Prerequisite {prerequisite} was specified, but could not be stat'ed at path \
+                     {prerequisite_path:?}: {e:?}"
                 ))
             })?;
             if !metadata.is_file() {
                 return Err(errors::ConfigurationFailure(format!(
-                    "Prerequisite {} was specified, but {:?} is not a regular file",
-                    prerequisite, prerequisite_path
+                    "Prerequisite {prerequisite} was specified, but {prerequisite_path:?} is not \
+                     a regular file"
                 )));
             }
         }
@@ -54,8 +54,8 @@ impl Program {
             package: package::Package::new(image, program.package.clone()).map_err(|e| {
                 errors::ConfigurationFailure(format!(
                     "The current image faled to provide package {}, which was specified in \
-                     program.cfg at {:?}: {:?}",
-                    program.package, path, e
+                     program.cfg at {path:?}: {e:?}",
+                    program.package
                 ))
             })?,
             prerequisites: program.prerequisites,
@@ -69,7 +69,7 @@ impl Program {
         for prerequisite in &self.prerequisites {
             bound_files.push((
                 self.artifacts_path.join(prerequisite),
-                format!("/space/{}", prerequisite),
+                format!("/space/{prerequisite}"),
             ));
         }
         let rootfs = sandbox::make_rootfs(

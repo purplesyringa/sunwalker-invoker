@@ -56,16 +56,14 @@ impl Communicator {
             .send(tungstenite::Message::Binary(
                 rmp_serde::to_vec(&message).map_err(|e| {
                     errors::CommunicationError(format!(
-                        "Failed to serialize a message to conductor: {:?}",
-                        e
+                        "Failed to serialize a message to conductor: {e:?}"
                     ))
                 })?,
             ))
             .await
             .map_err(|e| {
                 errors::CommunicationError(format!(
-                    "Failed to send a message to conductor via websocket: {:?}",
-                    e
+                    "Failed to send a message to conductor via websocket: {e:?}"
                 ))
             })?;
 
@@ -100,12 +98,12 @@ impl Communicator {
             .context_invoker("Failed to create target directory")?;
 
         let manifest = self
-            .request_file(&format!("manifest/{}", topic))
+            .request_file(&format!("manifest/{topic}"))
             .await
             .context_invoker("Failed to load manifest")?;
 
         let manifest = std::str::from_utf8(&manifest).map_err(|e| {
-            errors::ConfigurationFailure(format!("Invalid manifest for topic {}: {:?}", topic, e))
+            errors::ConfigurationFailure(format!("Invalid manifest for topic {topic}: {e:?}"))
         })?;
 
         for mut line in manifest.lines() {
@@ -113,7 +111,7 @@ impl Communicator {
                 // Directory
                 let dir_path = target_path.join(&line);
                 std::fs::create_dir(&dir_path)
-                    .with_context_invoker(|| format!("Failed to create {:?}", dir_path))?;
+                    .with_context_invoker(|| format!("Failed to create {dir_path:?}"))?;
             } else {
                 // File
                 let mut executable = false;
@@ -131,17 +129,17 @@ impl Communicator {
                 let data = self
                     .request_file(hash)
                     .await
-                    .with_context_invoker(|| format!("Failed to download file {}", file))?;
+                    .with_context_invoker(|| format!("Failed to download file {file}"))?;
 
                 let file_path = target_path.join(&file);
                 std::fs::write(&file_path, data)
-                    .with_context_invoker(|| format!("Failed to write to {:?}", file_path))?;
+                    .with_context_invoker(|| format!("Failed to write to {file_path:?}"))?;
 
                 if executable {
                     let mut permissions = file_path
                         .metadata()
                         .with_context_invoker(|| {
-                            format!("Failed to get metadata of {:?}", file_path)
+                            format!("Failed to get metadata of {file_path:?}")
                         })?
                         .permissions();
 
@@ -149,7 +147,7 @@ impl Communicator {
                     permissions.set_mode(permissions.mode() | ((permissions.mode() & 0o444) >> 2));
 
                     std::fs::set_permissions(&file_path, permissions).with_context_invoker(
-                        || format!("Failed to make {:?} executable", file_path),
+                        || format!("Failed to make {file_path:?} executable"),
                     )?
                 }
             }
@@ -157,7 +155,7 @@ impl Communicator {
 
         let ready_path = target_path.join(".ready");
         std::fs::write(&ready_path, b"")
-            .with_context_invoker(|| format!("Failed to write to {:?}", ready_path))?;
+            .with_context_invoker(|| format!("Failed to write to {ready_path:?}"))?;
 
         Ok(())
     }
@@ -212,7 +210,7 @@ async fn client_main_async(cli_args: init::CLIArgs) -> anyhow::Result<()> {
     for core in &config.environment.cpu_cores {
         cpusets.push(
             cgroups::AffineCPUSet::new(*core)
-                .with_context(|| format!("Failed to create cpuset for core {}", core))?,
+                .with_context(|| format!("Failed to create cpuset for core {core}"))?,
         );
     }
 
@@ -555,23 +553,23 @@ fn enter_sandbox() -> anyhow::Result<()> {
         "null", "full", "zero", "urandom", "random", "stdin", "stdout", "stderr", "ptmx", "pts",
         "fd",
     ] {
-        let source = format!("/dev/{}", name);
-        let target = format!("/tmp/sunwalker_invoker/dev/{}", name);
+        let source = format!("/dev/{name}");
+        let target = format!("/tmp/sunwalker_invoker/dev/{name}");
         let metadata = std::fs::symlink_metadata(&source)
-            .with_context(|| format!("{} does not exist (or oculd not be accessed)", source))?;
+            .with_context(|| format!("{source} does not exist (or oculd not be accessed)"))?;
         if metadata.is_symlink() {
             let symlink_target = std::fs::read_link(&source)
-                .with_context(|| format!("Cannot readlink {:?}", source))?;
+                .with_context(|| format!("Cannot readlink {source:?}"))?;
             std::os::unix::fs::symlink(&symlink_target, &target)
-                .with_context(|| format!("Cannot ln -s {:?} {:?}", symlink_target, target))?;
+                .with_context(|| format!("Cannot ln -s {symlink_target:?} {target:?}"))?;
             continue;
         } else if metadata.is_dir() {
-            std::fs::create_dir(&target).with_context(|| format!("Cannot mkdir {:?}", target))?;
+            std::fs::create_dir(&target).with_context(|| format!("Cannot mkdir {target:?}"))?;
         } else {
-            std::fs::File::create(&target).with_context(|| format!("Cannot touch {:?}", target))?;
+            std::fs::File::create(&target).with_context(|| format!("Cannot touch {target:?}"))?;
         }
         system::bind_mount(&source, &target)
-            .with_context(|| format!("Bind-mounting {} -> {} failed", target, source))?;
+            .with_context(|| format!("Bind-mounting {source} to {target} failed"))?;
     }
 
     std::fs::create_dir("/tmp/sunwalker_invoker/dev/mqueue")

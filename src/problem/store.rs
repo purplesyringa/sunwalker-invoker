@@ -33,7 +33,7 @@ impl ProblemStore {
         problem_id: String,
         revision_id: String,
     ) -> Result<Arc<problem::ProblemRevision>, errors::Error> {
-        let topic = format!("problems/{}/{}", problem_id, revision_id);
+        let topic = format!("problems/{problem_id}/{revision_id}");
         let root_path = self.local_storage_path.join(problem_id).join(revision_id);
 
         let mutex = self
@@ -48,18 +48,15 @@ impl ProblemStore {
             let _guard = mutex.lock().await;
 
             if !root_path.exists() {
-                std::fs::create_dir_all(&root_path).with_context_invoker(|| {
-                    format!("Failed to create directory {:?}", root_path)
-                })?;
+                std::fs::create_dir_all(&root_path)
+                    .with_context_invoker(|| format!("Failed to create directory {root_path:?}"))?;
             }
 
             if !root_path.join(".ready").exists() {
                 self.communicator
                     .download_archive(&topic, root_path.as_ref())
                     .await
-                    .with_context_invoker(|| {
-                        format!("Failed to load archive for topic {}", topic)
-                    })?;
+                    .with_context_invoker(|| format!("Failed to load archive for topic {topic}"))?;
             }
         }
 

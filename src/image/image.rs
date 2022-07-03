@@ -30,7 +30,7 @@ impl Image {
             .language_to_package_name
             .get(&name)
             .ok_or_else(|| {
-                errors::UserFailure(format!("The image does not provide language {}", name))
+                errors::UserFailure(format!("The image does not provide language {name}"))
             })?
             .clone();
         package::Package::new(image, package_name)?.get_language(&name)
