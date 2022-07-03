@@ -618,7 +618,6 @@ impl<'a> StrategyRun<'a> {
                             .bind(stderr.unwrap()),
                     ),
                     &program.rootfs,
-                    &program.namespace,
                 ));
             }
 

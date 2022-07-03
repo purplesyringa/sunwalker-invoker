@@ -33,8 +33,8 @@ impl LanguageImpl {
             },
             "identify".to_string(),
         )
+        .await
         .context_invoker("Failed to make sandbox for identification")?;
-        let ns = sandbox::make_namespace("identify".to_string()).await?;
 
         rootfs
             .reset()
@@ -44,7 +44,6 @@ impl LanguageImpl {
         let identification = sandbox::run_isolated(
             Box::new(identify.bind(self.borrow_config().identify.clone())),
             &rootfs,
-            &ns,
         )
         .await?;
 
@@ -55,8 +54,6 @@ impl LanguageImpl {
         }
 
         rootfs.remove().context_invoker("Failed to remove rootfs")?;
-
-        ns.remove().context_invoker("Failed to remove namespace")?;
 
         Ok(identification)
     }
@@ -147,8 +144,8 @@ impl LanguageImpl {
             },
             "build".to_string(),
         )
+        .await
         .context_invoker("Failed to make sandbox for build")?;
-        let ns = sandbox::make_namespace("build".to_string()).await?;
 
         rootfs
             .reset()
@@ -179,13 +176,10 @@ impl LanguageImpl {
                 ),
             ),
             &rootfs,
-            &ns,
         )
         .await?;
 
         rootfs.remove().context_invoker("Failed to remove rootfs")?;
-
-        ns.remove().context_invoker("Failed to remove namespace")?;
 
         let prerequisites: Vec<String> = lisp::evaluate(
             config.run.prerequisites.clone(),

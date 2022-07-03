@@ -29,11 +29,6 @@ pub struct RootFS {
     quotas: DiskQuotas,
 }
 
-pub struct Namespace {
-    removed: bool,
-    pub id: String,
-}
-
 // Unmount everything beneath prefix recursively. Does not unmount prefix itself.
 fn unmount_recursively(prefix: &str, inclusive: bool) -> Result<(), errors::Error> {
     let prefix_slash = format!("{prefix}/");
@@ -91,7 +86,7 @@ pub fn enter_worker_space(core: u64) -> Result<(), errors::Error> {
     Ok(())
 }
 
-pub fn make_rootfs(
+pub async fn make_rootfs(
     package: &package::Package,
     bound_files: Vec<(PathBuf, String)>,
     quotas: DiskQuotas,
@@ -171,6 +166,77 @@ pub fn make_rootfs(
             system::MS_RDONLY,
         )
         .context_invoker("Failed to mount /dev on <prefix>/overlay/root")?;
+
+        // By now, rootfs generation is mostly finished
+
+        // Start a subprocess which will create the appropriate namespaces
+        let (mut upstream, downstream) = multiprocessing::tokio::duplex::<(), ()>()
+            .context_invoker("Failed to create duplex connection to an isolated subprocess")?;
+
+        let mut child = make_ns
+            .spawn_tokio(downstream, prefix.clone())
+            .await
+            .context_invoker("Failed to start an isolated subprocess")?;
+
+        // The subprocess will now mount /dev/mqueue
+
+        // Wait for confirmation from the subprocess
+        let res = upstream
+            .recv()
+            .await
+            .context_invoker("Failed to read start confirmation from the isolated subprocess")?;
+        if res.is_none() {
+            let res = child
+                .join()
+                .await
+                .context_invoker("Isolated process didn't terminate gracefully")?;
+            let err = res
+                .err()
+                .unwrap_or_else(|| errors::InvokerFailure("(no error reported)".to_string()));
+            // ? instead of return so that the rootfs is rolled back
+            Err(err.context_invoker("Isolated process failed to start isolation"))?;
+        }
+
+        // Fill uid/gid maps
+        std::fs::write(
+            format!("/proc/{}/uid_map", child.id()),
+            // Global root stays root, the user is 1000, and nobody is bound just in case
+            format!("0 0 1\n1000 1 1\n65534 65534 1\n"),
+        )
+        .context_invoker("Failed to create uid_map for the isolated subprocess")?;
+
+        std::fs::write(format!("/proc/{}/setgroups", child.id()), "deny\n")
+            .context_invoker("Failed to create setgroups for the isolated subprocess")?;
+
+        std::fs::write(
+            format!("/proc/{}/gid_map", child.id()),
+            "0 0 1\n1000 1 1\n65534 65534 1\n",
+        )
+        .context_invoker("Failed to create gid_map for the isolated subprocess")?;
+
+        // Save namespaces
+        std::fs::create_dir(format!("{prefix}/ns"))
+            .context_invoker("Failed to create <prefix>/ns")?;
+
+        for name in ["ipc", "user", "uts", "net"] {
+            let orig_path = format!("/proc/{}/ns/{name}", child.id());
+            let path = format!("{prefix}/ns/{name}");
+            std::fs::write(&path, "")
+                .with_context_invoker(|| format!("Failed to create <prefix>/ns/{name}"))?;
+            system::bind_mount(&orig_path, &path).with_context_invoker(|| {
+                format!("Failed to bind-mount {orig_path} to <prefix>/ns/{name}")
+            })?;
+        }
+
+        upstream
+            .send(&())
+            .await
+            .context_invoker("Failed to tell the isolated subprocess to terminate")?;
+
+        child
+            .join()
+            .await
+            .context_invoker("Isolated process didn't terminate gracefully")?
     } {
         // Rollback
         if let Err(e) = unmount_recursively(&prefix, false) {
@@ -190,86 +256,6 @@ pub fn make_rootfs(
         bound_files,
         quotas,
     })
-}
-
-pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
-    let (mut upstream, downstream) = multiprocessing::tokio::duplex::<(), ()>()
-        .context_invoker("Failed to create duplex connection to an isolated subprocess")?;
-
-    let mut child = make_ns
-        .spawn_tokio(downstream)
-        .await
-        .context_invoker("Failed to start an isolated subprocess")?;
-
-    let res = upstream
-        .recv()
-        .await
-        .context_invoker("Failed to read start confirmation from the isolated subprocess")?;
-    if res.is_none() {
-        let res = child
-            .join()
-            .await
-            .context_invoker("Isolated process didn't terminate gracefully")?;
-        let err = res
-            .err()
-            .unwrap_or_else(|| errors::InvokerFailure("(no error reported)".to_string()));
-        return Err(err.context_invoker("Isolated process failed to start isolation"));
-    }
-
-    // Fill uid/gid maps
-    std::fs::write(
-        format!("/proc/{}/uid_map", child.id()),
-        // Global root stays root, the user is 1000, and nobody is bound just in case
-        format!("0 0 1\n1000 1 1\n65534 65534 1\n"),
-    )
-    .context_invoker("Failed to create uid_map for the isolated subprocess")?;
-
-    std::fs::write(format!("/proc/{}/setgroups", child.id()), "deny\n")
-        .context_invoker("Failed to create setgroups for the isolated subprocess")?;
-
-    std::fs::write(
-        format!("/proc/{}/gid_map", child.id()),
-        "0 0 1\n1000 1 1\n65534 65534 1\n",
-    )
-    .context_invoker("Failed to create gid_map for the isolated subprocess")?;
-
-    let prefix = &format!("/tmp/sunwalker_invoker/worker/ns/{id}");
-    std::fs::create_dir(prefix).context_invoker("Failed to create <prefix>")?;
-
-    if let Err(e) = try {
-        // Save namespaces
-        for name in ["ipc", "user", "uts", "net"] {
-            let orig_path = format!("/proc/{}/ns/{name}", child.id());
-            let path = format!("{prefix}/{name}");
-            std::fs::write(&path, "")
-                .with_context_invoker(|| format!("Failed to create <prefix>/{name}"))?;
-            system::bind_mount(&orig_path, &path).with_context_invoker(|| {
-                format!("Failed to bind-mount {orig_path} to <prefix>/{name}")
-            })?;
-        }
-
-        upstream
-            .send(&())
-            .await
-            .context_invoker("Failed to tell the isolated subprocess to terminate")?;
-
-        child
-            .join()
-            .await
-            .context_invoker("Isolated process didn't terminate gracefully")?
-    } {
-        if let Err(e) = unmount_recursively(prefix, false) {
-            println!(
-                "Failed to unmount {prefix} recursively after unsuccessful initialization: {e:?}"
-            );
-        }
-        if let Err(e) = std::fs::remove_dir_all(prefix) {
-            println!("Failed to rm -r {prefix} after unsuccessful initialization: {e:?}");
-        }
-        return Err(e);
-    }
-
-    Ok(Namespace { removed: false, id })
 }
 
 impl RootFS {
@@ -378,34 +364,7 @@ impl RootFS {
     }
 }
 
-impl Namespace {
-    fn _remove(&mut self) -> Result<(), errors::Error> {
-        if self.removed {
-            return Ok(());
-        }
-
-        self.removed = true;
-
-        let prefix = format!("/tmp/sunwalker_invoker/worker/ns/{}", self.id);
-        unmount_recursively(&prefix, false)?;
-        std::fs::remove_dir_all(&prefix)
-            .with_context_invoker(|| format!("Failed to remove {prefix} recursively"))?;
-
-        Ok(())
-    }
-
-    pub fn remove(mut self) -> Result<(), errors::Error> {
-        self._remove()
-    }
-}
-
 impl Drop for RootFS {
-    fn drop(&mut self) {
-        self._remove()/*.unwrap()*/;
-    }
-}
-
-impl Drop for Namespace {
     fn drop(&mut self) {
         self._remove()/*.unwrap()*/;
     }
@@ -414,10 +373,9 @@ impl Drop for Namespace {
 pub async fn run_isolated<T: Object + 'static>(
     f: Box<dyn multiprocessing::FnOnce<(), Output = Result<T, errors::Error>> + Send + Sync>,
     rootfs: &RootFS,
-    ns: &Namespace,
 ) -> Result<T, errors::Error> {
     let mut child = isolated_entry
-        .spawn_tokio(f, rootfs.id.clone(), ns.id.clone())
+        .spawn_tokio(f, rootfs.id.clone())
         .await
         .context_invoker("Failed to start an isolated subprocess")?;
 
@@ -429,11 +387,11 @@ pub async fn run_isolated<T: Object + 'static>(
 
 #[multiprocessing::entrypoint]
 #[tokio::main(flavor = "current_thread")] // unshare requires a single thread
-async fn make_ns(mut duplex: multiprocessing::tokio::Duplex<(), ()>) -> Result<(), errors::Error> {
-    if unsafe {
-        libc::unshare(CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWUTS | CLONE_SYSVSEM | CLONE_NEWNET)
-    } != 0
-    {
+async fn make_ns(
+    mut duplex: multiprocessing::tokio::Duplex<(), ()>,
+    prefix: String,
+) -> Result<(), errors::Error> {
+    if unsafe { libc::unshare(CLONE_NEWIPC | CLONE_NEWUTS | CLONE_SYSVSEM | CLONE_NEWNET) } != 0 {
         return Err(std::io::Error::last_os_error().context_invoker("Failed to unshare namespaces"));
     }
 
@@ -498,6 +456,22 @@ async fn make_ns(mut duplex: multiprocessing::tokio::Duplex<(), ()>) -> Result<(
         }
     }
 
+    // Mount /dev/mqueue. This has to happen inside the IPC namespace, because mqueuefs is attached
+    // to the namespace of the process that mounted it.
+    let dev_mqueue = format!("{prefix}/overlay/root/dev/mqueue");
+    system::mount("mqueue", &dev_mqueue, "mqueue", 0, None)
+        .context_invoker("Failed to mount <prefix>/overlay/root/dev/mqueue")?;
+    // rwxrwxrwt
+    std::fs::set_permissions(dev_mqueue, std::fs::Permissions::from_mode(0o1777))
+        .context_invoker("Failed to make <prefix>/overlay/root/dev/mqueue world-writable")?;
+
+    // Unshare user namespace. This has to happen after mounting /dev/mqueue
+    if unsafe { libc::unshare(CLONE_NEWUSER) } != 0 {
+        return Err(
+            std::io::Error::last_os_error().context_invoker("Failed to unshare user namespace")
+        );
+    }
+
     // Stop ourselves
     duplex
         .send(&())
@@ -517,12 +491,15 @@ async fn make_ns(mut duplex: multiprocessing::tokio::Duplex<(), ()>) -> Result<(
 async fn isolated_entry<T: Object + 'static>(
     f: Box<dyn multiprocessing::FnOnce<(), Output = Result<T, errors::Error>> + Send + Sync>,
     rootfs_id: String,
-    ns_id: String,
 ) -> Result<T, errors::Error> {
+    let overlay = format!("/tmp/sunwalker_invoker/worker/rootfs/{rootfs_id}/overlay");
+
     // Join prepared namespaces. They are old in the sense that they may contain stray information
-    // from previous runs. It's necessary to clean it up to prevent communication between runs.
-    for name in ["ipc", "user", "uts", "net"] {
-        let path = format!("/tmp/sunwalker_invoker/worker/ns/{ns_id}/{name}");
+    // from previous runs. It's necessary to clean it up to prevent communication between runs. The
+    // user namespace should be the last namespace to join, because otherwise we run into problem
+    // upon joining the other namespaces, probably because they were created in the outer namespace.
+    for name in ["ipc", "uts", "net", "user"] {
+        let path = format!("/tmp/sunwalker_invoker/worker/rootfs/{rootfs_id}/ns/{name}");
         let file =
             std::fs::File::open(&path).with_context_invoker(|| format!("Failed to open {path}"))?;
         nix::sched::setns(file.as_raw_fd(), nix::sched::CloneFlags::empty())
@@ -634,27 +611,24 @@ async fn isolated_entry<T: Object + 'static>(
         }
     }
 
-    // POSIX message queues are handled below
+    // POSIX message queues are stored in .../dev/mqueue as files, which we can simply unlink.
+    for entry in std::fs::read_dir(format!("{overlay}/root/dev/mqueue"))
+        .context_invoker("Failed to readdir .../dev/mqueue")?
+    {
+        let entry = entry.context_invoker("Failed to readdir .../dev/mqueue")?;
+        std::fs::remove_file(entry.path())
+            .with_context_invoker(|| format!("Failed to delete {:?}", entry.path()))?;
+    }
 
-    // Unshare mount, PID, and network namespaces:
+    // Unshare mount and PID namespaces:
     // - We remount overlay in the parent, and new mounts in the parent namespace don't propagate to
     //   the child namespace, so we have to create a new mountns every time;
     // - A PID namespace it's not usable after init (the process with pid 1, that is) dies, and we
-    //   can't make sure our init wasn't tampered with if we reuse the namespace;
+    //   can't make sure our init wasn't tampered with if we reuse the namespace.
     if unsafe { libc::unshare(CLONE_NEWNS | CLONE_NEWPID) } != 0 {
         return Err(
             std::io::Error::last_os_error().context_invoker("Failed to unshare mount namespace")
         );
-    }
-
-    // Switch to root user
-    if unsafe { libc::setuid(0) } != 0 {
-        return Err(std::io::Error::last_os_error()
-            .context_invoker("setuid(0) failed while entering sandbox"));
-    }
-    if unsafe { libc::setgid(0) } != 0 {
-        return Err(std::io::Error::last_os_error()
-            .context_invoker("setgid(0) failed while entering sandbox"));
     }
 
     // Instead of pivot_root'ing directly into .../overlay/root, we pivot_root into .../overlay
@@ -680,8 +654,6 @@ async fn isolated_entry<T: Object + 'static>(
     // onto itself. Note that if we pivot_root'ed into .../overlay/root, we'd need to bind-mount
     // itself anyway because the kernel marks .../overlay/root as MNT_LOCKED as a safety restriction
     // due to the use of user namespaces.
-    let overlay = format!("/tmp/sunwalker_invoker/worker/rootfs/{rootfs_id}/overlay");
-
     system::bind_mount_opt(&overlay, &overlay, system::MS_REC)
         .with_context_invoker(|| format!("Failed to bind-mount {overlay} onto itself"))?;
 
@@ -694,15 +666,6 @@ async fn isolated_entry<T: Object + 'static>(
     // Chroot into .../overlay/root
     std::env::set_current_dir("/root").context_invoker("Failed to chdir to /root")?;
     nix::unistd::chroot(".").context_invoker("Failed to chroot into /root")?;
-
-    // POSIX message queues are stored in /dev/mqueue, which we can simply remount instead of
-    // cleaning up queue-by-queue. It is also sort of a necessity, because the IPC that the mqueuefs
-    // is related to depends on when it's mounted.
-    system::mount("mqueue", "/dev/mqueue", "mqueue", 0, None)
-        .context_invoker("Failed to mount /dev/mqueue")?;
-    // rwxrwxrwt
-    std::fs::set_permissions("/dev/mqueue", std::fs::Permissions::from_mode(0o1777))
-        .context_invoker("Failed to make /dev/mqueue world-writable")?;
 
     // Expose defaults for environment variables
     std::env::set_var(

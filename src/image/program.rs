@@ -19,7 +19,6 @@ pub struct Program {
 pub struct InvocableProgram {
     pub program: Program,
     pub rootfs: sandbox::RootFS,
-    pub namespace: sandbox::Namespace,
 }
 
 #[derive(Clone, Object, Serialize, Deserialize)]
@@ -81,16 +80,12 @@ impl Program {
             },
             id.clone(),
         )
+        .await
         .context_invoker("Failed to make rootfs for running")?;
-
-        let namespace = sandbox::make_namespace(id)
-            .await
-            .context_invoker("Failed to make namespace for running")?;
 
         Ok(InvocableProgram {
             program: self,
             rootfs,
-            namespace,
         })
     }
 
