@@ -1,5 +1,8 @@
 use crate::{duplex, imp, Deserialize, FnOnce, Object, Receiver};
-use nix::{libc::pid_t, sys::signal};
+use nix::{
+    libc::{c_void, pid_t},
+    sys::signal,
+};
 use std::ffi::CString;
 use std::io::Result;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -49,10 +52,15 @@ impl<T: Deserialize> Child<T> {
 }
 
 pub(crate) fn _spawn_child(child_fd: RawFd) -> Result<nix::unistd::Pid> {
-    use nix::unistd::ForkResult;
-    match unsafe { nix::unistd::fork() }? {
-        ForkResult::Parent { child } => Ok(child),
-        ForkResult::Child => {
+    match unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_clone,
+            nix::libc::SIGCHLD,
+            std::ptr::null::<c_void>(),
+        )
+    } {
+        -1 => Err(std::io::Error::last_os_error()),
+        0 => {
             signal::sigprocmask(
                 signal::SigmaskHow::SIG_SETMASK,
                 Some(&signal::SigSet::empty()),
@@ -86,6 +94,7 @@ pub(crate) fn _spawn_child(child_fd: RawFd) -> Result<nix::unistd::Pid> {
 
             unreachable!();
         }
+        child_pid => Ok(nix::unistd::Pid::from_raw(child_pid as pid_t)),
     }
 }
 
