@@ -1,31 +1,35 @@
 use crate::{duplex, imp, Deserialize, FnOnce, Object, Receiver};
+use nix::{libc::pid_t, sys::signal};
+use std::ffi::CString;
 use std::io::Result;
-use std::os::unix::{
-    io::{AsRawFd, RawFd},
-    process::CommandExt,
-};
+use std::os::unix::io::{AsRawFd, RawFd};
 
 pub struct Child<T: Deserialize> {
-    proc: std::process::Child,
+    proc_pid: nix::unistd::Pid,
     output_rx: Receiver<T>,
 }
 
 impl<T: Deserialize> Child<T> {
-    pub fn new(proc: std::process::Child, output_rx: Receiver<T>) -> Child<T> {
-        Child { proc, output_rx }
+    pub fn new(proc_pid: nix::unistd::Pid, output_rx: Receiver<T>) -> Child<T> {
+        Child {
+            proc_pid,
+            output_rx,
+        }
     }
 
     pub fn kill(&mut self) -> Result<()> {
-        self.proc.kill()
+        signal::kill(self.proc_pid, signal::Signal::SIGKILL)?;
+        Ok(())
     }
 
-    pub fn id(&mut self) -> u32 {
-        self.proc.id()
+    pub fn id(&mut self) -> pid_t {
+        self.proc_pid.into()
     }
 
     pub fn join(&mut self) -> Result<T> {
         let value = self.output_rx.recv()?;
-        if self.proc.wait()?.success() {
+        let status = nix::sys::wait::waitpid(self.proc_pid, None)?;
+        if let nix::sys::wait::WaitStatus::Exited(_, 0) = status {
             value.ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
@@ -35,8 +39,52 @@ impl<T: Deserialize> Child<T> {
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "The subprocess did not terminate successfully",
+                format!(
+                    "The subprocess did not terminate successfully: {:?}",
+                    status
+                ),
             ))
+        }
+    }
+}
+
+pub(crate) fn _spawn_child(child_fd: RawFd) -> Result<nix::unistd::Pid> {
+    use nix::unistd::ForkResult;
+    match unsafe { nix::unistd::fork() }? {
+        ForkResult::Parent { child } => Ok(child),
+        ForkResult::Child => {
+            signal::sigprocmask(
+                signal::SigmaskHow::SIG_SETMASK,
+                Some(&signal::SigSet::empty()),
+                None,
+            )?;
+            for i in 1..32 {
+                if i != nix::libc::SIGKILL && i != nix::libc::SIGSTOP {
+                    unsafe {
+                        signal::sigaction(
+                            signal::Signal::try_from(i).unwrap(),
+                            &signal::SigAction::new(
+                                signal::SigHandler::SigDfl,
+                                signal::SaFlags::empty(),
+                                signal::SigSet::empty(),
+                            ),
+                        )?;
+                    }
+                }
+            }
+
+            imp::disable_cloexec(child_fd)?;
+
+            nix::unistd::execv(
+                &CString::new("/proc/self/exe").unwrap(),
+                &[
+                    CString::new("_multiprocessing_").unwrap(),
+                    CString::new(child_fd.to_string()).unwrap(),
+                ],
+            )
+            .expect("execve failed");
+
+            unreachable!();
         }
     }
 }
@@ -46,19 +94,8 @@ pub fn spawn<T: Object>(entry: Box<dyn FnOnce<(RawFd,), Output = i32>>) -> Resul
 
     let child_fd = child.as_raw_fd();
 
-    let mut command = std::process::Command::new("/proc/self/exe");
-    let child = unsafe {
-        command
-            .arg0("_multiprocessing_")
-            .arg(child_fd.to_string())
-            .pre_exec(move || {
-                imp::disable_cloexec(child_fd)?;
-                Ok(())
-            })
-            .spawn()?
-    };
+    let pid = _spawn_child(child_fd)?;
 
     local.send(&entry)?;
-
-    Ok(Child::new(child, local.into_receiver()))
+    Ok(Child::new(pid, local.into_receiver()))
 }
