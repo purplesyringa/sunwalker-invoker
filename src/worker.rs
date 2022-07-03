@@ -276,6 +276,11 @@ impl Subprocess {
             }
 
             submission::Command::Test(tests) => {
+                let strategy = main.strategy.as_mut().context_invoker(
+                    "Attempted to judge a program on a core before the core acquired a reference \
+                     to the built program",
+                )?;
+
                 for test in tests {
                     if !self
                         .instantiated_dependency_dag
@@ -289,14 +294,6 @@ impl Subprocess {
                             .context_invoker("Failed to send command result to invoker")?;
                         continue;
                     }
-
-                    let strategy = main.strategy.as_mut().ok_or_else(|| {
-                        errors::InvokerFailure(
-                            "Attempted to judge a program on a core before the core acquired a \
-                             reference to the built program"
-                                .to_string(),
-                        )
-                    })?;
 
                     let (handle, reg) = AbortHandle::new_pair();
                     *self.current_test.lock().await = Some((test, handle));
