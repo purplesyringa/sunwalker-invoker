@@ -381,10 +381,14 @@ pub async fn run_isolated<T: Object + 'static>(
     f: Box<dyn multiprocessing::FnOnce<(), Output = Result<T, errors::Error>> + Send + Sync>,
     rootfs: &RootFS,
 ) -> Result<T, errors::Error> {
-    let mut child = isolated_entry
-        .spawn_tokio(f, rootfs.id.clone())
-        .await
-        .context_invoker("Failed to start an isolated subprocess")?;
+    // A PID namespace it's not usable after the process with PID 1 dies, so we can't create the
+    // namespace once and reuse it later. We also can't unshare pidns inside isolated_entry, because
+    // that would only affect the pidns of its children, and we would be unable to mount /proc
+    // correctly.
+    let mut child =
+        unsafe { isolated_entry.spawn_with_flags_tokio(CLONE_NEWPID, f, rootfs.id.clone()) }
+            .await
+            .context_invoker("Failed to start an isolated subprocess")?;
 
     child
         .join()
@@ -626,12 +630,9 @@ async fn isolated_entry<T: Object + 'static>(
             .with_context_invoker(|| format!("Failed to delete {:?}", entry.path()))?;
     }
 
-    // Unshare mount and PID namespaces:
-    // - We remount overlay in the parent, and new mounts in the parent namespace don't propagate to
-    //   the child namespace, so we have to create a new mountns every time;
-    // - A PID namespace it's not usable after init (the process with pid 1, that is) dies, and we
-    //   can't make sure our init wasn't tampered with if we reuse the namespace.
-    if unsafe { libc::unshare(CLONE_NEWNS | CLONE_NEWPID) } != 0 {
+    // We remount overlay in the parent, and new mounts in the parent namespace don't propagate to
+    // the child namespace, so we have to create a new mountns every time.
+    if unsafe { libc::unshare(CLONE_NEWNS) } != 0 {
         return Err(
             std::io::Error::last_os_error().context_invoker("Failed to unshare mount namespace")
         );
