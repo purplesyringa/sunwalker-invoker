@@ -126,49 +126,63 @@ pub fn make_rootfs(
     let prefix = format!("/tmp/sunwalker_invoker/worker/rootfs/{id}");
 
     std::fs::create_dir(&prefix).context_invoker("Failed to create directory <prefix>")?;
-    std::fs::create_dir(format!("{prefix}/ephemeral"))
-        .context_invoker("Failed to create directory <prefix>/ephemeral")?;
-    std::fs::create_dir(format!("{prefix}/overlay"))
-        .context_invoker("Failed to create directory <prefix>/overlay")?;
-    std::fs::create_dir(format!("{prefix}/overlay/root"))
-        .context_invoker("Failed to create directory <prefix>/overlay/root")?;
 
-    // Create a lowerdir for /space and /dev
-    system::mount("none", format!("{prefix}/ephemeral"), "tmpfs", 0, None)
-        .context_invoker("Failed to mount tmpfs on <prefix>/ephemeral")?;
-    std::fs::create_dir(format!("{prefix}/ephemeral/space"))
-        .context_invoker("Failed to create <prefix>/ephemeral/space")?;
-    std::fs::create_dir(format!("{prefix}/ephemeral/dev"))
-        .context_invoker("Failed to create <prefix>/ephemeral/dev")?;
+    if let Err(e) = try {
+        std::fs::create_dir(format!("{prefix}/ephemeral"))
+            .context_invoker("Failed to create directory <prefix>/ephemeral")?;
+        std::fs::create_dir(format!("{prefix}/overlay"))
+            .context_invoker("Failed to create directory <prefix>/overlay")?;
+        std::fs::create_dir(format!("{prefix}/overlay/root"))
+            .context_invoker("Failed to create directory <prefix>/overlay/root")?;
 
-    // Mount overlay
-    let fs_options = format!(
-        "lowerdir={}/{}:{prefix}/ephemeral",
-        package
-            .image
-            .mountpoint
-            .to_str()
-            .context_invoker("Mountpoint must be a string")?,
-        package.name
-    );
-    system::mount(
-        "overlay",
-        format!("{prefix}/overlay/root"),
-        "overlay",
-        0,
-        Some(&fs_options),
-    )
-    .context_invoker("Failed to mount overlay on <prefix>/overlay/root")?;
+        // Create a lowerdir for /space and /dev
+        system::mount("none", format!("{prefix}/ephemeral"), "tmpfs", 0, None)
+            .context_invoker("Failed to mount tmpfs on <prefix>/ephemeral")?;
+        std::fs::create_dir(format!("{prefix}/ephemeral/space"))
+            .context_invoker("Failed to create <prefix>/ephemeral/space")?;
+        std::fs::create_dir(format!("{prefix}/ephemeral/dev"))
+            .context_invoker("Failed to create <prefix>/ephemeral/dev")?;
 
-    // Don't mount /space, because RootFS::reset() will remount it anyway
+        // Mount overlay
+        let fs_options = format!(
+            "lowerdir={}/{}:{prefix}/ephemeral",
+            package
+                .image
+                .mountpoint
+                .to_str()
+                .context_invoker("Mountpoint must be a string")?,
+            package.name
+        );
+        system::mount(
+            "overlay",
+            format!("{prefix}/overlay/root"),
+            "overlay",
+            0,
+            Some(&fs_options),
+        )
+        .context_invoker("Failed to mount overlay on <prefix>/overlay/root")?;
 
-    // Mount /dev on overlay
-    system::bind_mount_opt(
-        "/tmp/sunwalker_invoker/dev",
-        format!("{prefix}/overlay/root/dev"),
-        system::MS_RDONLY,
-    )
-    .context_invoker("Failed to mount /dev on <prefix>/overlay/root")?;
+        // Don't mount /space, because RootFS::reset() will remount it anyway
+
+        // Mount /dev on overlay
+        system::bind_mount_opt(
+            "/tmp/sunwalker_invoker/dev",
+            format!("{prefix}/overlay/root/dev"),
+            system::MS_RDONLY,
+        )
+        .context_invoker("Failed to mount /dev on <prefix>/overlay/root")?;
+    } {
+        // Rollback
+        if let Err(e) = unmount_recursively(&prefix, false) {
+            println!(
+                "Failed to unmount {prefix} recursively after unsuccessful initialization: {e:?}"
+            );
+        }
+        if let Err(e) = std::fs::remove_dir_all(&prefix) {
+            println!("Failed to rm -r {prefix} after unsuccessful initialization: {e:?}");
+        }
+        return Err(e);
+    }
 
     Ok(RootFS {
         removed: false,
@@ -202,7 +216,7 @@ pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
         return Err(err.context_invoker("Isolated process failed to start isolation"));
     }
 
-    // Fill uid/gid maps and switch to
+    // Fill uid/gid maps
     std::fs::write(
         format!("/proc/{}/uid_map", child.id()),
         // Global root stays root, the user is 1000, and nobody is bound just in case
@@ -222,7 +236,8 @@ pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
     let prefix = &format!("/tmp/sunwalker_invoker/worker/ns/{id}");
     std::fs::create_dir(prefix).context_invoker("Failed to create <prefix>")?;
 
-    (async move || {
+    if let Err(e) = try {
+        // Save namespaces
         for name in ["ipc", "user", "uts", "net"] {
             let orig_path = format!("/proc/{}/ns/{name}", child.id());
             let path = format!("{prefix}/{name}");
@@ -242,23 +257,17 @@ pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
             .join()
             .await
             .context_invoker("Isolated process didn't terminate gracefully")?
-    })()
-    .await
-    .map_err(|e| {
+    } {
         if let Err(e) = unmount_recursively(prefix, false) {
             println!(
-                "Failed to unmount {} recursively after unsuccessful initialization: {:?}",
-                prefix, e
+                "Failed to unmount {prefix} recursively after unsuccessful initialization: {e:?}"
             );
         }
         if let Err(e) = std::fs::remove_dir_all(prefix) {
-            println!(
-                "Failed to rm -r {} after unsuccessful initialization: {:?}",
-                prefix, e
-            );
+            println!("Failed to rm -r {prefix} after unsuccessful initialization: {e:?}");
         }
-        e
-    })?;
+        return Err(e);
+    }
 
     Ok(Namespace { removed: false, id })
 }
