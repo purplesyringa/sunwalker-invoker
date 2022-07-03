@@ -137,6 +137,8 @@ pub async fn make_rootfs(
             .context_invoker("Failed to create <prefix>/ephemeral/space")?;
         std::fs::create_dir(format!("{prefix}/ephemeral/dev"))
             .context_invoker("Failed to create <prefix>/ephemeral/dev")?;
+        std::fs::create_dir(format!("{prefix}/ephemeral/proc"))
+            .context_invoker("Failed to create <prefix>/ephemeral/proc")?;
 
         // Mount overlay
         let fs_options = format!(
@@ -220,7 +222,12 @@ pub async fn make_rootfs(
 
         for name in ["ipc", "user", "uts", "net"] {
             let orig_path = format!("/proc/{}/ns/{name}", child.id());
-            let path = format!("{prefix}/ns/{name}");
+            // We want the userns to be accessible from inside /overlay
+            let path = if name == "user" {
+                format!("{prefix}/overlay/userns")
+            } else {
+                format!("{prefix}/ns/{name}")
+            };
             std::fs::write(&path, "")
                 .with_context_invoker(|| format!("Failed to create <prefix>/ns/{name}"))?;
             system::bind_mount(&orig_path, &path).with_context_invoker(|| {
@@ -496,9 +503,8 @@ async fn isolated_entry<T: Object + 'static>(
 
     // Join prepared namespaces. They are old in the sense that they may contain stray information
     // from previous runs. It's necessary to clean it up to prevent communication between runs. The
-    // user namespace should be the last namespace to join, because otherwise we run into problem
-    // upon joining the other namespaces, probably because they were created in the outer namespace.
-    for name in ["ipc", "uts", "net", "user"] {
+    // user namespace is joined later.
+    for name in ["ipc", "uts", "net"] {
         let path = format!("/tmp/sunwalker_invoker/worker/rootfs/{rootfs_id}/ns/{name}");
         let file =
             std::fs::File::open(&path).with_context_invoker(|| format!("Failed to open {path}"))?;
@@ -631,6 +637,24 @@ async fn isolated_entry<T: Object + 'static>(
         );
     }
 
+    // Mount /proc
+    system::mount(
+        "proc",
+        format!("{overlay}/root/proc"),
+        "proc",
+        system::MS_NOSUID | system::MS_NOEXEC | system::MS_NODEV,
+        None,
+    )
+    .context_invoker("Failed to mount .../proc")?;
+
+    // pivot_root requires the new root to be a mount, and for it not to be MNT_LOCKED (the reason
+    // for which I don't quite understand). The simplest way to do that is to bind-mount .../overlay
+    // onto itself. Note that if we pivot_root'ed into .../overlay/root, we'd need to bind-mount
+    // itself anyway because the kernel marks .../overlay/root as MNT_LOCKED as a safety restriction
+    // due to the use of user namespaces.
+    system::bind_mount_opt(&overlay, &overlay, system::MS_REC)
+        .with_context_invoker(|| format!("Failed to bind-mount {overlay} onto itself"))?;
+
     // Instead of pivot_root'ing directly into .../overlay/root, we pivot_root into .../overlay
     // first and chroot into /root second. There are two reasons for this inefficiency:
     //
@@ -649,19 +673,37 @@ async fn isolated_entry<T: Object + 'static>(
     // One prominent example is mount namespace, which enables the user to mount a read-write tmpfs
     // without disk limits and use it as unlimited temporary storage to exceed the memory limit.
 
-    // pivot_root requires the new root to be a mount, and for it not to be MNT_LOCKED (the reason
-    // for which I don't quite understand). The simplest way to do that is to bind-mount .../overlay
-    // onto itself. Note that if we pivot_root'ed into .../overlay/root, we'd need to bind-mount
-    // itself anyway because the kernel marks .../overlay/root as MNT_LOCKED as a safety restriction
-    // due to the use of user namespaces.
-    system::bind_mount_opt(&overlay, &overlay, system::MS_REC)
-        .with_context_invoker(|| format!("Failed to bind-mount {overlay} onto itself"))?;
-
     // Change root to .../overlay
     std::env::set_current_dir(&overlay)
         .with_context_invoker(|| format!("Failed to chdir to new root at {overlay}"))?;
     nix::unistd::pivot_root(".", ".").context_invoker("Failed to pivot_root")?;
-    system::umount_opt(".", system::MNT_DETACH).context_invoker("Failed to unmount self")?;
+
+    // Unmount the old root
+    system::umount_opt(".", system::MNT_DETACH).context_invoker("Failed to unmount old root")?;
+
+    // Join the user namespace. This was not done before for three reasons:
+    //
+    // Firstly, this has to be joined after all other namespaces, because those other namespaces
+    // were unshared before userns, and therefore have to be joined in the same userns they were
+    // unshared in (something something security).
+    //
+    // Secondly, procfs has to be mounted outside the user namespace, because of a paranoid check in
+    // the kernel. Namely, it refuses to mount procfs in a namespace if it is already mounted
+    // somewhere in the parent namespace (and it is), and something is mounted on top of that mount,
+    // because it's afraid that the new mount may be used to access data that ought to be hidden.
+    // Mounting procfs while in the root namespace avoid this problem because we have CAP_SYS_ADMIN
+    // there.
+    //
+    // Thirdly, apparently we can only affect the mount namespace from the userns that created it,
+    // which is reasonable, because CAP_SYS_ADMIN inside the userns means absolutely nothing about
+    // the permissions to the mountns, so all mounting has to be done before switching the userns.
+    {
+        let path = format!("/userns");
+        let file =
+            std::fs::File::open(&path).with_context_invoker(|| format!("Failed to open {path}"))?;
+        nix::sched::setns(file.as_raw_fd(), nix::sched::CloneFlags::empty())
+            .with_context_invoker(|| format!("Failed to setns {path}"))?;
+    }
 
     // Chroot into .../overlay/root
     std::env::set_current_dir("/root").context_invoker("Failed to chdir to /root")?;
