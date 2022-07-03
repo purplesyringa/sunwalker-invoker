@@ -1,6 +1,6 @@
 use crate::{duplex, imp, Deserialize, FnOnce, Object, Receiver};
 use nix::{
-    libc::{c_void, pid_t},
+    libc::{c_int, c_void, pid_t},
     sys::signal,
 };
 use std::ffi::CString;
@@ -51,14 +51,12 @@ impl<T: Deserialize> Child<T> {
     }
 }
 
-pub(crate) fn _spawn_child(child_fd: RawFd) -> Result<nix::unistd::Pid> {
-    match unsafe {
-        nix::libc::syscall(
-            nix::libc::SYS_clone,
-            nix::libc::SIGCHLD,
-            std::ptr::null::<c_void>(),
-        )
-    } {
+pub(crate) unsafe fn _spawn_child(child_fd: RawFd, flags: c_int) -> Result<nix::unistd::Pid> {
+    match nix::libc::syscall(
+        nix::libc::SYS_clone,
+        nix::libc::SIGCHLD | flags,
+        std::ptr::null::<c_void>(),
+    ) {
         -1 => Err(std::io::Error::last_os_error()),
         0 => {
             signal::sigprocmask(
@@ -68,16 +66,14 @@ pub(crate) fn _spawn_child(child_fd: RawFd) -> Result<nix::unistd::Pid> {
             )?;
             for i in 1..32 {
                 if i != nix::libc::SIGKILL && i != nix::libc::SIGSTOP {
-                    unsafe {
-                        signal::sigaction(
-                            signal::Signal::try_from(i).unwrap(),
-                            &signal::SigAction::new(
-                                signal::SigHandler::SigDfl,
-                                signal::SaFlags::empty(),
-                                signal::SigSet::empty(),
-                            ),
-                        )?;
-                    }
+                    signal::sigaction(
+                        signal::Signal::try_from(i).unwrap(),
+                        &signal::SigAction::new(
+                            signal::SigHandler::SigDfl,
+                            signal::SaFlags::empty(),
+                            signal::SigSet::empty(),
+                        ),
+                    )?;
                 }
             }
 
@@ -98,12 +94,15 @@ pub(crate) fn _spawn_child(child_fd: RawFd) -> Result<nix::unistd::Pid> {
     }
 }
 
-pub fn spawn<T: Object>(entry: Box<dyn FnOnce<(RawFd,), Output = i32>>) -> Result<Child<T>> {
+pub unsafe fn spawn<T: Object>(
+    entry: Box<dyn FnOnce<(RawFd,), Output = i32>>,
+    flags: c_int,
+) -> Result<Child<T>> {
     let (mut local, child) = duplex::<Box<dyn FnOnce<(RawFd,), Output = i32>>, T>()?;
 
     let child_fd = child.as_raw_fd();
 
-    let pid = _spawn_child(child_fd)?;
+    let pid = _spawn_child(child_fd, flags)?;
 
     local.send(&entry)?;
     Ok(Child::new(pid, local.into_receiver()))

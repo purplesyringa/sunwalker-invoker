@@ -294,12 +294,15 @@ impl<T: Deserialize> Child<T> {
     }
 }
 
-pub async fn spawn<T: Object>(entry: Box<dyn FnOnce<(RawFd,), Output = i32>>) -> Result<Child<T>> {
+pub async unsafe fn spawn<T: Object>(
+    entry: Box<dyn FnOnce<(RawFd,), Output = i32>>,
+    flags: nix::libc::c_int,
+) -> Result<Child<T>> {
     let (mut local, child) = duplex::<Box<dyn FnOnce<(RawFd,), Output = i32>>, T>()?;
 
     let child_fd = child.as_raw_fd();
 
-    let pid = subprocess::_spawn_child(child_fd)?;
+    let pid = subprocess::_spawn_child(child_fd, flags)?;
 
     local.send(&entry).await?;
     Ok(Child::new(pid, local.into_receiver()))

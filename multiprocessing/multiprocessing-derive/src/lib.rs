@@ -224,14 +224,22 @@ pub fn entrypoint(_meta: TokenStream, input: TokenStream) -> TokenStream {
             #[link_name = #link_name]
             #input
 
-            pub fn spawn #generic_params(&self, #(#fn_args,)*) -> ::std::io::Result<::multiprocessing::Child<#return_type>> {
+            pub unsafe fn spawn_with_flags #generic_params(&self, flags: ::multiprocessing::libc::c_int, #(#fn_args,)*) -> ::std::io::Result<::multiprocessing::Child<#return_type>> {
                 use ::multiprocessing::Bind;
-                ::multiprocessing::spawn(Box::new(::multiprocessing::EntrypointWrapper::<#entry_ident #generics>(#entry_ident::new(Box::new(#bound)))))
+                ::multiprocessing::spawn(Box::new(::multiprocessing::EntrypointWrapper::<#entry_ident #generics>(#entry_ident::new(Box::new(#bound)))), flags)
+            }
+
+            pub async unsafe fn spawn_with_flags_tokio #generic_params(&self, flags: ::multiprocessing::libc::c_int, #(#fn_args,)*) -> ::std::io::Result<::multiprocessing::tokio::Child<#return_type>> {
+                use ::multiprocessing::Bind;
+                ::multiprocessing::tokio::spawn(Box::new(::multiprocessing::EntrypointWrapper::<#entry_ident #generics>(#entry_ident::new(Box::new(#bound)))), flags).await
+            }
+
+            pub fn spawn #generic_params(&self, #(#fn_args,)*) -> ::std::io::Result<::multiprocessing::Child<#return_type>> {
+                unsafe { self.spawn_with_flags(0, #(#arg_names,)*) }
             }
 
             pub async fn spawn_tokio #generic_params(&self, #(#fn_args,)*) -> ::std::io::Result<::multiprocessing::tokio::Child<#return_type>> {
-                use ::multiprocessing::Bind;
-                ::multiprocessing::tokio::spawn(Box::new(::multiprocessing::EntrypointWrapper::<#entry_ident #generics>(#entry_ident::new(Box::new(#bound))))).await
+                unsafe { self.spawn_with_flags_tokio(0, #(#arg_names,)*) }.await
             }
         }
 
