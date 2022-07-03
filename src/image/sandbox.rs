@@ -10,11 +10,10 @@ use libc::{
     CLONE_SYSVSEM,
 };
 use multiprocessing::Object;
-use std::ffi::{CString, OsString};
 use std::io::BufRead;
 use std::os::unix::{
     fs::{MetadataExt, PermissionsExt},
-    {ffi::OsStringExt, io::AsRawFd},
+    io::AsRawFd,
 };
 use std::path::PathBuf;
 
@@ -36,7 +35,7 @@ pub struct Namespace {
 }
 
 // Unmount everything beneath prefix recursively. Does not unmount prefix itself.
-fn unmount_recursively(prefix: &str) -> Result<(), errors::Error> {
+fn unmount_recursively(prefix: &str, inclusive: bool) -> Result<(), errors::Error> {
     let prefix_slash = format!("{prefix}/");
 
     let file = std::fs::File::open("/proc/self/mounts")
@@ -51,7 +50,7 @@ fn unmount_recursively(prefix: &str) -> Result<(), errors::Error> {
         let target_path = it
             .next()
             .context_invoker("Invalid format of /proc/self/mounts")?;
-        if target_path.starts_with(&prefix_slash) {
+        if target_path.starts_with(&prefix_slash) || (inclusive && target_path == prefix) {
             vec.push(target_path.to_string());
         }
     }
@@ -161,15 +160,7 @@ pub fn make_rootfs(
     )
     .context_invoker("Failed to mount overlay on <prefix>/overlay/root")?;
 
-    // Make /space a tmpfs with the necessary disk quotas
-    system::mount(
-        "none",
-        format!("{prefix}/overlay/root/space"),
-        "tmpfs",
-        system::MS_NOSUID,
-        Some(format!("size={},nr_inodes={}", quotas.space, quotas.max_inodes).as_ref()),
-    )
-    .context_invoker("Failed to mount tmpfs on <prefix>/overlay/root/space")?;
+    // Don't mount /space, because RootFS::reset() will remount it anyway
 
     // Mount /dev on overlay
     system::bind_mount_opt(
@@ -178,36 +169,6 @@ pub fn make_rootfs(
         system::MS_RDONLY,
     )
     .context_invoker("Failed to mount /dev on <prefix>/overlay/root")?;
-
-    // Mount /dev/shm on overlay
-    std::fs::create_dir(format!("{prefix}/overlay/root/space/.shm"))
-        .context_invoker("Failed to create directory at <prefix>/overlay/root/space/.shm")?;
-    // rwxrwxrwt
-    std::fs::set_permissions(
-        format!("{prefix}/overlay/root/space/.shm"),
-        std::fs::Permissions::from_mode(0o1777),
-    )
-    .context_invoker("Failed to make <prefix>/overlay/root/space/.shm")?;
-    system::bind_mount(
-        format!("{prefix}/overlay/root/space/.shm"),
-        format!("{prefix}/overlay/root/dev/shm"),
-    )
-    .context_invoker("Failed to mount /dev/shm on <prefix>/overlay/root")?;
-
-    // Allow the sandbox user to write to /space
-    std::os::unix::fs::chown(format!("{prefix}/overlay/root/space"), Some(1), Some(1))
-        .context_invoker("Failed to chown <prefix>/overlay/root/space")?;
-
-    // Initialize user directory.
-    for (from, to) in bound_files.iter() {
-        let to_path = format!("{prefix}/overlay/root{to}");
-
-        std::fs::write(&to_path, "")
-            .with_context_invoker(|| format!("Failed to create <prefix>/overlay/root{to}"))?;
-        system::bind_mount_opt(from, &to_path, system::MS_RDONLY).with_context_invoker(|| {
-            format!("Failed to bind-mount {from:?} to <prefix>/overlay/root{to}")
-        })?;
-    }
 
     Ok(RootFS {
         removed: false,
@@ -284,7 +245,7 @@ pub async fn make_namespace(id: String) -> Result<Namespace, errors::Error> {
     })()
     .await
     .map_err(|e| {
-        if let Err(e) = unmount_recursively(prefix) {
+        if let Err(e) = unmount_recursively(prefix, false) {
             println!(
                 "Failed to unmount {} recursively after unsuccessful initialization: {:?}",
                 prefix, e
@@ -306,12 +267,10 @@ impl RootFS {
     pub fn reset(&self) -> Result<(), errors::Error> {
         let space = format!("{}/space", self.overlay());
 
-        // Unmount everything under /space
-        unmount_recursively(&space)?;
+        // Unmount /space and everything beneath
+        unmount_recursively(&space, true)?;
 
         // Remount /space
-        system::umount(&space).with_context_invoker(|| format!("Failed to unmount {space}"))?;
-
         system::mount(
             "none",
             &space,
@@ -335,7 +294,14 @@ impl RootFS {
         let dev_shm = format!("{}/dev/shm", self.overlay());
         std::fs::create_dir(&space_shm)
             .with_context_invoker(|| format!("Failed to create directory at {space_shm}"))?;
-        system::umount(&dev_shm).with_context_invoker(|| format!("Failed to unmount {dev_shm}"))?;
+        if let Err(e) = system::umount(&dev_shm) {
+            if let std::io::ErrorKind::InvalidInput = e.kind() {
+                // This means /dev/shm is not a mountpoint, which is fine the first time we run
+                // reset()
+            } else {
+                return Err(e.with_context_invoker(|| format!("Failed to unmount {dev_shm}")));
+            }
+        }
         system::bind_mount(&space_shm, &dev_shm).with_context_invoker(|| {
             format!(
                 "Failed to bind-mount {space_shm} to {}/dev/shm",
@@ -362,7 +328,7 @@ impl RootFS {
         self.removed = true;
 
         let prefix = format!("/tmp/sunwalker_invoker/worker/rootfs/{}", self.id);
-        unmount_recursively(&prefix)?;
+        unmount_recursively(&prefix, false)?;
         std::fs::remove_dir_all(&prefix)
             .with_context_invoker(|| format!("Failed to remove {prefix} recursively"))?;
 
@@ -412,7 +378,7 @@ impl Namespace {
         self.removed = true;
 
         let prefix = format!("/tmp/sunwalker_invoker/worker/ns/{}", self.id);
-        unmount_recursively(&prefix)?;
+        unmount_recursively(&prefix, false)?;
         std::fs::remove_dir_all(&prefix)
             .with_context_invoker(|| format!("Failed to remove {prefix} recursively"))?;
 

@@ -36,6 +36,10 @@ impl LanguageImpl {
         .context_invoker("Failed to make sandbox for identification")?;
         let ns = sandbox::make_namespace("identify".to_string()).await?;
 
+        rootfs
+            .reset()
+            .context_invoker("Failed to reset rootfs for identification")?;
+
         // Enter the sandbox in another process
         let identification = sandbox::run_isolated(
             Box::new(identify.bind(self.borrow_config().identify.clone())),
@@ -145,6 +149,10 @@ impl LanguageImpl {
         )
         .context_invoker("Failed to make sandbox for build")?;
         let ns = sandbox::make_namespace("build".to_string()).await?;
+
+        rootfs
+            .reset()
+            .context_invoker("Failed to reset rootfs for build")?;
 
         // Add /space/artifacts -> /tmp/sunwalker_invoker/artifacts/{build_id}
         let artifacts_path = PathBuf::from(format!("/tmp/sunwalker_invoker/artifacts/{build_id}"));
