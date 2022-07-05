@@ -583,6 +583,3 @@ fn enter_sandbox() -> anyhow::Result<()> {
 
     Ok(())
 }
-
-    Ok(())
-}
