@@ -753,6 +753,7 @@ name = "multiprocessing"
 version = "0.1.0"
 dependencies = [
  "ctor",
+ "itertools",
  "lazy_static",
  "multiprocessing-derive",
  "nix 0.23.1",
