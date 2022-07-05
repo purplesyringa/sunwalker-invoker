@@ -42,12 +42,6 @@ pub struct Client {
     communicator: Arc<Communicator>,
 }
 
-#[derive(Deserialize)]
-struct ArchiveManifest {
-    directories: Vec<String>,
-    file_hashes: HashMap<String, String>,
-}
-
 impl Communicator {
     async fn send_to_conductor(&self, message: message::i2c::Message) -> Result<(), errors::Error> {
         self.conductor_write
