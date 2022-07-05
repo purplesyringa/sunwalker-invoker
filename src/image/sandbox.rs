@@ -648,6 +648,102 @@ async fn isolated_entry<T: Object + 'static>(
     )
     .context_invoker("Failed to mount .../proc")?;
 
+    // Linux announces way too much information under /proc. Hide everything possibly dangerous.
+    for path in [
+        // ACPI
+        "acpi",
+        // ALSA
+        "asound",
+        // A neighbour to zoneinfo
+        "buddyinfo",
+        // Contains PCI stuff
+        "bus",
+        // init(1) arguments
+        "cmdline",
+        // ttys
+        "consoles",
+        // May contain info about disks
+        "devices",
+        // Disk statistics, includes monotonic counters as well as private information
+        "diskstats",
+        // Contains info on DMA channels
+        "dma",
+        // Usually only contains information about RTC, which is fine, but nvram and NVIDIA data is
+        // common too
+        "driver",
+        // Contains information about framebuffers and related kernel modules
+        "fb",
+        // Contains statistics and configuration of physical filesystems, journals, etc.
+        "fs",
+        // Interrupts info, including references to PCI and modules
+        "interrupts",
+        // Contains kernel memory map. Only reveals absolute addresses to root, but just in case.
+        "iomem",
+        // Contains kernel memory map. Only reveals absolute addresses to root, but just in case.
+        "ioports",
+        // Interrupts stuff
+        "irq",
+        // Kernel symbols, including those of modules. Only reveals absolute addresses to root.
+        "kallsyms",
+        // Kernel memory
+        "kcore",
+        // Keyrings
+        "key-users",
+        // Keyring
+        "keys",
+        // Exactly what it says on the tin. Should be mode 400 anyway, but just in case.
+        "kmsg",
+        // RAID
+        "mdstat",
+        // /proc/meminfo is not namespaced, which means nothing inside it can really be trusted
+        "meminfo",
+        // Modules. May be useful for vulnerability enumeration.
+        "misc",
+        // Currently loaded modules
+        "modules",
+        // Contains information on block devices
+        "partitions",
+        // Load average and alike
+        "pressure",
+        // Contains way too much information about the scheduler
+        "sched_debug",
+        // Scheduler statistics, incldues monotonic counters
+        "schedstat",
+        // SCSI
+        "scsi",
+        // Monotonic counters
+        "softirqs",
+        // This one is complicated. It contains some information tools like time(1) may find useful,
+        // but it also reveals the count of processes started since uptime, the uptime itself, and
+        // other counters which may theoretically be used to learn information about the state of
+        // the judge.
+        "stat",
+        // May reveal paths outside sandbox
+        "swaps",
+        // Reveals hardware
+        "sys/dev",
+        // A monotonic counter
+        "uptime",
+        // Memory statistics, contains various monotonic counters
+        "vmstat",
+        // CPU and memory info, includes monotonic counters
+        "zoneinfo",
+    ] {
+        let target = format!("{overlay}/root/proc/{path}");
+
+        let metadata = std::fs::metadata(&target)
+            .with_context_invoker(|| format!("Failed to stat /proc/{path}"))?;
+
+        let source = if metadata.is_dir() {
+            "/tmp/sunwalker_invoker/emptydir"
+        } else {
+            "/dev/null"
+        };
+
+        system::bind_mount_opt(source, target, system::MS_RDONLY)
+            .with_context_invoker(|| format!("Failed to hide /proc/{path}"))?;
+    }
+
     // pivot_root requires the new root to be a mount, and for it not to be MNT_LOCKED (the reason
     // for which I don't quite understand). The simplest way to do that is to bind-mount .../overlay
     // onto itself. Note that if we pivot_root'ed into .../overlay/root, we'd need to bind-mount

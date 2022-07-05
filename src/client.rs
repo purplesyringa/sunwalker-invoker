@@ -539,6 +539,8 @@ fn enter_sandbox() -> anyhow::Result<()> {
         .with_context(|| "Creating /tmp/sunwalker_invoker/submissions failed")?;
     std::fs::create_dir("/tmp/sunwalker_invoker/artifacts")
         .with_context(|| "Creating /tmp/sunwalker_invoker/artifacts failed")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/emptydir")
+        .with_context(|| "Creating /tmp/sunwalker_invoker/emptydir failed")?;
 
     // Prepare a copy of /dev
     std::fs::create_dir("/tmp/sunwalker_invoker/dev")
