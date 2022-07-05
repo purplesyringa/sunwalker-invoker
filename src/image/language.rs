@@ -1,12 +1,13 @@
 use crate::{
     errors,
     errors::{ToError, ToResult},
-    image::{config, package, program, sandbox},
+    image::{config, ids, package, program, sandbox},
     system,
 };
 use multiprocessing::{Bind, Deserialize, DeserializeBoxed, Deserializer, Serialize, Serializer};
 use ouroboros::self_referencing;
 use rand::{thread_rng, Rng};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -162,8 +163,12 @@ impl LanguageImpl {
             .with_context_invoker(|| format!("Failed to bind-mount {artifacts_path:?}"))?;
 
         // Allow the sandbox user to access data
-        std::os::unix::fs::chown(&overlay_artifacts_path, Some(1), Some(1))
-            .with_context_invoker(|| format!("Failed to chown {overlay_artifacts_path}"))?;
+        std::os::unix::fs::chown(
+            &overlay_artifacts_path,
+            Some(ids::EXTERNAL_USER_UID),
+            Some(ids::EXTERNAL_USER_GID),
+        )
+        .with_context_invoker(|| format!("Failed to chown {overlay_artifacts_path}"))?;
 
         // Enter the sandbox in another process
         let (pattern, log) = sandbox::run_isolated(
@@ -304,14 +309,17 @@ impl<'a> DeserializeBoxed<'a> for Language {
 #[lisp::function]
 fn exec(call: lisp::CallTerm, state: &lisp::State) -> Result<lisp::TypedRef, lisp::Error> {
     let argv: Vec<String> = lisp::evaluate(lisp::builtins::as_item1(call)?, state)?.to_native()?;
-    let output = Command::new(argv[0].clone())
-        .args(argv.iter().skip(1))
-        .stdin(Stdio::null())
-        .current_dir("/space")
-        .output()
-        .map_err(|e| lisp::Error {
-            message: format!("Failed to start process {argv:?}: {e}"),
-        })?;
+    let output = unsafe {
+        Command::new(argv[0].clone())
+            .args(argv.iter().skip(1))
+            .stdin(Stdio::null())
+            .current_dir("/space")
+            .pre_exec(sandbox::drop_privileges)
+    }
+    .output()
+    .map_err(|e| lisp::Error {
+        message: format!("Failed to start process {argv:?}: {e}"),
+    })?;
     if output.status.success() {
         Ok(lisp::TypedRef::new(
             String::from_utf8_lossy(&output.stdout).into_owned()

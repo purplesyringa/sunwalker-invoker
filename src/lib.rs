@@ -2,6 +2,7 @@
 
 mod image {
     pub(crate) mod config;
+    pub(crate) mod ids;
     pub(crate) mod image;
     pub(crate) mod language;
     pub(crate) mod mount;

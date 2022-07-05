@@ -1,7 +1,7 @@
 use crate::{
     cgroups, errors,
     errors::{ToError, ToResult},
-    image::package,
+    image::{ids, package},
     system,
 };
 use futures_util::TryStreamExt;
@@ -200,21 +200,29 @@ pub async fn make_rootfs(
         }
 
         // Fill uid/gid maps
-        std::fs::write(
-            format!("/proc/{}/uid_map", child.id()),
-            // Global root stays root, the user is 1000, and nobody is bound just in case
-            format!("0 0 1\n1000 1 1\n65534 65534 1\n"),
-        )
-        .context_invoker("Failed to create uid_map for the isolated subprocess")?;
+        {
+            use ids::*;
+            std::fs::write(
+                format!("/proc/{}/uid_map", child.id()),
+                format!(
+                    "{INTERNAL_ROOT_UID} {EXTERNAL_ROOT_UID} 1\n{INTERNAL_USER_UID} \
+                     {EXTERNAL_USER_UID} 1\n{NOBODY_UID} {NOBODY_UID} 1\n"
+                ),
+            )
+            .context_invoker("Failed to create uid_map for the isolated subprocess")?;
 
-        std::fs::write(format!("/proc/{}/setgroups", child.id()), "deny\n")
-            .context_invoker("Failed to create setgroups for the isolated subprocess")?;
+            std::fs::write(format!("/proc/{}/setgroups", child.id()), "deny\n")
+                .context_invoker("Failed to create setgroups for the isolated subprocess")?;
 
-        std::fs::write(
-            format!("/proc/{}/gid_map", child.id()),
-            "0 0 1\n1000 1 1\n65534 65534 1\n",
-        )
-        .context_invoker("Failed to create gid_map for the isolated subprocess")?;
+            std::fs::write(
+                format!("/proc/{}/gid_map", child.id()),
+                format!(
+                    "{INTERNAL_ROOT_GID} {EXTERNAL_ROOT_GID} 1\n{INTERNAL_USER_GID} \
+                     {EXTERNAL_USER_GID} 1\n{NOGRP_GID} {NOGRP_GID} 1\n"
+                ),
+            )
+            .context_invoker("Failed to create gid_map for the isolated subprocess")?;
+        }
 
         // Save namespaces
         std::fs::create_dir(format!("{prefix}/ns"))
@@ -288,8 +296,12 @@ impl RootFS {
         )
         .with_context_invoker(|| format!("Mounting tmpfs on {space} failed"))?;
 
-        std::os::unix::fs::chown(&space, Some(1), Some(1))
-            .with_context_invoker(|| format!("Failed to chown {space}"))?;
+        std::os::unix::fs::chown(
+            &space,
+            Some(ids::EXTERNAL_USER_UID),
+            Some(ids::EXTERNAL_USER_GID),
+        )
+        .with_context_invoker(|| format!("Failed to chown {space}"))?;
 
         // Remount /dev/shm
         let space_shm = format!("{space}/.shm");
@@ -819,6 +831,16 @@ async fn isolated_entry<T: Object + 'static>(
             .with_context_invoker(|| format!("Failed to setns {path}"))?;
     }
 
+    // Drop privileges, sort of -- become root inside the sandbox rather than the real root
+    if unsafe { libc::setgid(ids::INTERNAL_ROOT_GID) } != 0 {
+        return Err(std::io::Error::last_os_error()
+            .context_invoker("setgid(INTERNAL_ROOT_GID) failed while entering sandbox"));
+    }
+    if unsafe { libc::setuid(ids::INTERNAL_ROOT_UID) } != 0 {
+        return Err(std::io::Error::last_os_error()
+            .context_invoker("setuid(INTERNAL_ROOT_UID) failed while entering sandbox"));
+    }
+
     // Chroot into .../overlay/root
     std::env::set_current_dir("/root").context_invoker("Failed to chdir to /root")?;
     nix::unistd::chroot(".").context_invoker("Failed to chroot into /root")?;
@@ -859,15 +881,23 @@ async fn isolated_entry<T: Object + 'static>(
         std::env::set_var(name, value);
     }
 
-    // Switch to fake user
-    if unsafe { libc::setgid(1000) } != 0 {
-        return Err(std::io::Error::last_os_error()
-            .context_invoker("setgid(1000) failed while entering sandbox"));
-    }
-    if unsafe { libc::setuid(1000) } != 0 {
-        return Err(std::io::Error::last_os_error()
-            .context_invoker("setuid(1000) failed while entering sandbox"));
-    }
-
     f()
+}
+
+pub fn drop_privileges() -> Result<(), std::io::Error> {
+    // Calling setuid() resets the "dumpable" attribute of the calling process, which in turn
+    // disables ptracing and makes its /proc/<pid> subdirectory root-owned, which guarantees that a
+    // malicious program cannot mess with the process except by sending signals to it. For the short
+    // period of time between clone(2) and execve(2), this is not a problem. It would be a problem
+    // in some other cases though, e.g. if we called drop_privileges() right in isolated_entry(),
+    // because that would allow the child to call SIGSTOP to circumvent time limit, or to call
+    // SIGKILL to commit suicide, which is admittedly not very useful, but would confuse the system
+    // enough to emit Bug verdict.
+    if unsafe { libc::setgid(ids::INTERNAL_USER_GID) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::setuid(ids::INTERNAL_USER_UID) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }

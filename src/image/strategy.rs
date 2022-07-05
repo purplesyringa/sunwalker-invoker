@@ -1,7 +1,7 @@
 use crate::{
     errors,
     errors::ToResult,
-    image::{program, sandbox},
+    image::{ids, program, sandbox},
     problem::verdict,
     system,
 };
@@ -9,8 +9,8 @@ use multiprocessing::{Bind, Object};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::os::unix::{
-    fs::OpenOptionsExt,
     io::{FromRawFd, OwnedFd},
+    process::CommandExt,
 };
 use std::path::PathBuf;
 
@@ -491,8 +491,12 @@ impl<'a> StrategyRun<'a> {
                             self.aux
                         )
                     })?;
-                    std::os::unix::fs::chown(&path, Some(1), Some(1))
-                        .with_context_invoker(|| format!("Failed to chown {path}"))?;
+                    std::os::unix::fs::chown(
+                        &path,
+                        Some(ids::EXTERNAL_USER_UID),
+                        Some(ids::EXTERNAL_USER_GID),
+                    )
+                    .with_context_invoker(|| format!("Failed to chown {path}"))?;
                 }
                 FileType::Pipe => {
                     let (rx, tx) = nix::unistd::pipe()
@@ -533,8 +537,12 @@ impl<'a> StrategyRun<'a> {
                         std::fs::write(&path, "").with_context_invoker(|| {
                             format!("Failed to touch file {path} to start running a strategy")
                         })?;
-                        std::os::unix::fs::chown(&path, Some(1), Some(1))
-                            .with_context_invoker(|| format!("Failed to chown {path}"))?;
+                        std::os::unix::fs::chown(
+                            &path,
+                            Some(ids::EXTERNAL_USER_UID),
+                            Some(ids::EXTERNAL_USER_GID),
+                        )
+                        .with_context_invoker(|| format!("Failed to chown {path}"))?;
                     }
                 }
 
@@ -769,17 +777,19 @@ fn execute(
     stdout: std::fs::File,
     stderr: std::fs::File,
 ) -> Result<verdict::ExitStatus, errors::Error> {
-    std::env::set_current_dir("/space").context_invoker("Failed to chdir to /space")?;
-
-    let exit_status = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .stdin(stdin)
-        .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
-        .with_context_invoker(|| format!("Failed to spawn {argv:?}"))?
-        .wait()
-        .with_context_invoker(|| format!("Failed to get exit code of {argv:?}"))?;
+    let exit_status = unsafe {
+        std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr)
+            .current_dir("/space")
+            .pre_exec(sandbox::drop_privileges)
+    }
+    .spawn()
+    .with_context_invoker(|| format!("Failed to spawn {argv:?}"))?
+    .wait()
+    .with_context_invoker(|| format!("Failed to get exit code of {argv:?}"))?;
 
     Ok(exit_status.into())
 }

@@ -6,7 +6,6 @@ use futures::stream::{SplitSink, SplitStream};
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use libc::CLONE_NEWNS;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -519,6 +518,11 @@ async fn supply_file(
 }
 
 fn enter_sandbox() -> anyhow::Result<()> {
+    // Various sanity checks
+    if std::fs::read_to_string("/proc/sys/fs/suid_dumpable")? != "0\n" {
+        anyhow::bail!("suid_dumpable is not set to zero, unable to continue safely");
+    }
+
     // Unshare namespaces
     if unsafe { libc::unshare(CLONE_NEWNS) } != 0 {
         anyhow::bail!("Initial unshare() failed, unable to continue safely");
