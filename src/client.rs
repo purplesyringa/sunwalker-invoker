@@ -546,8 +546,7 @@ fn enter_sandbox() -> anyhow::Result<()> {
     std::fs::create_dir("/tmp/sunwalker_invoker/dev")
         .with_context(|| "Creating /tmp/sunwalker_invoker/dev failed")?;
     for name in [
-        "null", "full", "zero", "urandom", "random", "stdin", "stdout", "stderr", "ptmx", "pts",
-        "fd",
+        "null", "full", "zero", "urandom", "random", "stdin", "stdout", "stderr", "fd",
     ] {
         let source = format!("/dev/{name}");
         let target = format!("/tmp/sunwalker_invoker/dev/{name}");
@@ -568,10 +567,15 @@ fn enter_sandbox() -> anyhow::Result<()> {
             .with_context(|| format!("Bind-mounting {source} to {target} failed"))?;
     }
 
+    // These directories and files will be mounted onto later
     std::fs::create_dir("/tmp/sunwalker_invoker/dev/mqueue")
         .with_context(|| "Cannot mkdir /tmp/sunwalker_invoker/dev/mqueue")?;
     std::fs::create_dir("/tmp/sunwalker_invoker/dev/shm")
         .with_context(|| "Cannot mkdir /tmp/sunwalker_invoker/dev/shm")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/dev/pts")
+        .with_context(|| "Cannot mkdir /tmp/sunwalker_invoker/dev/pts")?;
+    std::fs::write("/tmp/sunwalker_invoker/dev/ptmx", "")
+        .with_context(|| "Cannot touch /tmp/sunwalker_invoker/dev/ptmx")?;
 
     Ok(())
 }

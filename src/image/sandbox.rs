@@ -638,6 +638,23 @@ async fn isolated_entry<T: Object + 'static>(
         );
     }
 
+    // Mount /dev/pts
+    system::mount(
+        "devpts",
+        format!("{overlay}/root/dev/pts"),
+        "devpts",
+        system::MS_NOSUID | system::MS_NOEXEC,
+        Some(format!("mode=666,ptmxmode=666").as_ref()),
+    )
+    .context_invoker("Failed to mount .../dev/pts")?;
+
+    // Mount /dev/ptmx
+    system::bind_mount(
+        format!("{overlay}/root/dev/pts/ptmx"),
+        format!("{overlay}/root/dev/ptmx"),
+    )
+    .context_invoker("Failed to mount .../dev/ptmx")?;
+
     // Mount /proc
     system::mount(
         "proc",
