@@ -519,7 +519,10 @@ async fn supply_file(
 
 fn enter_sandbox() -> anyhow::Result<()> {
     // Various sanity checks
-    if std::fs::read_to_string("/proc/sys/fs/suid_dumpable")? != "0\n" {
+    let suid_dumpable = std::fs::read_to_string("/proc/sys/fs/suid_dumpable")?;
+    if suid_dumpable == "2\n" {
+        println!("suid_dumpable is set to 2 (suidsafe), which is potentially unsafe");
+    } else if suid_dumpable != "0\n" {
         anyhow::bail!("suid_dumpable is not set to zero, unable to continue safely");
     }
 
