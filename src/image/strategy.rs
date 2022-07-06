@@ -1,6 +1,6 @@
 use crate::{
     errors,
-    errors::ToResult,
+    errors::{ToError, ToResult},
     image::{ids, program, sandbox},
     problem::verdict,
     system,
@@ -515,6 +515,9 @@ impl<'a> StrategyRun<'a> {
         // Run programs
         let mut verdict = verdict::TestVerdict::Accepted;
 
+        let mut invocation_stats: Vec<Option<verdict::InvocationStat>> =
+            vec![None; self.strategy.blocks.len()];
+
         'comps: for component in self.strategy.components.iter() {
             let mut processes = Vec::new();
             for block_id in component.iter() {
@@ -647,18 +650,24 @@ impl<'a> StrategyRun<'a> {
             }
 
             // Collect user exit codes
-            for (block_id, result) in std::iter::zip(component.iter(), process_results.iter()) {
+            for (block_id, (exit_status, _stat)) in
+                std::iter::zip(component.iter(), process_results.iter())
+            {
                 let block = &self.strategy.blocks[*block_id];
                 if let Tactic::User = block.tactic {
-                    if *result != verdict::ExitStatus::ExitCode(0) {
-                        verdict = verdict::TestVerdict::RuntimeError(*result);
+                    if *exit_status != verdict::ExitStatus::ExitCode(0) {
+                        verdict = verdict::TestVerdict::RuntimeError(*exit_status);
                         break 'comps;
                     }
                 }
             }
 
             // Collect testlib exit codes
-            for (block_id, result) in std::iter::zip(component.iter(), process_results.iter()) {
+            for (block_id, (exit_status, stat)) in
+                std::iter::zip(component.iter(), process_results.iter())
+            {
+                invocation_stats[*block_id] = Some(stat.clone());
+
                 let block = &self.strategy.blocks[*block_id];
                 if let Tactic::Testlib = block.tactic {
                     let program = &self.strategy.invocable_programs[*block_id];
@@ -683,7 +692,8 @@ impl<'a> StrategyRun<'a> {
                         program.rootfs.read(&format!("/space/.file-{filename}"))?;
 
                     let current_verdict =
-                        verdict::TestVerdict::from_testlib(*result, &testlib_stderr);
+                        verdict::TestVerdict::from_testlib(*exit_status, &testlib_stderr);
+
                     match current_verdict {
                         verdict::TestVerdict::Accepted => (),
                         _ => {
@@ -718,10 +728,7 @@ impl<'a> StrategyRun<'a> {
         Ok(verdict::TestJudgementResult {
             verdict,
             logs,
-            real_time: std::default::Default::default(), // TODO
-            user_time: std::default::Default::default(),
-            sys_time: std::default::Default::default(),
-            memory_used: 0,
+            invocation_stats,
         })
     }
 
@@ -776,7 +783,9 @@ fn execute(
     stdin: std::fs::File,
     stdout: std::fs::File,
     stderr: std::fs::File,
-) -> Result<verdict::ExitStatus, errors::Error> {
+) -> Result<(verdict::ExitStatus, verdict::InvocationStat), errors::Error> {
+    let start = std::time::Instant::now();
+
     let exit_status = unsafe {
         std::process::Command::new(&argv[0])
             .args(&argv[1..])
@@ -791,5 +800,29 @@ fn execute(
     .wait()
     .with_context_invoker(|| format!("Failed to get exit code of {argv:?}"))?;
 
-    Ok(exit_status.into())
+    let real_time = start.elapsed();
+
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage as *mut libc::rusage) } == -1 {
+        return Err(
+            std::io::Error::last_os_error().context_invoker("Failed to get rusage of program")
+        );
+    }
+
+    let user_time = std::time::Duration::from_micros(
+        (usage.ru_utime.tv_sec as u64) * 1000000 + (usage.ru_utime.tv_usec as u64),
+    );
+    let sys_time = std::time::Duration::from_micros(
+        (usage.ru_stime.tv_sec as u64) * 1000000 + (usage.ru_stime.tv_usec as u64),
+    );
+
+    Ok((
+        exit_status.into(),
+        verdict::InvocationStat {
+            real_time,
+            user_time,
+            sys_time,
+            memory_used: 0, // TODO
+        },
+    ))
 }

@@ -52,6 +52,11 @@ pub enum TestVerdict {
 pub struct TestJudgementResult {
     pub verdict: TestVerdict,
     pub logs: HashMap<String, Vec<u8>>,
+    pub invocation_stats: Vec<Option<InvocationStat>>,
+}
+
+#[derive(Object, Debug, Serialize, Clone)]
+pub struct InvocationStat {
     pub real_time: std::time::Duration,
     pub user_time: std::time::Duration,
     pub sys_time: std::time::Duration,

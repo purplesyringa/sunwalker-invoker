@@ -155,10 +155,7 @@ impl Submission {
                             "Failed to evaluate test: {e:?}"
                         )),
                         logs: HashMap::new(),
-                        real_time: std::time::Duration::ZERO,
-                        user_time: std::time::Duration::ZERO,
-                        sys_time: std::time::Duration::ZERO,
-                        memory_used: 0,
+                        invocation_stats: Vec::new(),
                     }),
                 )
             }))
