@@ -7,9 +7,9 @@ use crate::{
 };
 use multiprocessing::{Bind, Object};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::{
-    io::{FromRawFd, OwnedFd},
+    io::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     process::CommandExt,
 };
 use std::path::PathBuf;
@@ -29,10 +29,12 @@ pub struct Strategy {
     components: Vec<Vec<usize>>,
     writer_by_file: HashMap<String, usize>,
     written_files_by_block: Vec<Vec<String>>,
+    invocation_limits: HashMap<String, verdict::InvocationLimit>,
 }
 
 #[derive(Clone, Object, Deserialize, Serialize)]
 struct Block {
+    name: String,
     tactic: Tactic,
     bindings: HashMap<String, Binding>,
     command: String,
@@ -79,9 +81,25 @@ impl StrategyFactory {
     pub async fn make<'a>(
         &'a self,
         user_program: &'a program::Program,
+        invocation_limits: HashMap<String, verdict::InvocationLimit>,
     ) -> Result<Strategy, errors::Error> {
         // Sanity checks
+        let mut seen_block_names = HashSet::new();
         for block in self.blocks.iter() {
+            if !seen_block_names.insert(block.name.clone()) {
+                return Err(errors::ConfigurationFailure(format!(
+                    "Several blocks have name '{}'",
+                    block.name
+                )));
+            }
+
+            if !invocation_limits.contains_key(&block.name) {
+                return Err(errors::ConfigurationFailure(format!(
+                    "Invocation limit missing for block '{}'",
+                    block.name
+                )));
+            }
+
             for (_, binding) in block.bindings.iter() {
                 match binding.source {
                     Pattern::File(ref filename) => match self.files.get(filename) {
@@ -370,9 +388,10 @@ impl StrategyFactory {
                         }
                         if component_of_block[*reader] == writer_component {
                             return Err(errors::ConfigurationFailure(format!(
-                                "Regular file %{name} is written to by block #{writer} and read \
-                                 from by block #{reader}, but these blocks are executed \
-                                 concurrently; such races are not allowed"
+                                "Regular file %{name} is written to by block '{}' and read from \
+                                 by block '{}', but these blocks are executed concurrently; such \
+                                 races are not allowed",
+                                self.blocks[writer].name, self.blocks[*reader].name
                             )));
                         }
                     }
@@ -393,9 +412,10 @@ impl StrategyFactory {
                     let reader = readers[0];
                     if component_of_block[reader] != writer_component {
                         return Err(errors::ConfigurationFailure(format!(
-                            "Pipe %{name} is written to by block #{writer} and read from by block \
-                             #{reader}, but these blocks are not executed concurrently, which \
-                             will lead to blocking; this is not allowed"
+                            "Pipe %{name} is written to by block '{}' and read from by block \
+                             '{}', but these blocks are not executed concurrently, which will \
+                             lead to blocking; this is not allowed",
+                            self.blocks[writer].name, self.blocks[reader].name
                         )));
                     }
                 }
@@ -443,6 +463,7 @@ impl StrategyFactory {
             components,
             writer_by_file,
             written_files_by_block,
+            invocation_limits,
         })
     }
 }
@@ -514,9 +535,8 @@ impl<'a> StrategyRun<'a> {
 
         // Run programs
         let mut verdict = verdict::TestVerdict::Accepted;
-
-        let mut invocation_stats: Vec<Option<verdict::InvocationStat>> =
-            vec![None; self.strategy.blocks.len()];
+        let mut invocation_stats = HashMap::new();
+        let mut logs = HashMap::new();
 
         'comps: for component in self.strategy.components.iter() {
             let mut processes = Vec::new();
@@ -638,7 +658,14 @@ impl<'a> StrategyRun<'a> {
                             .bind(patched_argv)
                             .bind(stdin.unwrap())
                             .bind(stdout.unwrap())
-                            .bind(stderr.unwrap()),
+                            .bind(stderr.unwrap())
+                            .bind(
+                                self.strategy
+                                    .invocation_limits
+                                    .get(&block.name)
+                                    .unwrap()
+                                    .clone(),
+                            ),
                     ),
                     &program.rootfs,
                 ));
@@ -649,25 +676,44 @@ impl<'a> StrategyRun<'a> {
                 process_results.push(res?);
             }
 
-            // Collect user exit codes
-            for (block_id, (exit_status, _stat)) in
+            // Collect logs and stats
+            for (block_id, (_test_verdict, stat)) in
                 std::iter::zip(component.iter(), process_results.iter())
             {
                 let block = &self.strategy.blocks[*block_id];
-                if let Tactic::User = block.tactic {
-                    if *exit_status != verdict::ExitStatus::ExitCode(0) {
-                        verdict = verdict::TestVerdict::RuntimeError(*exit_status);
-                        break 'comps;
+                let program = &self.strategy.invocable_programs[*block_id];
+
+                invocation_stats.insert(block.name.clone(), stat.clone());
+
+                for name in self.strategy.written_files_by_block[*block_id].iter() {
+                    let file_type = self.strategy.files[name];
+                    if let FileType::Regular = file_type {
+                        let data = program.rootfs.read(&format!("/space/.file-{name}"))?;
+                        logs.insert(name.to_string(), data);
                     }
                 }
             }
 
-            // Collect testlib exit codes
-            for (block_id, (exit_status, stat)) in
+            // Collect user exit codes and exit immediately on failure
+            for (block_id, (test_verdict, _stat)) in
                 std::iter::zip(component.iter(), process_results.iter())
             {
-                invocation_stats[*block_id] = Some(stat.clone());
+                let block = &self.strategy.blocks[*block_id];
+                if let Tactic::User = block.tactic {
+                    match *test_verdict {
+                        verdict::TestVerdict::Accepted => {}
+                        _ => {
+                            verdict = test_verdict.clone();
+                            break 'comps;
+                        }
+                    }
+                }
+            }
 
+            // Collect testlib exit codes and exit immediately on failure
+            for (block_id, (test_verdict, _stat)) in
+                std::iter::zip(component.iter(), process_results.iter())
+            {
                 let block = &self.strategy.blocks[*block_id];
                 if let Tactic::Testlib = block.tactic {
                     let program = &self.strategy.invocable_programs[*block_id];
@@ -691,8 +737,21 @@ impl<'a> StrategyRun<'a> {
                     let testlib_stderr =
                         program.rootfs.read(&format!("/space/.file-{filename}"))?;
 
+                    let exit_status = match *test_verdict {
+                        verdict::TestVerdict::Accepted => verdict::ExitStatus::ExitCode(0),
+                        verdict::TestVerdict::RuntimeError(exit_status) => exit_status,
+                        _ => {
+                            verdict = verdict::TestVerdict::Bug(format!(
+                                "Testlib task '{}' failed with verdict {}",
+                                block.name,
+                                test_verdict.to_short_string(),
+                            ));
+                            break 'comps;
+                        }
+                    };
+
                     let current_verdict =
-                        verdict::TestVerdict::from_testlib(*exit_status, &testlib_stderr);
+                        verdict::TestVerdict::from_testlib(exit_status, &testlib_stderr);
 
                     match current_verdict {
                         verdict::TestVerdict::Accepted => (),
@@ -702,17 +761,6 @@ impl<'a> StrategyRun<'a> {
                         }
                     }
                 }
-            }
-        }
-
-        // Load logs
-        let mut logs: HashMap<String, Vec<u8>> = HashMap::new();
-        for (filename, file_type) in self.strategy.files.iter() {
-            if let FileType::Regular = file_type {
-                let block_id = self.strategy.writer_by_file[filename];
-                let program = &self.strategy.invocable_programs[block_id];
-                let data = program.rootfs.read(&format!("/space/.file-{filename}"))?;
-                logs.insert(filename.to_string(), data);
             }
         }
 
@@ -783,10 +831,10 @@ fn execute(
     stdin: std::fs::File,
     stdout: std::fs::File,
     stderr: std::fs::File,
-) -> Result<(verdict::ExitStatus, verdict::InvocationStat), errors::Error> {
-    let start = std::time::Instant::now();
-
-    let exit_status = unsafe {
+    invocation_limit: verdict::InvocationLimit,
+) -> Result<(verdict::TestVerdict, verdict::InvocationStat), errors::Error> {
+    // Start process
+    let pid = unsafe {
         std::process::Command::new(&argv[0])
             .args(&argv[1..])
             .stdin(stdin)
@@ -797,11 +845,115 @@ fn execute(
     }
     .spawn()
     .with_context_invoker(|| format!("Failed to spawn {argv:?}"))?
-    .wait()
-    .with_context_invoker(|| format!("Failed to get exit code of {argv:?}"))?;
+    .id() as libc::pid_t;
 
-    let real_time = start.elapsed();
+    // Acquire pidfd for the process. This is safe because the process hasn't been awaited yet. We
+    // prefer younger pidfd to older signalfd because our process is PID 1 and therefore reaps all
+    // orphan processes, so SIGCHLD may fire for a process that was not our direct descendant.
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as RawFd;
+    if pidfd == -1 {
+        return Err(std::io::Error::last_os_error())
+            .context_invoker("Failed to open pidfd for child process");
+    }
 
+    // Create timerfd. It would perhaps be more correct to account for the lapse of time between
+    // starting the process and creating the timerfd, but we acquire the uptime of the process via
+    // safe procfs methods anyway.
+    use nix::sys::timerfd::*;
+    let timer = TimerFd::new(ClockId::CLOCK_MONOTONIC, TimerFlags::empty())
+        .context_invoker("Failed to create timerfd")?;
+    timer
+        .set(
+            Expiration::OneShot(nix::sys::time::TimeSpec::from_duration(
+                invocation_limit.real_time,
+            )),
+            TimerSetTimeFlags::empty(),
+        )
+        .context_invoker("Failed to configure timerfd")?;
+
+    // Listen for events
+    use nix::sys::epoll::*;
+    let epollfd = epoll_create().context_invoker("Failed to create epollfd")?;
+
+    epoll_ctl(
+        epollfd,
+        EpollOp::EpollCtlAdd,
+        pidfd,
+        &mut EpollEvent::new(EpollFlags::EPOLLIN, 0),
+    )
+    .context_invoker("Failed to configure epoll")?;
+
+    epoll_ctl(
+        epollfd,
+        EpollOp::EpollCtlAdd,
+        timer.as_raw_fd(),
+        &mut EpollEvent::new(EpollFlags::EPOLLIN, 1),
+    )
+    .context_invoker("Failed to configure epoll")?;
+
+    let mut events = [EpollEvent::empty()];
+
+    // We could theoretically use epoll's timeout option, but that would stop working when we would
+    // need to call epoll_wait several times
+    let n_events = epoll_wait(epollfd, &mut events, -1).context_invoker("epoll_wait failed")?;
+    if n_events != 1 {
+        return Err(std::io::Error::last_os_error())
+            .with_context_invoker(|| format!("epoll_wait returned {n_events}"));
+    }
+
+    let mut real_time_timeout = false;
+    match events[0].data() {
+        0 => {
+            // pidfd fired -- the process has terminated
+        }
+        1 => {
+            // timerfd fired -- time out
+            real_time_timeout = true;
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::SIGKILL)
+                .context_invoker("Failed to kill the process")?;
+        }
+        _ => {
+            return Err(errors::InvokerFailure(
+                "Invalid epollfd data returned".to_string(),
+            ));
+        }
+    }
+
+    let uptime = nix::time::clock_gettime(nix::time::ClockId::CLOCK_BOOTTIME)
+        .context_invoker("Failed to get uptime")?;
+    let uptime = std::time::Duration::new(uptime.tv_sec() as u64, uptime.tv_nsec() as u32);
+
+    // Collect real time statistics
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .context_invoker("Failed to read /proc/.../stat")?;
+    // Whoever thought putting an unescaped process name into the middle of the file was a good idea
+    // probably wasn't a very bright person
+    let fields = stat[stat
+        .rfind(')')
+        .context_invoker("Invalid /proc/.../stat format: stat does not contain )")?
+        + 1..]
+        .split_ascii_whitespace();
+    // On Linux, the 'starttime' field is computed from task->start_boottime in fs/proc/array.c,
+    // which is set to ktime_get_boottime_ns() in kernel/fork.c, which is the kernel equivalent to
+    // clock_gettime(CLOCK_BOOTTIME).
+    let starttime: u64 = fields
+        .skip(19)
+        .next()
+        .context_invoker("Invalid /proc/.../stat format: missing starttime")?
+        .parse()
+        .context_invoker("Invalid /proc/.../stat format: starttime is not a number")?;
+    let clk_tck = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
+        .ok()
+        .flatten()
+        .context_invoker("sysconf(_SC_CLK_TCK) failed")? as u64;
+    let starttime = std::time::Duration::from_nanos(1_000_000_000 * starttime / clk_tck);
+    let real_time = uptime.saturating_sub(starttime);
+
+    // Await the child process now because getrusage only takes awaited processes into consideration
+    let wait_status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None)
+        .context_invoker("Failed to waitpid for process")?;
+
+    // Collect CPU time and memory statistics
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage as *mut libc::rusage) } == -1 {
         return Err(
@@ -815,14 +967,46 @@ fn execute(
     let sys_time = std::time::Duration::from_micros(
         (usage.ru_stime.tv_sec as u64) * 1000000 + (usage.ru_stime.tv_usec as u64),
     );
+    let cpu_time = user_time + sys_time; // both PCMS and ejudge take system time into account
+
+    // Into verdict
+    let test_verdict;
+    if cpu_time > invocation_limit.cpu_time {
+        test_verdict = verdict::TestVerdict::TimeLimitExceeded;
+    } else if real_time_timeout || real_time > invocation_limit.real_time {
+        test_verdict = verdict::TestVerdict::IdlenessLimitExceeded;
+    } else {
+        match wait_status {
+            nix::sys::wait::WaitStatus::Exited(_, exit_code) => {
+                if exit_code == 0 {
+                    test_verdict = verdict::TestVerdict::Accepted;
+                } else {
+                    test_verdict = verdict::TestVerdict::RuntimeError(
+                        verdict::ExitStatus::ExitCode(exit_code as u8),
+                    );
+                }
+            }
+            nix::sys::wait::WaitStatus::Signaled(_, signal, _) => {
+                test_verdict = verdict::TestVerdict::RuntimeError(verdict::ExitStatus::Signal(
+                    signal as i32 as u8,
+                ))
+            }
+            _ => {
+                return Err(errors::InvokerFailure(format!(
+                    "waitpid returned unexpected status: {wait_status:?}"
+                )));
+            }
+        }
+    }
 
     Ok((
-        exit_status.into(),
+        test_verdict,
         verdict::InvocationStat {
             real_time,
+            cpu_time,
             user_time,
             sys_time,
-            memory_used: 0, // TODO
+            memory: 0, // TODO
         },
     ))
 }

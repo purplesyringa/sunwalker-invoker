@@ -5,7 +5,7 @@ import websockets
 
 
 PACKAGES = {
-    "problems/mock-problem/rev12"
+    "problems/mock-problem/rev13"
 }
 
 
@@ -19,7 +19,7 @@ tests/
 """.strip() + "".join(f"\nt{i} tests/{i}\na{i} tests/{i}.a" for i in range(1, 1001))
 
 FILES = {
-    "manifest/problems/mock-problem/rev12": MANIFEST.encode(),
+    "manifest/problems/mock-problem/rev13": MANIFEST.encode(),
     "judging": msgpack.packb([
         [  # dependency_dag
             {  # dependents_of
@@ -29,11 +29,13 @@ FILES = {
 
         [  # strategy_factory
             # file %output %stderr %checker_output %checker_stderr
-            # tactic user
+            # invocation
+            #     tactic user
             #     ro $test as input.txt
             #     rw %output as output.txt
             #     user <input.txt >output.txt 2>%stderr
-            # tactic testlib
+            # check
+            #     tactic testlib
             #     checker $test %output $test.a >%checker_output 2>%checker_stderr
 
             {  # files
@@ -45,6 +47,7 @@ FILES = {
 
             [  # blocks
                 [
+                    "invocation",  # name
                     "User",  # tactic
                     {  # bindings
                         "input.txt": [
@@ -65,6 +68,7 @@ FILES = {
                     {"File": "stderr"}  # stderr
                 ],
                 [
+                    "check",  # name
                     "Testlib",  # tactic
                     {},  # bindings
                     "checker",  # command
@@ -92,7 +96,7 @@ FILES = {
 
         [  # data
             "mock-problem",  # problem_id
-            "rev12"  # revision_id
+            "rev13"  # revision_id
         ]
     ]),
 
@@ -145,7 +149,7 @@ async def echo(websocket):
                             core,  # compilation_core
                             submission_id,  # submission_id
                             "mock-problem",  # problem_id
-                            "rev12",  # revision_id
+                            "rev13",  # revision_id
                             {  # files
                                 "hello.cpp": list("""
 #include <bits/stdc++.h>
@@ -157,7 +161,19 @@ int main() {
 }
 """.encode())
                             },
-                            "cxx.20.gcc"  # language
+                            "cxx.20.gcc",  # language
+                            {  # invocation_limits
+                                "invocation": [
+                                    [1, 0],  # real_time
+                                    [1, 0],  # cpu_time
+                                    256 * 1024 * 1024  # memory
+                                ],
+                                "check": [
+                                    [5, 0],  # real_time
+                                    [5, 0],  # cpu_time
+                                    256 * 1024 * 1024  # memory
+                                ]
+                            }
                         ]
                     }))
 

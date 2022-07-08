@@ -1,3 +1,4 @@
+use crate::problem::verdict::InvocationLimit;
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -18,6 +19,7 @@ pub struct AddSubmission {
     pub revision_id: String,
     pub files: HashMap<String, Vec<u8>>,
     pub language: String,
+    pub invocation_limits: HashMap<String, InvocationLimit>,
 }
 
 #[derive(Debug, Deserialize)]

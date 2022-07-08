@@ -27,6 +27,7 @@ pub struct Submission {
     program: RwLock<Option<program::Program>>,
     workers: RwLock<HashMap<u64, Arc<RwLock<worker::Worker>>>>,
     problem_revision: Arc<problem::ProblemRevision>,
+    invocation_limits: HashMap<String, verdict::InvocationLimit>,
 }
 
 impl Submission {
@@ -34,6 +35,7 @@ impl Submission {
         id: String,
         problem_revision: Arc<problem::ProblemRevision>,
         language: language::Language,
+        invocation_limits: HashMap<String, verdict::InvocationLimit>,
     ) -> Result<Submission, errors::Error> {
         let root = format!("/tmp/sunwalker_invoker/submissions/{id}");
         std::fs::create_dir(&root).with_context_invoker(|| {
@@ -50,6 +52,7 @@ impl Submission {
             program: RwLock::new(None),
             workers: RwLock::new(HashMap::new()),
             problem_revision,
+            invocation_limits,
         })
     }
 
@@ -83,6 +86,7 @@ impl Submission {
                         self.program.read().await.clone(),
                         self.problem_revision.strategy_factory.clone(),
                         self.problem_revision.data.clone(),
+                        self.invocation_limits.clone(),
                     )
                     .await?,
                 )))
@@ -155,7 +159,7 @@ impl Submission {
                             "Failed to evaluate test: {e:?}"
                         )),
                         logs: HashMap::new(),
-                        invocation_stats: Vec::new(),
+                        invocation_stats: HashMap::new(),
                     }),
                 )
             }))

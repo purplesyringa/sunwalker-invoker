@@ -11,6 +11,7 @@ use futures::{
 };
 use multiprocessing::tokio::{channel, Child, Receiver, Sender};
 use multiprocessing::Object;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
@@ -44,6 +45,7 @@ impl Worker {
         program: Option<program::Program>,
         strategy_factory: strategy::StrategyFactory,
         problem_revision_data: problem::ProblemRevisionData,
+        invocation_limits: HashMap<String, verdict::InvocationLimit>,
     ) -> Result<Worker, errors::Error> {
         let (tx_i2w_command, rx_i2w_command) =
             channel().context_invoker("Failed to create an IPC channel")?;
@@ -63,6 +65,7 @@ impl Worker {
                 program,
                 strategy_factory,
                 problem_revision_data,
+                invocation_limits,
             )
             .await
             .context_invoker("Failed to spawn a worker subprocess")?;
@@ -163,6 +166,7 @@ struct SubprocessMain {
     strategy_factory: strategy::StrategyFactory,
     strategy: Option<strategy::Strategy>,
     problem_revision_data: problem::ProblemRevisionData,
+    invocation_limits: Option<HashMap<String, verdict::InvocationLimit>>,
 }
 
 // multithreading does not interact with sandboxing well. For one thing, unshare only seems to apply
@@ -183,12 +187,19 @@ pub async fn subprocess_main(
     program: Option<program::Program>,
     strategy_factory: strategy::StrategyFactory,
     problem_revision_data: problem::ProblemRevisionData,
+    invocation_limits: HashMap<String, verdict::InvocationLimit>,
 ) -> Result<(), errors::Error> {
     let mut tx_w2i = {
         sandbox::enter_worker_space(core).context_invoker("Failed to enter worker space")?;
 
+        let mut invocation_limits = Some(invocation_limits);
+
         let strategy = match program {
-            Some(ref program) => Some(strategy_factory.make(program).await?),
+            Some(ref program) => Some(
+                strategy_factory
+                    .make(program, invocation_limits.take().unwrap())
+                    .await?,
+            ),
             None => None,
         };
 
@@ -206,6 +217,7 @@ pub async fn subprocess_main(
                 strategy_factory,
                 strategy,
                 problem_revision_data,
+                invocation_limits,
             };
 
             while let Some(command) = rx_i2w_command
@@ -265,7 +277,11 @@ impl Subprocess {
                             build_id,
                         )
                         .await?;
-                    main.strategy = Some(main.strategy_factory.make(&program).await?);
+                    main.strategy = Some(
+                        main.strategy_factory
+                            .make(&program, main.invocation_limits.take().unwrap())
+                            .await?,
+                    );
                     W2IMessage::CompilationResult(program, log)
                 };
                 let res = res.unwrap_or_else(|e| W2IMessage::Failure(e));

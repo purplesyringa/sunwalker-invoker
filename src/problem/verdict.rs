@@ -1,5 +1,5 @@
 use multiprocessing::Object;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::os::unix::process::ExitStatusExt;
 
@@ -29,7 +29,7 @@ use std::os::unix::process::ExitStatusExt;
 //     CheckerFailed(u64),
 // }
 
-#[derive(Object, Debug, Serialize)]
+#[derive(Object, Debug, Serialize, Clone)]
 pub enum TestVerdict {
     InQueue,
     Running,
@@ -52,15 +52,23 @@ pub enum TestVerdict {
 pub struct TestJudgementResult {
     pub verdict: TestVerdict,
     pub logs: HashMap<String, Vec<u8>>,
-    pub invocation_stats: Vec<Option<InvocationStat>>,
+    pub invocation_stats: HashMap<String, InvocationStat>,
 }
 
 #[derive(Object, Debug, Serialize, Clone)]
 pub struct InvocationStat {
     pub real_time: std::time::Duration,
+    pub cpu_time: std::time::Duration,
     pub user_time: std::time::Duration,
     pub sys_time: std::time::Duration,
-    pub memory_used: usize,
+    pub memory: usize,
+}
+
+#[derive(Object, Debug, Deserialize, Clone)]
+pub struct InvocationLimit {
+    pub real_time: std::time::Duration,
+    pub cpu_time: std::time::Duration,
+    pub memory: usize,
 }
 
 #[derive(Object, PartialEq, Eq, Debug, Clone, Copy, Serialize)]
@@ -147,7 +155,7 @@ impl From<std::process::ExitStatus> for ExitStatus {
 // }
 
 impl TestVerdict {
-    fn to_short_string(&self) -> String {
+    pub fn to_short_string(&self) -> String {
         match self {
             Self::InQueue => "PD".to_string(),
             Self::Running => "RU".to_string(),

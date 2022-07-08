@@ -357,6 +357,7 @@ async fn add_submission(
                 client.mounted_image.clone(),
                 message.language.clone(),
             )?,
+            message.invocation_limits,
         )?;
 
         for (name, content) in message.files.into_iter() {
