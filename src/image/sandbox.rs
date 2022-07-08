@@ -79,7 +79,7 @@ pub fn enter_worker_space(core: u64) -> Result<(), errors::Error> {
 
     // Switch to core
     let pid = unsafe { libc::getpid() };
-    cgroups::add_task_to_core(pid, core).with_context_invoker(|| {
+    cgroups::add_process_to_core(pid, core).with_context_invoker(|| {
         format!("Failed to move current process (PID {pid}) to core {core}")
     })?;
 

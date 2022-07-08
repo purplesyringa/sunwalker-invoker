@@ -1,12 +1,9 @@
 use anyhow::{bail, Context, Result};
 use libc::pid_t;
 use std::collections::HashSet;
-use std::io::{BufRead, Write};
-
-const CPUSET_ROOT: &str = "/sys/fs/cgroup/cpuset";
 
 pub fn create_root_cpuset() -> Result<()> {
-    std::fs::create_dir(format!("{CPUSET_ROOT}/sunwalker_root"))
+    std::fs::create_dir("/sys/fs/cgroup/sunwalker_root")
         .or_else(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 Ok(())
@@ -14,154 +11,75 @@ pub fn create_root_cpuset() -> Result<()> {
                 Err(e)
             }
         })
-        .with_context(|| format!("Unable to create {CPUSET_ROOT}/sunwalker_root directory"))?;
+        .context("Unable to create /sys/fs/cgroup/sunwalker_root directory")?;
 
-    // Inherit mems
     std::fs::write(
-        format!("{CPUSET_ROOT}/sunwalker_root/cpuset.mems"),
-        std::fs::read_to_string(format!("{CPUSET_ROOT}/cpuset.mems"))?,
+        "/sys/fs/cgroup/sunwalker_root/cgroup.subtree_control",
+        "+cpuset",
     )
-    .with_context(|| format!("Failed to write to {CPUSET_ROOT}/sunwalker_root/cpuset.mems"))?;
-
-    // Move all tasks that don't yet belong to a cpuset to the root cpuset
-    // FIXME: this is inherently racy, what can we do to avoid the race condition?
-    let mut tids: Vec<pid_t> = Vec::new();
-
-    for proc_entry in std::fs::read_dir("/proc")? {
-        let proc_entry = proc_entry?;
-        let proc_name = proc_entry.file_name();
-
-        if let Ok(proc_name) = proc_name.into_string() {
-            if let Ok(_) = proc_name.parse::<pid_t>() {
-                let mut tasks_path = proc_entry.path();
-                tasks_path.push("task");
-
-                // Permission error? Race condition?
-                if let Ok(tasks_it) = std::fs::read_dir(tasks_path) {
-                    for task_entry in tasks_it {
-                        let task_entry = task_entry?;
-                        let tid = task_entry
-                            .file_name()
-                            .into_string()
-                            .or_else(|e| bail!("Unable to parse task ID as string: {:?}", e))?
-                            .parse::<pid_t>()?;
-
-                        let mut cpuset_path = task_entry.path();
-                        cpuset_path.push("cpuset");
-
-                        // Idem
-                        if let Ok(cpuset) = std::fs::read_to_string(cpuset_path) {
-                            if cpuset == "/\n" {
-                                // Does not belong to any cpuset yet
-                                tids.push(tid);
-                            } else {
-                                // TODO: issue a warning or something
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut tasks_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(format!("{CPUSET_ROOT}/sunwalker_root/tasks"))
-        .with_context(|| format!("Cannot open {CPUSET_ROOT}/sunwalker_root/tasks for writing"))?;
-
-    for tid in tids {
-        // A failure most likely indicates a kernel thread, which cannot be rescheduled
-        let _ = tasks_file.write_all(tid.to_string().as_ref());
-    }
+    .context("Failed to enable cpuset controller")?;
 
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-pub struct AffineCPUSet {
-    core: u64,
+pub fn create_core_cpuset(core: u64) -> Result<()> {
+    let dir = format!("/sys/fs/cgroup/sunwalker_root/sunwalker_cpu_{core}");
+
+    std::fs::create_dir(&dir)
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .with_context(|| format!("Unable to create {dir} directory"))?;
+
+    std::fs::write(format!("{dir}/cpuset.cpus"), format!("{core}\n"))
+        .with_context(|| format!("Failed to write to {dir}/cpuset.cpus"))?;
+
+    Ok(())
 }
 
-impl AffineCPUSet {
-    pub fn new(core: u64) -> Result<AffineCPUSet> {
-        let dir = format!("{CPUSET_ROOT}/sunwalker_cpu_{core}");
-
-        std::fs::create_dir(&dir)
-            .or_else(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            })
-            .with_context(|| format!("Unable to create {dir} directory"))?;
-
-        std::fs::write(format!("{dir}/cpuset.cpus"), core.to_string())
-            .with_context(|| format!("Failed to write to {dir}/cpuset.cpus"))?;
-
-        std::fs::write(
-            format!("{dir}/cpuset.mems"),
-            std::fs::read_to_string(format!("{CPUSET_ROOT}/cpuset.mems"))?,
-        )
-        .with_context(|| format!("Failed to write to {dir}/cpuset.mems"))?;
-
-        if let Err(e) =
-            std::fs::write(format!("{dir}/cpuset.cpu_exclusive"), "1").with_context(|| {
-                format!("Failed to write to {dir}/cpuset.cpu_exclusive (is core {core} in use?)")
-            })
-        {
-            println!(
-                "[!] Failed to acquire exclusive access to core {} from the kernel. This usually \
-                 indicates the presence of tasks with explicit CPU affinity. Make sure you do not \
-                 have any such services running, or their list of CPU cores is limited. Docker is \
-                 a common cause of the problem.\n{:?}",
-                core, e
-            );
-        }
-
-        Ok(AffineCPUSet { core })
-    }
-
-    pub fn add_task(&self, tid: pid_t) -> Result<()> {
-        add_task_to_core(tid, self.core)
-    }
-}
-
-pub fn add_task_to_core(tid: pid_t, core: u64) -> Result<()> {
-    let path = format!("{CPUSET_ROOT}/sunwalker_cpu_{core}/tasks");
-    std::fs::write(path, tid.to_string())
-        .with_context(|| format!("Failed to set affinity of task {tid} to CPU {core}"))
+pub fn add_process_to_core(pid: pid_t, core: u64) -> Result<()> {
+    std::fs::write(
+        format!("/sys/fs/cgroup/sunwalker_root/sunwalker_cpu_{core}/cgroup.procs"),
+        format!("{pid}\n"),
+    )
+    .with_context(|| format!("Failed to set affinity of process {pid} to CPU {core}"))
 }
 
 pub fn drop_existing_affine_cpusets() -> Result<()> {
-    let mut root_tasks_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(format!("{CPUSET_ROOT}/tasks"))
-        .with_context(|| format!("Cannot open {CPUSET_ROOT}/tasks for writing"))?;
+    if std::path::Path::new("/sys/fs/cgroup/sunwalker_root").exists() {
+        // Remove all the child cgroups
+        for entry in std::fs::read_dir("/sys/fs/cgroup/sunwalker_root")
+            .context("Failed to readdir /sys/fs/cgroup/sunwalker_root")?
+        {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                // Child cgroup
+                std::fs::remove_dir(entry.path())
+                    .with_context(|| format!("Failed to delete {:?}", entry.path()))?;
+            }
+        }
 
-    for entry in
-        std::fs::read_dir(CPUSET_ROOT).with_context(|| format!("Cannot read {CPUSET_ROOT}"))?
-    {
-        let entry = entry?;
-        if let Ok(cpuset_name) = entry.file_name().into_string() {
-            if cpuset_name.starts_with("sunwalker_cpu_") {
-                // Move all tasks out from /sunwalker_cpu_*
-                // FIXME: we should also send them SIGKILL, but this has terrible consequences in case of race condition
-                let mut tasks_path = entry.path();
-                tasks_path.push("tasks");
-                let file = std::fs::File::open(&tasks_path)
-                    .with_context(|| format!("Cannot open {tasks_path:?} for reading"))?;
-                for line in std::io::BufReader::new(file).lines() {
-                    let tid: pid_t = line?
-                        .parse()
-                        .with_context(|| format!("Invalid TID in {tasks_path:?}"))?;
-                    root_tasks_file.write_all(tid.to_string().as_ref())?;
+        let mut backoff = std::time::Duration::from_millis(50);
+        let mut times = 0;
+        while let Err(e) = std::fs::write(
+            "/sys/fs/cgroup/sunwalker_root/cpuset.cpus.partition",
+            "member\n",
+        ) {
+            if let std::io::ErrorKind::ResourceBusy = e.kind() {
+                // cgroup operations are asynchronous, so writing to cpuset.cpus.partition right
+                // after deleting children may yield EBUSY
+                if times == 5 {
+                    return Err(e).context("Failed to make the cgroup a member group");
                 }
-
-                // Remove cpuset
-                std::fs::remove_dir(entry.path())?;
+                std::thread::sleep(backoff);
+                backoff *= 2;
+                times += 1;
+            } else {
+                return Err(e).context("Failed to make the cgroup a member group");
             }
         }
     }
@@ -196,48 +114,47 @@ fn parse_cpuset_list(s: &str) -> Result<Vec<u64>> {
     Ok(result)
 }
 
-fn format_cpuset_list(mut list: Vec<u64>) -> String {
-    list.sort();
+fn format_cpuset_list(list: &[u64]) -> String {
     list.iter()
         .map(|x| x.to_string())
         .collect::<Vec<String>>()
         .join(",")
 }
 
-fn get_all_cores() -> Result<Vec<u64>> {
-    let path = format!("{CPUSET_ROOT}/cpuset.cpus");
-    let all_cores = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read a list of CPU cores from {path}"))?;
-    parse_cpuset_list(all_cores.as_ref())
-}
-
-pub fn isolate_cores(isolated_cores: &Vec<u64>) -> Result<()> {
-    let all_cores = get_all_cores()?;
-
-    let mut not_isolated_cores: HashSet<u64> = HashSet::from_iter(all_cores.iter().cloned());
-    for core in isolated_cores {
-        if !not_isolated_cores.remove(core) {
-            bail!(
-                "Core {} does not exist or was specified twice in the list of isolated cores",
-                core
-            );
-        }
+pub fn isolate_cores(isolated_cores: &[u64]) -> Result<()> {
+    if isolated_cores.is_empty() {
+        bail!("Cannot isolate an empty list of cores");
     }
 
-    if not_isolated_cores.is_empty() {
+    std::fs::write(
+        "/sys/fs/cgroup/sunwalker_root/cpuset.cpus",
+        format_cpuset_list(isolated_cores),
+    )
+    .with_context(|| format!("Failed to isolate cores {isolated_cores:?}, most likely because they are offline, used by another cgroup, or sunwalker is still running"))?;
+
+    let effective_cores: HashSet<u64> = HashSet::from_iter(parse_cpuset_list(
+        &std::fs::read_to_string("/sys/fs/cgroup/sunwalker_root/cpuset.cpus.effective")
+            .context("Failed to read cpuset.cpus.effective")?,
+    )?);
+
+    let isolated_cores = HashSet::from_iter(isolated_cores.iter().cloned());
+    if effective_cores != isolated_cores {
         bail!(
-            "Cannot isolate all cores, at least one core should be devoted to general purpose \
-             tasks"
+            "A subset of cores could not be isolated: {:?}",
+            isolated_cores.difference(&effective_cores)
         );
     }
 
-    let not_isolated_cores = format_cpuset_list(Vec::from_iter(not_isolated_cores.iter().cloned()));
+    if std::fs::read_to_string("/sys/fs/cgroup/sunwalker_root/cpuset.cpus.partition")
+        .context("Failed to read cpuset.cpus.partition")?
+        == "member\n"
+    {
+        std::fs::write(
+            "/sys/fs/cgroup/sunwalker_root/cpuset.cpus.partition",
+            "root\n",
+        )
+        .context("Failed to make the cgroup a root cpuset, most likely because some cores are used by another cgroup")?;
+    }
 
-    std::fs::write(
-        format!("{CPUSET_ROOT}/sunwalker_root/cpuset.cpus"),
-        &not_isolated_cores,
-    )
-    .with_context(|| {
-        format!("Failed to write {not_isolated_cores} to {CPUSET_ROOT}/sunwalker_root/cpuset.cpus")
-    })
+    Ok(())
 }

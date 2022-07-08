@@ -199,12 +199,9 @@ async fn client_main_async(cli_args: init::CLIArgs) -> anyhow::Result<()> {
         )
     })?;
 
-    let mut cpusets = Vec::new();
     for core in &config.environment.cpu_cores {
-        cpusets.push(
-            cgroups::AffineCPUSet::new(*core)
-                .with_context(|| format!("Failed to create cpuset for core {core}"))?,
-        );
+        cgroups::create_core_cpuset(*core)
+            .with_context(|| format!("Failed to create cpuset for core {core}"))?;
     }
 
     let (conductor_ws, _) = tokio_tungstenite::connect_async(&config.conductor.address)
