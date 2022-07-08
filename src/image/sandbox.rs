@@ -760,8 +760,16 @@ async fn isolated_entry<T: Object + 'static>(
     ] {
         let target = format!("{overlay}/root/proc/{path}");
 
-        let metadata = std::fs::metadata(&target)
-            .with_context_invoker(|| format!("Failed to stat /proc/{path}"))?;
+        let metadata = std::fs::metadata(&target);
+
+        if let Err(ref e) = metadata {
+            if let std::io::ErrorKind::NotFound = e.kind() {
+                // If a file does not exist, there's nothing to hide
+                continue;
+            }
+        }
+
+        let metadata = metadata.with_context_invoker(|| format!("Failed to stat /proc/{path}"))?;
 
         let source = if metadata.is_dir() {
             "/tmp/sunwalker_invoker/emptydir"
