@@ -527,6 +527,25 @@ fn enter_sandbox() -> anyhow::Result<()> {
         anyhow::bail!("suid_dumpable is not set to zero, unable to continue safely");
     }
 
+    let fstype = nix::sys::statfs::statfs("/sys/fs/cgroup")
+        .context("cgroups are not available at /sys/fs/cgroup")?
+        .filesystem_type();
+    match fstype {
+        nix::sys::statfs::CGROUP2_SUPER_MAGIC => {}
+        nix::sys::statfs::TMPFS_MAGIC => {
+            anyhow::bail!(
+                "cgroups v1 seems to be mounted at /sys/fs/cgroup. sunwalker requires cgroups v2. \
+                 Please configure your kernel and/or distribution to use cgroups v2"
+            );
+        }
+        _ => {
+            anyhow::bail!(
+                "Unknown filesystem type at /sys/fs/cgroup. sunwalker requires cgroups v2. Please \
+                 configure your kernel and/or distribution to use cgroups v2"
+            );
+        }
+    }
+
     // Unshare namespaces
     if unsafe { libc::unshare(CLONE_NEWNS) } != 0 {
         anyhow::bail!("Initial unshare() failed, unable to continue safely");
