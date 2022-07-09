@@ -1,6 +1,6 @@
 use crate::{
     errors,
-    errors::ToResult,
+    errors::{ToError, ToResult},
     image::{language, program, sandbox, strategy},
     problem::{problem, verdict},
     submission,
@@ -33,7 +33,7 @@ pub struct Worker {
     tx_i2w_command: Option<Arc<Mutex<Sender<submission::Command>>>>,
     tx_i2w_urgent: Option<Mutex<Sender<I2WUrgentCommand>>>,
     rx_w2i: Arc<Mutex<Receiver<W2IMessage>>>,
-    child: Child<Result<(), errors::Error>>,
+    child: Arc<Mutex<(Child<Result<(), errors::Error>>, Option<errors::Error>)>>,
 }
 
 impl Worker {
@@ -74,7 +74,7 @@ impl Worker {
             tx_i2w_command: Some(Arc::new(Mutex::new(tx_i2w_command))),
             tx_i2w_urgent: Some(Mutex::new(tx_i2w_urgent)),
             rx_w2i: Arc::new(Mutex::new(rx_w2i)),
-            child,
+            child: Arc::new(Mutex::new((child, None))),
         })
     }
 
@@ -90,6 +90,7 @@ impl Worker {
             .clone();
 
         let rx_w2i = self.rx_w2i.clone();
+        let child = self.child.clone();
 
         let (tx, rx) = mpsc::unbounded_channel();
 
@@ -109,8 +110,40 @@ impl Worker {
                     let msg = rx_w2i
                         .recv()
                         .await
-                        .context_invoker("Failed to receive response from the worker")?
-                        .context_invoker("No response from the worker: preemptive termination")?;
+                        .context_invoker("Failed to receive response from the worker")?;
+
+                    let msg = match msg {
+                        Some(msg) => msg,
+                        None => {
+                            // The worker must have terminated preemptively; this shouldn't happen
+                            let mut child = child.lock().await;
+
+                            if child.1.is_none() {
+                                child.1 = Some(
+                                    child
+                                        .0
+                                        .join()
+                                        .await
+                                        .context_invoker("Failed to join child")?
+                                        .err()
+                                        .unwrap_or_else(|| {
+                                            errors::InvokerFailure(
+                                                "(no error reported)".to_string(),
+                                            )
+                                        }),
+                                );
+                            }
+
+                            W2IMessage::Failure(
+                                child
+                                    .1
+                                    .as_ref()
+                                    .unwrap()
+                                    .context_invoker("Worker terminated preemptively"),
+                            )
+                        }
+                    };
+
                     if let Err(e) = tx.send(msg) {
                         println!("Response to a command is ignored: {:?}", e);
                     }
