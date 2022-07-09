@@ -29,6 +29,7 @@ pub struct Strategy {
     writer_by_file: HashMap<String, usize>,
     written_files_by_block: Vec<Vec<String>>,
     invocation_limits: HashMap<String, verdict::InvocationLimit>,
+    core: u64,
 }
 
 #[derive(Clone, Object, Deserialize, Serialize)]
@@ -74,7 +75,6 @@ struct StrategyRun<'a> {
     aux: String,
     test_path: PathBuf,
     removed: bool,
-    core: u64,
 }
 
 impl StrategyFactory {
@@ -82,6 +82,7 @@ impl StrategyFactory {
         &'a self,
         user_program: &'a program::Program,
         invocation_limits: HashMap<String, verdict::InvocationLimit>,
+        core: u64,
     ) -> Result<Strategy, errors::Error> {
         // Sanity checks
         let mut seen_block_names = HashSet::new();
@@ -448,6 +449,20 @@ impl StrategyFactory {
             invocable_programs.push(program.into_invocable(format!("block-{i}")).await?);
         }
 
+        // Create cgroups
+        for i in 0..self.blocks.len() {
+            let dir = format!("/sys/fs/cgroup/sunwalker_root/cpu_{core}/block-{i}");
+            std::fs::create_dir(&dir)
+                .or_else(|e| {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                })
+                .with_context_invoker(|| format!("Unable to create {dir} directory"))?;
+        }
+
         let mut writer_by_file = HashMap::new();
         let mut written_files_by_block = vec![Vec::new(); self.blocks.len()];
         for (name, (_, writer)) in readers_and_writer_by_file.into_iter() {
@@ -464,6 +479,7 @@ impl StrategyFactory {
             writer_by_file,
             written_files_by_block,
             invocation_limits,
+            core,
         })
     }
 }
@@ -473,7 +489,6 @@ impl Strategy {
         &mut self,
         build_id: String,
         test_path: PathBuf,
-        core: u64,
     ) -> Result<verdict::TestJudgementResult, errors::Error> {
         let aux = format!("/tmp/sunwalker_invoker/worker/aux/{build_id}");
 
@@ -486,7 +501,6 @@ impl Strategy {
             aux,
             test_path,
             removed: false,
-            core,
         })
         .invoke()
         .await
@@ -674,8 +688,8 @@ impl<'a> StrategyRun<'a> {
                                 std::fs::File::options()
                                     .write(true)
                                     .open(format!(
-                                        "/sys/fs/cgroup/sunwalker_root/cpu_{}/user/cgroup.procs",
-                                        self.core
+                                        "/sys/fs/cgroup/sunwalker_root/cpu_{}/block-{block_id}/cgroup.procs",
+                                        self.strategy.core
                                     ))
                                     .context_invoker("Failed to open user cgroup")?,
                             ),

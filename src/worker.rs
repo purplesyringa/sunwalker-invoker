@@ -231,7 +231,7 @@ pub async fn subprocess_main(
         let strategy = match program {
             Some(ref program) => Some(
                 strategy_factory
-                    .make(program, invocation_limits.take().unwrap())
+                    .make(program, invocation_limits.take().unwrap(), core)
                     .await?,
             ),
             None => None,
@@ -314,7 +314,7 @@ impl Subprocess {
                         .await?;
                     main.strategy = Some(
                         main.strategy_factory
-                            .make(&program, main.invocation_limits.take().unwrap())
+                            .make(&program, main.invocation_limits.take().unwrap(), self.core)
                             .await?,
                     );
                     W2IMessage::CompilationResult(program, log)
@@ -358,7 +358,6 @@ impl Subprocess {
                                         .root
                                         .join("tests")
                                         .join(test.to_string()),
-                                    self.core,
                                 )
                                 .await
                             {

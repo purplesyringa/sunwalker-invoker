@@ -45,16 +45,6 @@ pub fn create_core_cpuset(core: u64) -> Result<(), errors::Error> {
     std::fs::write(format!("{dir}/cpuset.cpus"), format!("{core}\n"))
         .with_context_invoker(|| format!("Failed to write to {dir}/cpuset.cpus"))?;
 
-    std::fs::create_dir(format!("{dir}/user"))
-        .or_else(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        })
-        .with_context_invoker(|| format!("Unable to create {dir}/user directory"))?;
-
     std::fs::create_dir(format!("{dir}/invoker"))
         .or_else(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
