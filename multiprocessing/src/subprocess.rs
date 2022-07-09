@@ -24,8 +24,8 @@ impl<T: Deserialize> Child<T> {
         Ok(())
     }
 
-    pub fn id(&mut self) -> pid_t {
-        self.proc_pid.into()
+    pub fn id(&self) -> pid_t {
+        self.proc_pid.as_raw()
     }
 
     pub fn join(&mut self) -> Result<T> {
