@@ -1043,14 +1043,16 @@ fn executor_worker(
     mut pipe: multiprocessing::Duplex<errors::Error, ()>,
 ) {
     if let Err(e) = try {
+        sandbox::drop_privileges().context_invoker("Failed to drop privileges")?;
+
+        std::env::set_current_dir("/space").context_invoker("Failed to chdir to /space")?;
+
         nix::unistd::dup2(stdin.as_raw_fd(), nix::libc::STDIN_FILENO)
             .context_invoker("dup2 for stdin failed")?;
         nix::unistd::dup2(stdout.as_raw_fd(), nix::libc::STDOUT_FILENO)
             .context_invoker("dup2 for stdout failed")?;
         nix::unistd::dup2(stderr.as_raw_fd(), nix::libc::STDERR_FILENO)
             .context_invoker("dup2 for stderr failed")?;
-
-        sandbox::drop_privileges().context_invoker("Failed to drop privileges")?;
 
         let mut args = Vec::with_capacity(argv.len());
         for arg in argv {
@@ -1066,7 +1068,9 @@ fn executor_worker(
 
         // Fine to start the application now. We don't need to reset signals because we didn't
         // configure them inside executor_worker()
-        nix::unistd::execv(&args[0], &args).context_invoker("execve failed")
+
+        // Try block wraps return value in Ok(...)
+        nix::unistd::execv(&args[0], &args).context_invoker("execve failed")?;
     } {
         pipe.send(&e).expect("Failed to report error to parent");
     }
