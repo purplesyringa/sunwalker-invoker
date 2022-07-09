@@ -450,7 +450,7 @@ impl StrategyFactory {
         }
 
         // Create cgroups
-        for (i, block) in self.blocks.iter().enumerate() {
+        for i in 0..self.blocks.len() {
             let dir = format!("/sys/fs/cgroup/sunwalker_root/cpu_{core}/block-{i}");
             std::fs::create_dir(&dir)
                 .or_else(|e| {
@@ -462,23 +462,23 @@ impl StrategyFactory {
                 })
                 .with_context_invoker(|| format!("Unable to create {dir} directory"))?;
 
-            // If possible, don't let the process use more CPU time than allowed. This will not
-            // optimize real time usage because cgroups won't notify us when the allotted time runs
-            // out, but it will optimize CPU utilization slightly.
+            // There was code that limited the CPU usage of the process via cpu.max. That turned out
+            // to be a bad idea for the following reason:
+            //
+            // Cgroups don't notify us when the allotted time runs out, but it lets us optimize CPU
+            // utilization slightly.
             //
             // The format of cpu.max is "$MAX $PERIOD", which means "at most $MAX CPU time in
-            // $PERIOD". The units are microseconds, and the period is at most one second, so we
-            // can't limit the usage if TL is at least one second, but we can otherwise.
-            let cpu_time = invocation_limits[&block.name].cpu_time;
-            std::fs::write(
-                format!("{dir}/cpu.max"),
-                if cpu_time < std::time::Duration::from_secs(1) {
-                    format!("{} 1000000\n", cpu_time.as_micros())
-                } else {
-                    format!("max 100000\n") // default value
-                },
-            )
-            .context_invoker("Failed to set cpu.max")?;
+            // $PERIOD". The units are microseconds, and the period is at most one second. This
+            // means we can tell the scheduler to stop running the program if it has already run for
+            // some period of time, but this data is reset in $PERIOD, so this is only reasonable if
+            // TL is less than one second.
+            //
+            // But there's a much worse fact. The allotted chunk sort of survives between
+            // invocations, which means that if, say, $MAX is 300ms and $PERIOD is 1s and a program
+            // used up 200ms, then the next program will use the other 100ms, wait for about 700ms
+            // for the limits to reset, and then continue execution. This is certainly not what we
+            // want.
         }
 
         let mut writer_by_file = HashMap::new();
@@ -871,15 +871,28 @@ impl Drop for StrategyRun<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CgroupCpuStat {
+    user: std::time::Duration,
+    system: std::time::Duration,
+    total: std::time::Duration,
+}
+
+impl std::ops::Sub for CgroupCpuStat {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            user: self.user - rhs.user,
+            system: self.system - rhs.system,
+            total: self.total - rhs.total,
+        }
+    }
+}
+
 #[derive(Object)]
 struct CgroupHandle {
     cgroup_procs: std::fs::File,
     cpu_stat: std::fs::File,
-}
-
-struct CgroupCpuStat {
-    user_usec: u64,
-    system_usec: u64,
 }
 
 impl CgroupHandle {
@@ -912,28 +925,32 @@ impl CgroupHandle {
             .context_invoker("Failed to read cpu.stat")?;
 
         let mut stat = CgroupCpuStat {
-            user_usec: 0,
-            system_usec: 0,
+            user: std::time::Duration::ZERO,
+            system: std::time::Duration::ZERO,
+            total: std::time::Duration::ZERO,
         };
 
         for line in buf.lines() {
             let target;
             if line.starts_with("user_usec ") {
-                target = &mut stat.user_usec;
+                target = &mut stat.user;
             } else if line.starts_with("system_usec ") {
-                target = &mut stat.system_usec;
+                target = &mut stat.system;
             } else {
                 continue;
             }
 
             let mut it = line.split_ascii_whitespace();
             it.next();
-            *target = it
-                .next()
-                .context_invoker("Invalid cpu.stat format")?
-                .parse()
-                .context_invoker("Invalid cpu.stat format")?;
+            *target = std::time::Duration::from_micros(
+                it.next()
+                    .context_invoker("Invalid cpu.stat format")?
+                    .parse()
+                    .context_invoker("Invalid cpu.stat format")?,
+            );
         }
+
+        stat.total = stat.user + stat.system;
 
         Ok(stat)
     }
@@ -997,9 +1014,9 @@ fn execute(
         return Err(e.context_invoker("Child returned an error"));
     }
 
-    // Create timerfd. It would perhaps be more correct to account for the lapse of time between
-    // starting the process and creating the timerfd, but we acquire the uptime of the process via
-    // safe procfs methods anyway.
+    // Create a timerfd for tracking real time limit. It would perhaps be more correct to account
+    // for the lapse of time between starting the process and creating the timerfd, but the
+    // difference is negligible.
     use nix::sys::timerfd::*;
     let timer = TimerFd::new(ClockId::CLOCK_MONOTONIC, TimerFlags::empty())
         .context_invoker("Failed to create timerfd")?;
@@ -1034,29 +1051,75 @@ fn execute(
 
     let mut events = [EpollEvent::empty()];
 
-    // We could theoretically use epoll's timeout option, but that would stop working when we would
-    // need to call epoll_wait several times
-    let n_events = epoll_wait(epollfd, &mut events, -1).context_invoker("epoll_wait failed")?;
-    if n_events != 1 {
-        return Err(std::io::Error::last_os_error())
-            .with_context_invoker(|| format!("epoll_wait returned {n_events}"));
-    }
+    // The connection between real time and cpu time is complicated. On the one hand, a process can
+    // sleep, which does not count towards cpu time, so it can be as low as it gets. Secondly,
+    // multithreaded applications can use several cores (TODO: add opt-in support for that), and
+    // that means cpu time may exceed real time. The inequality seems to be
+    //     0 <= cpu_time <= real_time * n_cores,
+    // so a process cannot exceed its cpu time limit during the first
+    //     cpu_time_limit / n_cores
+    // seconds. This gives us a better way to handle TLE than by polling the stats every few
+    // milliseconds. Instead, the algorithm is roughly (other limits notwithstanding):
+    //     while the process has not terminated and limits are not exceeded {
+    //         let guaranteed_cpu_time_left = how much more cpu time the process can spend without
+    //             exceeding the limit;
+    //         let guaranteed_real_time_left = max_cpu_time_left / n_cores;
+    //         sleep(guaranteed_real_time_left);
+    //     }
 
     let mut real_time_timeout = false;
-    match events[0].data() {
-        0 => {
-            // pidfd fired -- the process has terminated
-        }
-        1 => {
-            // timerfd fired -- time out
-            real_time_timeout = true;
+    loop {
+        let cpu_stat = cgroup.cpu_stat()? - cpu_stat_before;
+
+        if cpu_stat.total > invocation_limit.cpu_time {
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::SIGKILL)
                 .context_invoker("Failed to kill the process")?;
+            break;
         }
-        _ => {
-            return Err(errors::InvokerFailure(
-                "Invalid epollfd data returned".to_string(),
-            ));
+
+        let timeout = invocation_limit.cpu_time - cpu_stat.total;
+        let n_events = epoll_wait(
+            epollfd,
+            &mut events,
+            // Switching context takes time, some other operations take time too, etc., so less cpu
+            // time is usually used than permitted. We also don't really want to interrupt the
+            // process. We need to set a low limit on the timeout as well, so simply adding 10ms
+            // seems like a good solution.
+            (timeout.as_millis().min(1000000) as isize) + 10,
+        )
+        .context_invoker("epoll_wait failed")?;
+
+        match n_events {
+            0 => {
+                // End of allotted real time chunk, will check if the limit was exceeded on the next
+                // iteration of the loop
+            }
+            1 => {
+                match events[0].data() {
+                    0 => {
+                        // pidfd fired -- the process has terminated
+                    }
+                    1 => {
+                        // timerfd fired -- time out
+                        real_time_timeout = true;
+                        nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid),
+                            nix::sys::signal::SIGKILL,
+                        )
+                        .context_invoker("Failed to kill the process")?;
+                    }
+                    _ => {
+                        return Err(errors::InvokerFailure(
+                            "Invalid epollfd data returned".to_string(),
+                        ));
+                    }
+                }
+                break;
+            }
+            _ => {
+                return Err(std::io::Error::last_os_error())
+                    .with_context_invoker(|| format!("epoll_wait returned {n_events}"));
+            }
         }
     }
 
@@ -1065,36 +1128,17 @@ fn execute(
 
     // Collect current stats; we will later compute the difference between the current stats and the
     // previous stats
-    let cpu_stat = cgroup.cpu_stat()?;
-
-    // Await the child process now because getrusage only takes awaited processes into consideration
-    let wait_status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None)
-        .context_invoker("Failed to waitpid for process")?;
-
-    // Collect CPU time and memory statistics
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage as *mut libc::rusage) } == -1 {
-        return Err(
-            std::io::Error::last_os_error().context_invoker("Failed to get rusage of program")
-        );
-    }
-
-    let user_time =
-        std::time::Duration::from_micros(cpu_stat.user_usec - cpu_stat_before.user_usec);
-    let sys_time =
-        std::time::Duration::from_micros(cpu_stat.system_usec - cpu_stat_before.system_usec);
-
-    // Both PCMS and ejudge take system time into account. This also seems to be the way Linux
-    // computes usage_usec field of the CPU stats.
-    let cpu_time = user_time + sys_time;
+    let cpu_stat = cgroup.cpu_stat()? - cpu_stat_before;
 
     // Into verdict
     let test_verdict;
-    if cpu_time > invocation_limit.cpu_time {
+    if cpu_stat.total > invocation_limit.cpu_time {
         test_verdict = verdict::TestVerdict::TimeLimitExceeded;
     } else if real_time_timeout || real_time > invocation_limit.real_time {
         test_verdict = verdict::TestVerdict::IdlenessLimitExceeded;
     } else {
+        let wait_status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None)
+            .context_invoker("Failed to waitpid for process")?;
         match wait_status {
             nix::sys::wait::WaitStatus::Exited(_, exit_code) => {
                 if exit_code == 0 {
@@ -1122,9 +1166,9 @@ fn execute(
         test_verdict,
         verdict::InvocationStat {
             real_time,
-            cpu_time,
-            user_time,
-            sys_time,
+            cpu_time: cpu_stat.total,
+            user_time: cpu_stat.user,
+            sys_time: cpu_stat.system,
             memory: 0, // TODO
         },
     ))
