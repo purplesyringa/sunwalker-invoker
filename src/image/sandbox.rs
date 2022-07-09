@@ -79,9 +79,9 @@ pub fn enter_worker_space(core: u64) -> Result<(), errors::Error> {
 
     // Switch to core
     let pid = unsafe { libc::getpid() };
-    cgroups::add_process_to_core(pid, core).with_context_invoker(|| {
-        format!("Failed to move current process (PID {pid}) to core {core}")
-    })?;
+    cgroups::move_process_to_cgroup(pid, format!("cpu_{core}/invoker")).with_context_invoker(
+        || format!("Failed to move current process (PID {pid}) to core {core}"),
+    )?;
 
     Ok(())
 }
@@ -393,7 +393,7 @@ pub async fn run_isolated<T: Object + 'static>(
     f: Box<dyn multiprocessing::FnOnce<(), Output = Result<T, errors::Error>> + Send + Sync>,
     rootfs: &RootFS,
 ) -> Result<T, errors::Error> {
-    // A PID namespace it's not usable after the process with PID 1 dies, so we can't create the
+    // A PID namespace is not usable after the process with PID 1 dies, so we can't create the
     // namespace once and reuse it later. We also can't unshare pidns inside isolated_entry, because
     // that would only affect the pidns of its children, and we would be unable to mount /proc
     // correctly.

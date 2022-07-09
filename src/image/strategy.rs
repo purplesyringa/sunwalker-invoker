@@ -8,10 +8,9 @@ use crate::{
 use multiprocessing::{Bind, Object};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::os::unix::{
-    io::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    process::CommandExt,
-};
+use std::ffi::CString;
+use std::io::Write;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 
 #[derive(Clone, Object, Deserialize, Serialize)]
@@ -75,6 +74,7 @@ struct StrategyRun<'a> {
     aux: String,
     test_path: PathBuf,
     removed: bool,
+    core: u64,
 }
 
 impl StrategyFactory {
@@ -473,6 +473,7 @@ impl Strategy {
         &mut self,
         build_id: String,
         test_path: PathBuf,
+        core: u64,
     ) -> Result<verdict::TestJudgementResult, errors::Error> {
         let aux = format!("/tmp/sunwalker_invoker/worker/aux/{build_id}");
 
@@ -485,6 +486,7 @@ impl Strategy {
             aux,
             test_path,
             removed: false,
+            core,
         })
         .invoke()
         .await
@@ -665,6 +667,17 @@ impl<'a> StrategyRun<'a> {
                                     .get(&block.name)
                                     .unwrap()
                                     .clone(),
+                            )
+                            // Open the cgroup configuration file here because /sys/fs/cgroup is not
+                            // mounted inside the sandbox
+                            .bind(
+                                std::fs::File::options()
+                                    .write(true)
+                                    .open(format!(
+                                        "/sys/fs/cgroup/sunwalker_root/cpu_{}/user/cgroup.procs",
+                                        self.core
+                                    ))
+                                    .context_invoker("Failed to open user cgroup")?,
                             ),
                     ),
                     &program.rootfs,
@@ -832,20 +845,16 @@ fn execute(
     stdout: std::fs::File,
     stderr: std::fs::File,
     invocation_limit: verdict::InvocationLimit,
+    mut cgroup_procs: std::fs::File,
 ) -> Result<(verdict::TestVerdict, verdict::InvocationStat), errors::Error> {
     // Start process
-    let pid = unsafe {
-        std::process::Command::new(&argv[0])
-            .args(&argv[1..])
-            .stdin(stdin)
-            .stdout(stdout)
-            .stderr(stderr)
-            .current_dir("/space")
-            .pre_exec(sandbox::drop_privileges)
-    }
-    .spawn()
-    .with_context_invoker(|| format!("Failed to spawn {argv:?}"))?
-    .id() as libc::pid_t;
+    let (mut ours, theirs) =
+        multiprocessing::duplex().context_invoker("Failed to create a pipe")?;
+
+    let proc = executor_worker
+        .spawn(argv, stdin, stdout, stderr, theirs)
+        .context_invoker("Failed to spawn the child")?;
+    let pid = proc.id();
 
     // Acquire pidfd for the process. This is safe because the process hasn't been awaited yet. We
     // prefer younger pidfd to older signalfd because our process is PID 1 and therefore reaps all
@@ -854,6 +863,33 @@ fn execute(
     if pidfd == -1 {
         return Err(std::io::Error::last_os_error())
             .context_invoker("Failed to open pidfd for child process");
+    }
+
+    // Apply cgroup limits
+    cgroup_procs
+        .write(format!("{pid}\n").as_bytes())
+        .context_invoker("Failed to move the child to user cgroup")?;
+
+    // Measure time. It would be slightly before execve, but it should not be a big problem
+    let start = std::time::Instant::now();
+
+    // Tell the child it's alright to start
+    if let Err(_) = ours.send(&()) {
+        // This most likely indicates that the child has terminated before having a chance to wait
+        // on the pipe, i.e. a preparation failure
+        return Err(ours
+            .recv()
+            .context_invoker("Failed to read an error from the child")?
+            .context_invoker("The child terminated preemptively but did not report any error")?);
+    }
+
+    // The child will either report an error during execve, or nothing if execve succeeded and the
+    // pipe was closed automatically because it's CLOEXEC.
+    if let Some(e) = ours
+        .recv()
+        .context_invoker("Failed to read an error from the child")?
+    {
+        return Err(e.context_invoker("Child returned an error"));
     }
 
     // Create timerfd. It would perhaps be more correct to account for the lapse of time between
@@ -919,35 +955,8 @@ fn execute(
         }
     }
 
-    let uptime = nix::time::clock_gettime(nix::time::ClockId::CLOCK_BOOTTIME)
-        .context_invoker("Failed to get uptime")?;
-    let uptime = std::time::Duration::new(uptime.tv_sec() as u64, uptime.tv_nsec() as u32);
-
     // Collect real time statistics
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .context_invoker("Failed to read /proc/.../stat")?;
-    // Whoever thought putting an unescaped process name into the middle of the file was a good idea
-    // probably wasn't a very bright person
-    let fields = stat[stat
-        .rfind(')')
-        .context_invoker("Invalid /proc/.../stat format: stat does not contain )")?
-        + 1..]
-        .split_ascii_whitespace();
-    // On Linux, the 'starttime' field is computed from task->start_boottime in fs/proc/array.c,
-    // which is set to ktime_get_boottime_ns() in kernel/fork.c, which is the kernel equivalent to
-    // clock_gettime(CLOCK_BOOTTIME).
-    let starttime: u64 = fields
-        .skip(19)
-        .next()
-        .context_invoker("Invalid /proc/.../stat format: missing starttime")?
-        .parse()
-        .context_invoker("Invalid /proc/.../stat format: starttime is not a number")?;
-    let clk_tck = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
-        .ok()
-        .flatten()
-        .context_invoker("sysconf(_SC_CLK_TCK) failed")? as u64;
-    let starttime = std::time::Duration::from_nanos(1_000_000_000 * starttime / clk_tck);
-    let real_time = uptime.saturating_sub(starttime);
+    let real_time = start.elapsed();
 
     // Await the child process now because getrusage only takes awaited processes into consideration
     let wait_status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None)
@@ -1009,4 +1018,42 @@ fn execute(
             memory: 0, // TODO
         },
     ))
+}
+
+#[multiprocessing::entrypoint]
+fn executor_worker(
+    argv: Vec<String>,
+    stdin: std::fs::File,
+    stdout: std::fs::File,
+    stderr: std::fs::File,
+    mut pipe: multiprocessing::Duplex<errors::Error, ()>,
+) {
+    if let Err(e) = try {
+        nix::unistd::dup2(stdin.as_raw_fd(), nix::libc::STDIN_FILENO)
+            .context_invoker("dup2 for stdin failed")?;
+        nix::unistd::dup2(stdout.as_raw_fd(), nix::libc::STDOUT_FILENO)
+            .context_invoker("dup2 for stdout failed")?;
+        nix::unistd::dup2(stderr.as_raw_fd(), nix::libc::STDERR_FILENO)
+            .context_invoker("dup2 for stderr failed")?;
+
+        sandbox::drop_privileges().context_invoker("Failed to drop privileges")?;
+
+        let mut args = Vec::with_capacity(argv.len());
+        for arg in argv {
+            args.push(
+                CString::new(arg.into_bytes())
+                    .context_invoker("Argument contains null character")?,
+            );
+        }
+
+        pipe.recv()
+            .context_invoker("Failed to await confirmation from master process")?
+            .context_invoker("No confirmation from master process")?;
+
+        // Fine to start the application now. We don't need to reset signals because we didn't
+        // configure them inside executor_worker()
+        nix::unistd::execv(&args[0], &args).context_invoker("execve failed")
+    } {
+        pipe.send(&e).expect("Failed to report error to parent");
+    }
 }

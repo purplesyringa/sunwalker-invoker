@@ -192,6 +192,7 @@ struct Subprocess {
     language: language::Language,
     source_files: Vec<String>,
     instantiated_dependency_dag: RwLock<problem::InstantiatedDependencyDAG>,
+    core: u64,
 }
 
 struct SubprocessMain {
@@ -241,6 +242,7 @@ pub async fn subprocess_main(
             language,
             source_files,
             instantiated_dependency_dag: RwLock::new(instantiated_dependency_dag),
+            core,
         });
 
         let proc = subprocess.clone();
@@ -356,6 +358,7 @@ impl Subprocess {
                                         .root
                                         .join("tests")
                                         .join(test.to_string()),
+                                    self.core,
                                 )
                                 .await
                             {
