@@ -10,6 +10,7 @@ use std::arch::asm;
 use std::cell::{SyncUnsafeCell, UnsafeCell};
 use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::RawFd;
 
 #[derive(Eq, PartialEq, Debug)]
@@ -33,6 +34,7 @@ unsafe impl Send for VMMap {}
 // This data is preserved across restoration
 struct TransparentData {
     stack_bottom: *mut u8,
+    stack_env_start: *const u8,
     stack_size: usize,
     entry_rx_fd: RawFd,
 }
@@ -208,7 +210,23 @@ pub(crate) fn cache_current_state() {
 
     if !transparent_data.stack_bottom.is_null() {
         // After restore()
+
         unsafe {
+            // Restore environment. TODO: delete removed variables
+            let stack_top =
+                (transparent_data.stack_bottom as *const u8).add(transparent_data.stack_size);
+            let mut stack_env = transparent_data.stack_env_start;
+            while stack_env != stack_top {
+                let key = std::ffi::CStr::from_ptr(stack_env as *const i8).to_bytes();
+                stack_env = stack_env.add(key.len() + 1);
+                let value = std::ffi::CStr::from_ptr(stack_env as *const i8).to_bytes();
+                stack_env = stack_env.add(value.len() + 1);
+                std::env::set_var(
+                    std::ffi::OsStr::from_bytes(key),
+                    std::ffi::OsStr::from_bytes(value),
+                );
+            }
+
             mman::munmap(
                 transparent_data.stack_bottom as *mut c_void,
                 transparent_data.stack_size,
@@ -263,11 +281,19 @@ pub(crate) unsafe fn restore(entry_rx_fd: RawFd) -> ! {
     let cached_data = &*CACHED_DATA.get();
     let mut current_maps = get_current_maps(false);
 
-    // Allocate the stack after current_maps to avoid clashing or whatever
+    // Environment variables are to be preserved across restore()
+    let vars: Vec<_> = std::env::vars_os().collect();
+    let vars_size: usize = vars
+        .iter()
+        .map(|(key, value)| key.len() + 1 + value.len() + 1)
+        .sum();
 
-    // Worst case: everything has to be remapped, plus a page for control flow stack
-    let stack_size =
-        std::mem::size_of::<RestoreAction>() * (cached_data.maps.len() + current_maps.len()) + 4096;
+    // Allocate the stack after current_maps to avoid clashing or whatever
+    // Worst case: everything has to be remapped, plus environment, plus a page for control flow stack
+    let stack_size = std::mem::size_of::<RestoreAction>()
+        * (cached_data.maps.len() + current_maps.len())
+        + vars_size
+        + 4096;
     let stack_size = (stack_size + 4095) & !4095;
 
     let stack_bottom = mman::mmap(
@@ -289,7 +315,20 @@ pub(crate) unsafe fn restore(entry_rx_fd: RawFd) -> ! {
         }
     }
 
-    let mut stack_head = stack_top as *mut RestoreAction;
+    let mut stack_env_start = stack_top;
+
+    // Push environment variables
+    for (key, value) in vars {
+        for s in [value, key] {
+            let s = s.into_vec();
+            stack_env_start = stack_env_start.sub(1);
+            *stack_env_start = 0;
+            stack_env_start = stack_env_start.sub(s.len());
+            std::ptr::copy_nonoverlapping(s.as_ptr(), stack_env_start, s.len());
+        }
+    }
+
+    let mut stack_head = stack_env_start as *mut RestoreAction;
 
     let mut push_action = |action: RestoreAction| {
         stack_head = stack_head.sub(1);
@@ -384,6 +423,7 @@ pub(crate) unsafe fn restore(entry_rx_fd: RawFd) -> ! {
 
     let transparent_data = &mut *cached_data.transparent_data.unwrap().get();
     transparent_data.stack_bottom = stack_bottom;
+    transparent_data.stack_env_start = stack_env_start;
     transparent_data.stack_size = stack_size;
     transparent_data.entry_rx_fd = entry_rx_fd;
 
@@ -397,7 +437,7 @@ pub(crate) unsafe fn restore(entry_rx_fd: RawFd) -> ! {
         "mov rsp, rbp",
         "pop rbp",
         stack = in(reg) stack_head,
-        in("rdi") stack_top,
+        in("rdi") stack_env_start,
         in("rsi") stack_head,
         in("rdx") cached_data.rsp,
         in("rcx") cached_data.rip,
