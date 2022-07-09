@@ -450,7 +450,7 @@ impl StrategyFactory {
         }
 
         // Create cgroups
-        for i in 0..self.blocks.len() {
+        for (i, block) in self.blocks.iter().enumerate() {
             let dir = format!("/sys/fs/cgroup/sunwalker_root/cpu_{core}/block-{i}");
             std::fs::create_dir(&dir)
                 .or_else(|e| {
@@ -461,6 +461,24 @@ impl StrategyFactory {
                     }
                 })
                 .with_context_invoker(|| format!("Unable to create {dir} directory"))?;
+
+            // If possible, don't let the process use more CPU time than allowed. This will not
+            // optimize real time usage because cgroups won't notify us when the allotted time runs
+            // out, but it will optimize CPU utilization slightly.
+            //
+            // The format of cpu.max is "$MAX $PERIOD", which means "at most $MAX CPU time in
+            // $PERIOD". The units are microseconds, and the period is at most one second, so we
+            // can't limit the usage if TL is at least one second, but we can otherwise.
+            let cpu_time = invocation_limits[&block.name].cpu_time;
+            std::fs::write(
+                format!("{dir}/cpu.max"),
+                if cpu_time < std::time::Duration::from_secs(1) {
+                    format!("{} 1000000\n", cpu_time.as_micros())
+                } else {
+                    format!("max 100000\n") // default value
+                },
+            )
+            .context_invoker("Failed to set cpu.max")?;
         }
 
         let mut writer_by_file = HashMap::new();
