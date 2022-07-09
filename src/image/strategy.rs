@@ -1079,6 +1079,7 @@ fn execute(
         let cpu_stat = cgroup.cpu_stat()? - cpu_stat_before;
 
         if cpu_stat.total > invocation_limit.cpu_time {
+            // Sending a signal to a zombie process is fine, so races are not a problem
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::SIGKILL)
                 .context_invoker("Failed to kill the process")?;
             break;
@@ -1113,6 +1114,7 @@ fn execute(
                     1 => {
                         // timerfd fired -- time out
                         real_time_timeout = true;
+                        // Sending a signal to a zombie process is fine, so races are not a problem
                         nix::sys::signal::kill(
                             nix::unistd::Pid::from_raw(pid),
                             nix::sys::signal::SIGKILL,
