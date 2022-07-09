@@ -41,7 +41,6 @@ fn watchdog_main(invoker_pid: libc::pid_t) -> Result<()> {
     // Garbage cleanup
     cgroups::drop_existing_affine_cpusets()
         .with_context(|| "Failed to remove dangling cpusets at shutdown")?;
-    cgroups::isolate_cores(&vec![]).with_context(|| "Failed to revert CPU isolation")?;
 
     Ok(())
 }
