@@ -1,6 +1,7 @@
 use crate::{errors, errors::ToResult};
 use libc::pid_t;
 use std::collections::HashSet;
+use std::path::Path;
 
 pub fn create_root_cpuset() -> Result<(), errors::Error> {
     std::fs::create_dir("/sys/fs/cgroup/sunwalker_root")
@@ -76,35 +77,26 @@ pub fn move_process_to_cgroup(pid: pid_t, name: String) -> Result<(), errors::Er
 }
 
 pub fn drop_existing_affine_cpusets() -> Result<(), errors::Error> {
-    if std::path::Path::new("/sys/fs/cgroup/sunwalker_root").exists() {
+    if Path::new("/sys/fs/cgroup/sunwalker_root").exists() {
         // Remove all the child cgroups
-        for entry in std::fs::read_dir("/sys/fs/cgroup/sunwalker_root")
-            .context_invoker("Failed to readdir /sys/fs/cgroup/sunwalker_root")?
-        {
-            let entry = entry.context_invoker("Failed to readdir /sys/fs/cgroup/sunwalker_root")?;
-            if entry
-                .file_type()
-                .with_context_invoker(|| format!("Failed to stat {:?}", entry.path()))?
-                .is_dir()
+        fn cleanup(dir: &Path) -> Result<(), errors::Error> {
+            for entry in std::fs::read_dir(dir)
+                .with_context_invoker(|| format!("Failed to readdir {dir:?}"))?
             {
-                // Children cgroups
-                for name in ["user", "invoker"] {
-                    if let Err(e) = std::fs::remove_dir(entry.path().join(name)) {
-                        match e.kind() {
-                            std::io::ErrorKind::NotFound => {}
-                            _ => {
-                                return Err(e).with_context_invoker(|| {
-                                    format!("Failed to delete {:?}", entry.path())
-                                });
-                            }
-                        }
-                    }
+                let entry = entry.with_context_invoker(|| format!("Failed to readdir {dir:?}"))?;
+                if entry
+                    .file_type()
+                    .with_context_invoker(|| format!("Failed to stat {:?}", entry.path()))?
+                    .is_dir()
+                {
+                    cleanup(&entry.path())?;
+                    std::fs::remove_dir(entry.path())
+                        .with_context_invoker(|| format!("Failed to delete {:?}", entry.path()))?;
                 }
-
-                std::fs::remove_dir(entry.path())
-                    .with_context_invoker(|| format!("Failed to delete {:?}", entry.path()))?;
             }
+            Ok(())
         }
+        cleanup(Path::new("/sys/fs/cgroup/sunwalker_root"))?;
 
         let mut backoff = std::time::Duration::from_millis(50);
         let mut times = 0;
