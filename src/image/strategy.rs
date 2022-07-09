@@ -970,7 +970,14 @@ fn execute(
         multiprocessing::duplex().context_invoker("Failed to create a pipe")?;
 
     let proc = executor_worker
-        .spawn(argv, stdin, stdout, stderr, theirs)
+        .spawn(
+            argv,
+            stdin,
+            stdout,
+            stderr,
+            theirs,
+            invocation_limit.cpu_time,
+        )
         .context_invoker("Failed to spawn the child")?;
     let pid = proc.id();
 
@@ -983,14 +990,14 @@ fn execute(
             .context_invoker("Failed to open pidfd for child process");
     }
 
-    // Acquire previous cgroup stats. We reuse cgroups across tests and even across submissions, so
-    // we can't assume the stats are at zero at this moment.
-    let cpu_stat_before = cgroup.cpu_stat()?;
-
     // Apply cgroup limits
     cgroup
         .add_process(pid)
         .context_invoker("Failed to move the child to user cgroup")?;
+
+    // Acquire previous cgroup stats. We reuse cgroups across tests and even across submissions, so
+    // we can't assume the stats are at zero at this moment.
+    let cpu_stat_before = cgroup.cpu_stat()?;
 
     // Measure time. It would be slightly before execve, but it should not be a big problem
     let start = std::time::Instant::now();
@@ -1083,9 +1090,13 @@ fn execute(
             &mut events,
             // Switching context takes time, some other operations take time too, etc., so less cpu
             // time is usually used than permitted. We also don't really want to interrupt the
-            // process. We need to set a low limit on the timeout as well, so simply adding 10ms
-            // seems like a good solution.
-            (timeout.as_millis().min(1000000) as isize) + 10,
+            // process. We need to set a low limit on the timeout as well.
+            //
+            // In practice, adding 50ms seems like a good solution. This is not too big a number to
+            // slow the judgment, not too small to steal resources from the solution in what is
+            // effectively a spin lock, and allows SIGPROF to fire just at the right moment under
+            // normal circumstances.
+            (timeout.as_millis().min(1000000) as isize) + 50,
         )
         .context_invoker("epoll_wait failed")?;
 
@@ -1130,15 +1141,21 @@ fn execute(
     // previous stats
     let cpu_stat = cgroup.cpu_stat()? - cpu_stat_before;
 
+    let wait_status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None)
+        .context_invoker("Failed to waitpid for process")?;
+
+    let cpu_time_timeout = match wait_status {
+        nix::sys::wait::WaitStatus::Signaled(_, nix::sys::signal::Signal::SIGPROF, _) => true,
+        _ => false,
+    };
+
     // Into verdict
     let test_verdict;
-    if cpu_stat.total > invocation_limit.cpu_time {
+    if cpu_time_timeout || cpu_stat.total > invocation_limit.cpu_time {
         test_verdict = verdict::TestVerdict::TimeLimitExceeded;
     } else if real_time_timeout || real_time > invocation_limit.real_time {
         test_verdict = verdict::TestVerdict::IdlenessLimitExceeded;
     } else {
-        let wait_status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None)
-            .context_invoker("Failed to waitpid for process")?;
         match wait_status {
             nix::sys::wait::WaitStatus::Exited(_, exit_code) => {
                 if exit_code == 0 {
@@ -1181,6 +1198,7 @@ fn executor_worker(
     stdout: std::fs::File,
     stderr: std::fs::File,
     mut pipe: multiprocessing::Duplex<errors::Error, ()>,
+    cpu_time_limit: std::time::Duration,
 ) {
     if let Err(e) = try {
         sandbox::drop_privileges().context_invoker("Failed to drop privileges")?;
@@ -1208,6 +1226,33 @@ fn executor_worker(
 
         // Fine to start the application now. We don't need to reset signals because we didn't
         // configure them inside executor_worker()
+
+        // An additional optimization for finer handling of cpu time limit. An ITIMER_PROF timer can
+        // emit a signal when the given limit is exceeded and is not reset upon execve. This only
+        // applies to a single process, not a cgroup, and can be overwritten by the user program,
+        // but this feature is not mission-critical. It merely saves us a few precious milliseconds
+        // due to the (somewhat artificially deliberate) inefficiency of polling.
+        let timer = libc::itimerval {
+            it_interval: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            it_value: libc::timeval {
+                tv_sec: cpu_time_limit.as_secs() as i64,
+                tv_usec: cpu_time_limit.subsec_micros() as i64,
+            },
+        };
+        if unsafe {
+            libc::syscall(
+                libc::SYS_setitimer,
+                libc::ITIMER_PROF,
+                &timer as *const libc::itimerval,
+                std::ptr::null_mut::<libc::itimerval>(),
+            )
+        } == -1
+        {
+            Err(std::io::Error::last_os_error()).context_invoker("Failed to set interval timer")?;
+        }
 
         // Try block wraps return value in Ok(...)
         nix::unistd::execv(&args[0], &args).context_invoker("execve failed")?;
