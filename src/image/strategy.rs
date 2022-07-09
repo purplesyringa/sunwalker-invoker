@@ -9,7 +9,7 @@ use multiprocessing::{Bind, Object};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 
@@ -700,16 +700,17 @@ impl<'a> StrategyRun<'a> {
                                     .unwrap()
                                     .clone(),
                             )
-                            // Open the cgroup configuration file here because /sys/fs/cgroup is not
-                            // mounted inside the sandbox
+                            // Open the cgroup files here because /sys/fs/cgroup is not mounted
+                            // inside the sandbox and is owned by real root, not fake root
                             .bind(
-                                std::fs::File::options()
-                                    .write(true)
-                                    .open(format!(
-                                        "/sys/fs/cgroup/sunwalker_root/cpu_{}/block-{block_id}/cgroup.procs",
+                                CgroupHandle::open(
+                                    format!(
+                                        "/sys/fs/cgroup/sunwalker_root/cpu_{}/block-{block_id}",
                                         self.strategy.core
-                                    ))
-                                    .context_invoker("Failed to open user cgroup")?,
+                                    )
+                                    .as_ref(),
+                                )
+                                .context_invoker("Failed to open user cgroup")?,
                             ),
                     ),
                     &program.rootfs,
@@ -870,6 +871,74 @@ impl Drop for StrategyRun<'_> {
     }
 }
 
+#[derive(Object)]
+struct CgroupHandle {
+    cgroup_procs: std::fs::File,
+    cpu_stat: std::fs::File,
+}
+
+struct CgroupCpuStat {
+    user_usec: u64,
+    system_usec: u64,
+}
+
+impl CgroupHandle {
+    fn open(path: &std::path::Path) -> Result<Self, errors::Error> {
+        Ok(CgroupHandle {
+            cgroup_procs: std::fs::File::options()
+                .write(true)
+                .open(path.join("cgroup.procs"))
+                .context_invoker("Failed to open cgroup.procs")?,
+            cpu_stat: std::fs::File::open(path.join("cpu.stat"))
+                .context_invoker("Failed to open cpu.stat")?,
+        })
+    }
+
+    fn add_process(&mut self, pid: libc::pid_t) -> Result<(), errors::Error> {
+        self.cgroup_procs
+            .write(format!("{pid}\n").as_bytes())
+            .context_invoker("Failed to write to cgroup.procs")?;
+        Ok(())
+    }
+
+    fn cpu_stat(&mut self) -> Result<CgroupCpuStat, errors::Error> {
+        self.cpu_stat
+            .rewind()
+            .context_invoker("Failed to rewind cpu.stat")?;
+
+        let mut buf = String::new();
+        self.cpu_stat
+            .read_to_string(&mut buf)
+            .context_invoker("Failed to read cpu.stat")?;
+
+        let mut stat = CgroupCpuStat {
+            user_usec: 0,
+            system_usec: 0,
+        };
+
+        for line in buf.lines() {
+            let target;
+            if line.starts_with("user_usec ") {
+                target = &mut stat.user_usec;
+            } else if line.starts_with("system_usec ") {
+                target = &mut stat.system_usec;
+            } else {
+                continue;
+            }
+
+            let mut it = line.split_ascii_whitespace();
+            it.next();
+            *target = it
+                .next()
+                .context_invoker("Invalid cpu.stat format")?
+                .parse()
+                .context_invoker("Invalid cpu.stat format")?;
+        }
+
+        Ok(stat)
+    }
+}
+
 #[multiprocessing::entrypoint]
 fn execute(
     argv: Vec<String>,
@@ -877,7 +946,7 @@ fn execute(
     stdout: std::fs::File,
     stderr: std::fs::File,
     invocation_limit: verdict::InvocationLimit,
-    mut cgroup_procs: std::fs::File,
+    mut cgroup: CgroupHandle,
 ) -> Result<(verdict::TestVerdict, verdict::InvocationStat), errors::Error> {
     // Start process
     let (mut ours, theirs) =
@@ -897,9 +966,13 @@ fn execute(
             .context_invoker("Failed to open pidfd for child process");
     }
 
+    // Acquire previous cgroup stats. We reuse cgroups across tests and even across submissions, so
+    // we can't assume the stats are at zero at this moment.
+    let cpu_stat_before = cgroup.cpu_stat()?;
+
     // Apply cgroup limits
-    cgroup_procs
-        .write(format!("{pid}\n").as_bytes())
+    cgroup
+        .add_process(pid)
         .context_invoker("Failed to move the child to user cgroup")?;
 
     // Measure time. It would be slightly before execve, but it should not be a big problem
@@ -990,6 +1063,10 @@ fn execute(
     // Collect real time statistics
     let real_time = start.elapsed();
 
+    // Collect current stats; we will later compute the difference between the current stats and the
+    // previous stats
+    let cpu_stat = cgroup.cpu_stat()?;
+
     // Await the child process now because getrusage only takes awaited processes into consideration
     let wait_status = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None)
         .context_invoker("Failed to waitpid for process")?;
@@ -1002,13 +1079,14 @@ fn execute(
         );
     }
 
-    let user_time = std::time::Duration::from_micros(
-        (usage.ru_utime.tv_sec as u64) * 1000000 + (usage.ru_utime.tv_usec as u64),
-    );
-    let sys_time = std::time::Duration::from_micros(
-        (usage.ru_stime.tv_sec as u64) * 1000000 + (usage.ru_stime.tv_usec as u64),
-    );
-    let cpu_time = user_time + sys_time; // both PCMS and ejudge take system time into account
+    let user_time =
+        std::time::Duration::from_micros(cpu_stat.user_usec - cpu_stat_before.user_usec);
+    let sys_time =
+        std::time::Duration::from_micros(cpu_stat.system_usec - cpu_stat_before.system_usec);
+
+    // Both PCMS and ejudge take system time into account. This also seems to be the way Linux
+    // computes usage_usec field of the CPU stats.
+    let cpu_time = user_time + sys_time;
 
     // Into verdict
     let test_verdict;
