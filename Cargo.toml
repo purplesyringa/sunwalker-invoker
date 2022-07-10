@@ -15,8 +15,8 @@ anyhow = "1.0"
 nix = "0.23.1"
 sys-mount = "1.5.1"
 lisp = { path = "lisp" }
-tokio-tungstenite = { version = "0.17.1", features = ["native-tls"] }
-tungstenite = { version = "0.17.1", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.17.1", features = ["rustls"] }
+tungstenite = { version = "0.17.1", features = ["rustls"] }
 clap = { version = "3.1.6", features = ["derive"] }
 toml = "0.5.8"
 serde = { version = "1.0", features = ["derive", "rc"] }
