@@ -13,12 +13,8 @@ rand = "0.8.3"
 libc = "0.2.120"
 anyhow = "1.0"
 nix = "0.23.1"
-signal-hook = { version = "0.3", features = ["extended-siginfo"] }
 sys-mount = "1.5.1"
-crossbeam = "0.8.1"
 lisp = { path = "lisp" }
-ctor = "0.1.22"
-exec = "0.3.1"
 tokio-tungstenite = { version = "0.17.1", features = ["native-tls"] }
 tungstenite = { version = "0.17.1", features = ["native-tls"] }
 clap = { version = "3.1.6", features = ["derive"] }
@@ -31,10 +27,8 @@ rmp-serde = "1.0.0"
 tokio-fork = "0.2.1"
 ouroboros = "0.15.0"
 futures = "0.3.21"
-tokio-fd = "0.3.0"
 multiprocessing = { path = "multiprocessing" }
 rtnetlink = "0.9.1"
-ipnetwork = "0.19"
 itertools = "0.10.3"
 tokio-stream = "0.1.9"
 
