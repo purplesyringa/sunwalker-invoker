@@ -527,9 +527,9 @@ fn enter_sandbox() -> anyhow::Result<()> {
     let fstype = nix::sys::statfs::statfs("/sys/fs/cgroup")
         .context("cgroups are not available at /sys/fs/cgroup")?
         .filesystem_type();
-    match fstype {
-        nix::sys::statfs::CGROUP2_SUPER_MAGIC => {}
-        nix::sys::statfs::TMPFS_MAGIC => {
+    match fstype.0 as i64 {
+        libc::CGROUP2_SUPER_MAGIC => {}
+        libc::TMPFS_MAGIC => {
             anyhow::bail!(
                 "cgroups v1 seems to be mounted at /sys/fs/cgroup. sunwalker requires cgroups v2. \
                  Please configure your kernel and/or distribution to use cgroups v2"
