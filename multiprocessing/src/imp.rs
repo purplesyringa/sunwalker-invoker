@@ -1,6 +1,6 @@
 pub use ctor::ctor;
 
-use crate::{caching, FnOnce, Receiver};
+use crate::{FnOnce, Receiver};
 use lazy_static::lazy_static;
 use nix::fcntl;
 use std::os::unix::io::{FromRawFd, RawFd};
@@ -58,28 +58,12 @@ pub fn main() {
         }
     }
 
-    caching::cache_current_state();
-
     std::process::exit(MAIN_ENTRY
         .read()
         .expect("Failed to acquire read access to MAIN_ENTRY")
         .expect(
             "MAIN_ENTRY was not registered: is #[multiprocessing::main] missing?",
         )());
-}
-
-pub(crate) fn start_subprocess(fd: RawFd) -> ! {
-    let mut entry_rx =
-        unsafe { Receiver::<Box<dyn FnOnce<(RawFd,), Output = i32>>>::from_raw_fd(fd) };
-
-    let entry = entry_rx
-        .recv()
-        .expect("Failed to read entry for multiprocessing")
-        .expect("No entry passed");
-
-    std::mem::forget(entry_rx);
-
-    std::process::exit(entry(fd));
 }
 
 pub fn disable_cloexec(fd: RawFd) -> std::io::Result<()> {

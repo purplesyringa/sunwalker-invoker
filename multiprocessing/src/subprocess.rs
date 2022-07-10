@@ -1,8 +1,9 @@
-use crate::{caching, duplex, Deserialize, FnOnce, Object, Receiver};
+use crate::{duplex, imp, Deserialize, FnOnce, Object, Receiver};
 use nix::{
     libc::{c_int, c_void, pid_t},
     sys::signal,
 };
+use std::ffi::CString;
 use std::io::Result;
 use std::os::unix::io::{AsRawFd, RawFd};
 
@@ -76,47 +77,18 @@ pub(crate) unsafe fn _spawn_child(child_fd: RawFd, flags: c_int) -> Result<nix::
                 }
             }
 
-            // The code below is a less straightforward but much faster alternative to:
-            // imp::disable_cloexec(child_fd)?;
-            // nix::unistd::execv(
-            //     &CString::new("/proc/self/exe").unwrap(),
-            //     &[
-            //         CString::new("_multiprocessing_").unwrap(),
-            //         CString::new(child_fd.to_string()).unwrap(),
-            //     ],
-            // )
-            // .expect("execve failed");
+            imp::disable_cloexec(child_fd)?;
 
-            // Close O_CLOEXEC descriptors except the ones we want to retain manually
-            let mut fds_to_close = Vec::new();
-            for entry in
-                std::fs::read_dir("/proc/self/fd").expect("Failed to opendir /proc/self/fd")
-            {
-                let entry = entry.expect("Failed to readdir /proc/self/fd");
-                let fd: RawFd = entry
-                    .file_name()
-                    .into_string()
-                    .expect("A file in /proc/self/fd does not have a legible name")
-                    .parse()
-                    .expect("A file in /proc/self/fd does not have a digital name");
-                if fd == child_fd || caching::is_retained_fd(fd) {
-                    continue;
-                }
-                let fd_flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD)
-                    .expect("A file in /proc/self/fd does not designate a file descriptor");
-                if fd_flags & nix::libc::FD_CLOEXEC != 0 {
-                    // If we close all fds while reading the directory, we'll close its own fd too
-                    fds_to_close.push(fd);
-                }
-            }
-            for fd in fds_to_close.into_iter() {
-                // close(2) can only reasonably fail on EBADF, which is fine if it happens. In fact,
-                // it will happen, because the file descriptor that read_dir created is listed in
-                // fds_to_close.
-                let _ = nix::unistd::close(fd);
-            }
+            nix::unistd::execv(
+                &CString::new("/proc/self/exe").unwrap(),
+                &[
+                    CString::new("_multiprocessing_").unwrap(),
+                    CString::new(child_fd.to_string()).unwrap(),
+                ],
+            )
+            .expect("execve failed");
 
-            caching::restore(child_fd);
+            unreachable!();
         }
         child_pid => Ok(nix::unistd::Pid::from_raw(child_pid as pid_t)),
     }

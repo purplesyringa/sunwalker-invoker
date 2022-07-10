@@ -8,9 +8,6 @@
 #![feature(ptr_metadata)]
 #![feature(never_type)]
 #![feature(generic_associated_types)]
-#![feature(allocator_api)]
-#![feature(slice_ptr_get)]
-#![feature(sync_unsafe_cell)]
 
 extern crate self as multiprocessing;
 
@@ -41,5 +38,3 @@ pub mod delayed;
 pub use delayed::Delayed;
 
 pub use nix::libc;
-
-mod caching;
