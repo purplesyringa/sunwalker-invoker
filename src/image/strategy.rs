@@ -866,7 +866,9 @@ impl<'a> StrategyRun<'a> {
 impl Drop for StrategyRun<'_> {
     fn drop(&mut self) {
         if !self.removed {
-            std::fs::remove_dir_all(&self.aux);
+            if let Err(e) = std::fs::remove_dir_all(&self.aux) {
+                println!("Failed to clean up {} in drop(): {e:?}", self.aux);
+            }
         }
     }
 }

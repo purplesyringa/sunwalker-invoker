@@ -385,7 +385,9 @@ impl RootFS {
 
 impl Drop for RootFS {
     fn drop(&mut self) {
-        self._remove()/*.unwrap()*/;
+        if let Err(e) = self._remove() {
+            println!("Failed to remove RootFS in drop(): {e:?}");
+        }
     }
 }
 
