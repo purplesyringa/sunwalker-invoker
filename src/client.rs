@@ -336,72 +336,69 @@ async fn handle_message(
         Message::AddSubmission(message) => add_submission(message, client).await,
         Message::PushToJudgementQueue(message) => push_to_judgment_queue(message, &client).await,
         Message::CancelJudgementOnTests(message) => {
-            cancel_judgement_on_tests(message, client).await?
+            cancel_judgement_on_tests(message, &client).await
         }
-        Message::FinalizeSubmission(message) => finalize_submission(message, client).await?,
-        Message::SupplyFile(message) => supply_file(message, client).await?,
+        Message::FinalizeSubmission(message) => finalize_submission(message, &client).await,
+        Message::SupplyFile(message) => supply_file(message, &client).await,
     }
 
     Ok(())
 }
 
 async fn add_submission(message: message::c2i::AddSubmission, client: Arc<Client>) {
-    let client1 = client.clone();
-    let submission_id = message.submission_id.clone();
-
-    let closure = async move {
-        let lock = client1.try_lock_core(message.compilation_core)?;
-
-        if !client1.mounted_image.has_language(&message.language) {
-            return Err(errors::ConductorFailure(format!(
-                "Language {} is not available",
-                message.language
-            )));
-        }
-
-        let problem = client1
-            .problem_store
-            .load_revision(message.problem_id, message.revision_id)
-            .await?;
-
-        let mut submission = submission::Submission::new(
-            message.submission_id.clone(),
-            problem,
-            image::image::Image::get_language(
-                client1.mounted_image.clone(),
-                message.language.clone(),
-            )?,
-            message.invocation_limits,
-        )?;
-
-        for (name, content) in message.files.into_iter() {
-            submission.add_source_file(&name, &content)?;
-        }
-
-        let submission = Arc::new(submission);
-
-        {
-            let mut submissions = client1.submissions.write().await;
-            submissions
-                .try_insert(message.submission_id.clone(), submission.clone())
-                .map_err(|_| {
-                    errors::ConductorFailure(format!(
-                        "A submission with ID {} cannot be added because it is already in the queue",
-                        message.submission_id
-                    ))
-                })?;
-        }
-
-        submission.compile_on_core(message.compilation_core).await
-    };
-
     tokio::spawn(async move {
+        let result: Result<String, errors::Error> = async {
+            let lock = client.try_lock_core(message.compilation_core)?;
+
+            if !client.mounted_image.has_language(&message.language) {
+                return Err(errors::ConductorFailure(format!(
+                    "Language {} is not available",
+                    message.language
+                )));
+            }
+
+            let problem = client
+                .problem_store
+                .load_revision(message.problem_id, message.revision_id)
+                .await?;
+
+            let mut submission = submission::Submission::new(
+                message.submission_id.clone(),
+                problem,
+                image::image::Image::get_language(
+                    client.mounted_image.clone(),
+                    message.language.clone(),
+                )?,
+                message.invocation_limits,
+            )?;
+
+            for (name, content) in message.files.into_iter() {
+                submission.add_source_file(&name, &content)?;
+            }
+
+            let submission = Arc::new(submission);
+
+            {
+                let mut submissions = client.submissions.write().await;
+                submissions
+                    .try_insert(message.submission_id.clone(), submission.clone())
+                    .map_err(|_| {
+                        errors::ConductorFailure(format!(
+                            "A submission with ID {} cannot be added because it is already in the queue",
+                            message.submission_id
+                        ))
+                    })?;
+            }
+
+            submission.compile_on_core(message.compilation_core).await
+        }.await;
+
         if let Err(e) = client
             .communicator
             .send_to_conductor(message::i2c::Message::NotifyCompilationStatus(
                 message::i2c::NotifyCompilationStatus {
-                    submission_id,
-                    result: closure.await,
+                    submission_id: message.submission_id,
+                    result,
                 },
             ))
             .await
@@ -412,7 +409,7 @@ async fn add_submission(message: message::c2i::AddSubmission, client: Arc<Client
 }
 
 async fn push_to_judgment_queue(message: message::c2i::PushToJudgementQueue, client: &Client) {
-    if let Err(e) = async {
+    if let Err(e) = try {
         let submissions = client.submissions.read().await;
 
         let submission = submissions.get(&message.submission_id).ok_or_else(|| {
@@ -443,14 +440,8 @@ async fn push_to_judgment_queue(message: message::c2i::PushToJudgementQueue, cli
                     println!("Failed to send to conductor: {:?}", e);
                 }
             }
-
-            Ok(()) as Result<(), errors::Error>
         });
-
-        Ok(())
-    }
-    .await
-    {
+    } {
         if let Err(e) = client
             .communicator
             .send_to_conductor(message::i2c::Message::NotifySubmissionError(
@@ -466,66 +457,85 @@ async fn push_to_judgment_queue(message: message::c2i::PushToJudgementQueue, cli
     }
 }
 
-async fn cancel_judgement_on_tests(
-    message: message::c2i::CancelJudgementOnTests,
-    client: Arc<Client>,
-) -> Result<(), errors::Error> {
-    let submissions = client.submissions.read().await;
+async fn cancel_judgement_on_tests(message: message::c2i::CancelJudgementOnTests, client: &Client) {
+    if let Err(e) = try {
+        let submissions = client.submissions.read().await;
 
-    let submission = submissions.get(&message.submission_id).ok_or_else(|| {
-        errors::ConductorFailure(format!(
-            "Submission {} does not exist or has already been finalized",
-            message.submission_id
-        ))
-    })?;
+        let submission = submissions.get(&message.submission_id).ok_or_else(|| {
+            errors::ConductorFailure(format!(
+                "Submission {} does not exist or has already been finalized",
+                message.submission_id
+            ))
+        })?;
 
-    submission.add_failed_tests(&message.failed_tests).await?;
-
-    Ok(())
+        submission.add_failed_tests(&message.failed_tests).await?
+    } {
+        if let Err(e) = client
+            .communicator
+            .send_to_conductor(message::i2c::Message::NotifySubmissionError(
+                message::i2c::NotifySubmissionError {
+                    submission_id: message.submission_id.clone(),
+                    error: e,
+                },
+            ))
+            .await
+        {
+            println!("Failed to send to conductor: {:?}", e);
+        }
+    }
 }
 
-async fn finalize_submission(
-    message: message::c2i::FinalizeSubmission,
-    client: Arc<Client>,
-) -> Result<(), errors::Error> {
-    let mut submissions = client.submissions.write().await;
+async fn finalize_submission(message: message::c2i::FinalizeSubmission, client: &Client) {
+    if let Err(e) = try {
+        let mut submissions = client.submissions.write().await;
 
-    let submission = submissions.remove(&message.submission_id).ok_or_else(|| {
-        errors::ConductorFailure(format!(
-            "Cannot finalize an unknown (or already finalized) submission {}",
-            message.submission_id
-        ))
-    })?;
+        let submission = submissions.remove(&message.submission_id).ok_or_else(|| {
+            errors::ConductorFailure(format!(
+                "Cannot finalize an unknown (or already finalized) submission {}",
+                message.submission_id
+            ))
+        })?;
 
-    submission.finalize().await?;
-
-    Ok(())
+        submission.finalize().await?
+    } {
+        if let Err(e) = client
+            .communicator
+            .send_to_conductor(message::i2c::Message::NotifySubmissionError(
+                message::i2c::NotifySubmissionError {
+                    submission_id: message.submission_id.clone(),
+                    error: e,
+                },
+            ))
+            .await
+        {
+            println!("Failed to send to conductor: {:?}", e);
+        }
+    }
 }
 
-async fn supply_file(
-    message: message::c2i::SupplyFile,
-    client: Arc<Client>,
-) -> Result<(), errors::Error> {
-    let tx = client
+async fn supply_file(message: message::c2i::SupplyFile, client: &Client) {
+    match client
         .communicator
         .requests
         .lock()
         .await
         .remove(&message.request_id)
-        .ok_or_else(|| {
-            errors::ConductorFailure(format!(
-                "Conductor sent reply to message #{}, which either does not exist or has been \
-                 responded to already",
+    {
+        Some(tx) => {
+            if let Err(_) = tx.send(Ok(message.contents)) {
+                println!(
+                    "Conductor sent reply to message #{} of kind RequestFile, but its handler is dead",
+                    message.request_id
+                );
+            }
+        }
+        None => {
+            println!(
+                "Conductor sent reply to message #{} of kind RequestFile, which either does not exist or has been responded to already",
                 message.request_id
-            ))
-        })?;
-
-    tx.send(Ok(message.contents)).map_err(|_| {
-        errors::InvokerFailure(format!(
-            "Conductor sent reply to message #{}, but its handler is dead",
-            message.request_id
-        ))
-    })
+            );
+        }
+    }
 }
 
 fn enter_sandbox() -> anyhow::Result<()> {
