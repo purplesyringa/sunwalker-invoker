@@ -168,7 +168,8 @@ impl Client {
             .try_lock()
             .map_err(|_| {
                 errors::ConductorFailure(format!(
-                    "Core {core} is already in use and can only be freed after submission finalization"
+                    "Core {core} is already in use and can only be freed after submission \
+                     finalization"
                 ))
             })
     }
@@ -384,14 +385,16 @@ async fn add_submission(message: message::c2i::AddSubmission, client: Arc<Client
                     .try_insert(message.submission_id.clone(), submission.clone())
                     .map_err(|_| {
                         errors::ConductorFailure(format!(
-                            "A submission with ID {} cannot be added because it is already in the queue",
+                            "A submission with ID {} cannot be added because it is already in the \
+                             queue",
                             message.submission_id
                         ))
                     })?;
             }
 
             submission.compile_on_core(message.compilation_core).await
-        }.await;
+        }
+        .await;
 
         if let Err(e) = client
             .communicator
@@ -524,14 +527,16 @@ async fn supply_file(message: message::c2i::SupplyFile, client: &Client) {
         Some(tx) => {
             if let Err(_) = tx.send(Ok(message.contents)) {
                 println!(
-                    "Conductor sent reply to message #{} of kind RequestFile, but its handler is dead",
+                    "Conductor sent reply to message #{} of kind RequestFile, but its handler is \
+                     dead",
                     message.request_id
                 );
             }
         }
         None => {
             println!(
-                "Conductor sent reply to message #{} of kind RequestFile, which either does not exist or has been responded to already",
+                "Conductor sent reply to message #{} of kind RequestFile, which either does not \
+                 exist or has been responded to already",
                 message.request_id
             );
         }

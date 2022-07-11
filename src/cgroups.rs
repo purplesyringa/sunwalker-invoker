@@ -157,7 +157,12 @@ pub fn isolate_cores(isolated_cores: &[u64]) -> Result<(), errors::Error> {
         "/sys/fs/cgroup/sunwalker_root/cpuset.cpus",
         format_cpuset_list(isolated_cores),
     )
-    .with_context_invoker(|| format!("Failed to isolate cores {isolated_cores:?}, most likely because they are offline, used by another cgroup, or sunwalker is still running"))?;
+    .with_context_invoker(|| {
+        format!(
+            "Failed to isolate cores {isolated_cores:?}, most likely because they are offline, \
+             used by another cgroup, or sunwalker is still running"
+        )
+    })?;
 
     let effective_cores: HashSet<u64> = HashSet::from_iter(parse_cpuset_list(
         &std::fs::read_to_string("/sys/fs/cgroup/sunwalker_root/cpuset.cpus.effective")
@@ -180,7 +185,10 @@ pub fn isolate_cores(isolated_cores: &[u64]) -> Result<(), errors::Error> {
             "/sys/fs/cgroup/sunwalker_root/cpuset.cpus.partition",
             "root\n",
         )
-        .context_invoker("Failed to make the cgroup a root cpuset, most likely because some cores are used by another cgroup")?;
+        .context_invoker(
+            "Failed to make the cgroup a root cpuset, most likely because some cores are used by \
+             another cgroup",
+        )?;
     }
 
     Ok(())
