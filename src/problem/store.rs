@@ -3,11 +3,11 @@ use anyhow::{bail, Context};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 
 pub struct ProblemStore {
     local_storage_path: PathBuf,
-    locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
+    problems: Mutex<HashMap<String, Arc<Mutex<Option<Arc<problem::ProblemRevision>>>>>>,
     communicator: Arc<communicator::Communicator>,
 }
 
@@ -23,7 +23,7 @@ impl ProblemStore {
         }
         Ok(ProblemStore {
             local_storage_path,
-            locks: RwLock::new(HashMap::new()),
+            problems: Mutex::new(HashMap::new()),
             communicator,
         })
     }
@@ -37,16 +37,16 @@ impl ProblemStore {
         let root_path = self.local_storage_path.join(problem_id).join(revision_id);
 
         let mutex = self
-            .locks
-            .write()
+            .problems
+            .lock()
             .await
             .entry(topic.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone();
 
-        {
-            let _guard = mutex.lock().await;
+        let mut guard = mutex.lock().await;
 
+        if guard.is_none() {
             if !root_path.exists() {
                 std::fs::create_dir_all(&root_path)
                     .with_context_invoker(|| format!("Failed to create directory {root_path:?}"))?;
@@ -58,10 +58,12 @@ impl ProblemStore {
                     .await
                     .with_context_invoker(|| format!("Failed to load archive for topic {topic}"))?;
             }
+
+            *guard = Some(Arc::new(problem::ProblemRevision::load_from_cache(
+                &root_path,
+            )?));
         }
 
-        Ok(Arc::new(problem::ProblemRevision::load_from_cache(
-            &root_path,
-        )?))
+        Ok(guard.as_ref().unwrap().clone())
     }
 }
