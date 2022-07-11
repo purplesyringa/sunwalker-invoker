@@ -362,15 +362,19 @@ async fn add_submission(
             submission.add_source_file(&name, &content)?;
         }
 
-        let mut submissions = client.submissions.write().await;
-        let submission = submissions
-            .try_insert(message.submission_id.clone(), Arc::new(submission))
-            .map_err(|_| {
-                errors::ConductorFailure(format!(
-                    "A submission with ID {} cannot be added because it is already in the queue",
-                    message.submission_id
-                ))
-            })?;
+        let submission = Arc::new(submission);
+
+        {
+            let mut submissions = client.submissions.write().await;
+            submissions
+                .try_insert(message.submission_id.clone(), submission.clone())
+                .map_err(|_| {
+                    errors::ConductorFailure(format!(
+                        "A submission with ID {} cannot be added because it is already in the queue",
+                        message.submission_id
+                    ))
+                })?;
+        }
 
         let compilation_result = submission.compile_on_core(message.compilation_core).await;
 
