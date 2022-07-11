@@ -199,16 +199,16 @@ impl Communicator {
             Some(tx) => {
                 if let Err(_) = tx.send(Ok(message.contents)) {
                     println!(
-                        "Conductor sent reply to message #{} of kind RequestFile, but its handler is \
-                         dead",
+                        "Conductor sent reply to message #{} of kind RequestFile, but its handler \
+                         is dead",
                         message.request_id
                     );
                 }
             }
             None => {
                 println!(
-                    "Conductor sent reply to message #{} of kind RequestFile, which either does not \
-                     exist or has been responded to already",
+                    "Conductor sent reply to message #{} of kind RequestFile, which either does \
+                     not exist or has been responded to already",
                     message.request_id
                 );
             }

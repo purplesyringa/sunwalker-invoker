@@ -115,10 +115,10 @@ async fn client_main_async(cli_args: init::CLIArgs) -> anyhow::Result<()> {
             .await
             .with_context(|| {
                 format!(
-                "Failed to connect to the conductor via a websocket at {:?} (this address is from \
-                 field conductor.address of the configuration file)",
-                config.conductor.address
-            )
+                    "Failed to connect to the conductor via a websocket at {:?} (this address is \
+                     from field conductor.address of the configuration file)",
+                    config.conductor.address
+                )
             })?,
     );
 
@@ -245,8 +245,7 @@ async fn add_submission(message: message::c2i::AddSubmission, client: &Arc<Clien
             .try_insert(message.submission_id.clone(), submission.clone())
             .map_err(|_| {
                 errors::ConductorFailure(format!(
-                    "A submission with ID {} cannot be added because it is already in the \
-                     queue",
+                    "A submission with ID {} cannot be added because it is already in the queue",
                     message.submission_id
                 ))
             })?;
