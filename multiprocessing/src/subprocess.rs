@@ -1,9 +1,9 @@
 use crate::{duplex, imp, Deserialize, FnOnce, Object, Receiver};
 use nix::{
-    libc::{c_int, c_void, pid_t},
+    libc::{c_char, c_int, c_void, pid_t},
     sys::signal,
 };
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io::Result;
 use std::os::unix::io::{AsRawFd, RawFd};
 
@@ -52,6 +52,8 @@ impl<T: Deserialize> Child<T> {
 }
 
 pub(crate) unsafe fn _spawn_child(child_fd: RawFd, flags: c_int) -> Result<nix::unistd::Pid> {
+    let child_fd_str = CString::new(child_fd.to_string()).unwrap();
+
     match nix::libc::syscall(
         nix::libc::SYS_clone,
         nix::libc::SIGCHLD | flags,
@@ -59,36 +61,45 @@ pub(crate) unsafe fn _spawn_child(child_fd: RawFd, flags: c_int) -> Result<nix::
     ) {
         -1 => Err(std::io::Error::last_os_error()),
         0 => {
-            signal::sigprocmask(
-                signal::SigmaskHow::SIG_SETMASK,
-                Some(&signal::SigSet::empty()),
-                None,
-            )?;
-            for i in 1..32 {
-                if i != nix::libc::SIGKILL && i != nix::libc::SIGSTOP {
-                    signal::sigaction(
-                        signal::Signal::try_from(i).unwrap(),
-                        &signal::SigAction::new(
-                            signal::SigHandler::SigDfl,
-                            signal::SaFlags::empty(),
-                            signal::SigSet::empty(),
-                        ),
-                    )?;
+            // No heap allocations are allowed from now on
+            let res: Result<!> = try {
+                signal::sigprocmask(
+                    signal::SigmaskHow::SIG_SETMASK,
+                    Some(&signal::SigSet::empty()),
+                    None,
+                )?;
+                for i in 1..32 {
+                    if i != nix::libc::SIGKILL && i != nix::libc::SIGSTOP {
+                        signal::sigaction(
+                            signal::Signal::try_from(i).unwrap(),
+                            &signal::SigAction::new(
+                                signal::SigHandler::SigDfl,
+                                signal::SaFlags::empty(),
+                                signal::SigSet::empty(),
+                            ),
+                        )?;
+                    }
                 }
-            }
 
-            imp::disable_cloexec(child_fd)?;
+                imp::disable_cloexec(child_fd)?;
 
-            nix::unistd::execv(
-                &CString::new("/proc/self/exe").unwrap(),
-                &[
-                    CString::new("_multiprocessing_").unwrap(),
-                    CString::new(child_fd.to_string()).unwrap(),
-                ],
-            )
-            .expect("execve failed");
+                // nix::unistd::execv uses allocations
+                nix::libc::execv(
+                    b"/proc/self/exe\0" as *const u8 as *const c_char,
+                    &[
+                        b"_multiprocessing_\0" as *const u8 as *const c_char,
+                        child_fd_str.as_ptr() as *const u8 as *const c_char,
+                        std::ptr::null(),
+                    ] as *const *const c_char,
+                );
 
-            unreachable!();
+                Err(std::io::Error::last_os_error())?;
+
+                unreachable!()
+            };
+
+            eprintln!("{}", res.into_err());
+            std::process::abort();
         }
         child_pid => Ok(nix::unistd::Pid::from_raw(child_pid as pid_t)),
     }
