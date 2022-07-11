@@ -11,6 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{atomic, Arc};
 use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio_tungstenite::tungstenite;
 
 pub struct Communicator {
     conductor_read: Mutex<

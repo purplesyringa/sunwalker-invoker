@@ -1187,7 +1187,6 @@ dependencies = [
  "tokio-stream",
  "tokio-tungstenite",
  "toml",
- "tungstenite",
 ]
 
 [[package]]
@@ -1395,7 +1394,6 @@ dependencies = [
  "httparse",
  "log",
  "rand",
- "rustls",
  "sha-1",
  "thiserror",
  "url",
