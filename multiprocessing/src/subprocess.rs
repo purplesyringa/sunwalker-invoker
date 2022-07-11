@@ -3,7 +3,7 @@ use nix::{
     libc::{c_char, c_int, c_void, pid_t},
     sys::signal,
 };
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::io::Result;
 use std::os::unix::io::{AsRawFd, RawFd};
 
