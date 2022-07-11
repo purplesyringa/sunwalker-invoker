@@ -4,6 +4,7 @@ use crate::{
 use anyhow::Context;
 use futures_util::StreamExt;
 use libc::CLONE_NEWNS;
+use ouroboros::self_referencing;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, MutexGuard, RwLock};
@@ -18,22 +19,44 @@ pub struct Client {
     core_locks: HashMap<u64, Mutex<()>>,
 }
 
+#[self_referencing]
+pub struct CoreHandle {
+    core: u64,
+    client: Arc<Client>,
+    #[borrows(client)]
+    #[covariant]
+    guard: MutexGuard<'this, ()>,
+}
+
+impl CoreHandle {
+    pub fn get_core(&self) -> u64 {
+        // Shut rustc up about unused field. Naming it _guard just brings more warnings because of
+        // non-snake-case function names that ouroboros creates.
+        self.borrow_guard();
+
+        *self.borrow_core()
+    }
+}
+
 impl Client {
-    fn try_lock_core(&self, core: u64) -> Result<MutexGuard<()>, errors::Error> {
-        self.core_locks
-            .get(&core)
-            .ok_or_else(|| {
-                errors::ConductorFailure(format!(
-                    "Core {core} is not dedicated to the invoker and cannot be used for a task"
-                ))
-            })?
-            .try_lock()
-            .map_err(|_| {
-                errors::ConductorFailure(format!(
-                    "Core {core} is already in use and can only be freed after submission \
-                     finalization"
-                ))
-            })
+    fn try_lock_core(self: &Arc<Self>, core: u64) -> Result<CoreHandle, errors::Error> {
+        CoreHandle::try_new(core, self.clone(), |client| {
+            client
+                .core_locks
+                .get(&core)
+                .ok_or_else(|| {
+                    errors::ConductorFailure(format!(
+                        "Core {core} is not dedicated to the invoker and cannot be used for a task"
+                    ))
+                })?
+                .try_lock()
+                .map_err(|_| {
+                    errors::ConductorFailure(format!(
+                        "Core {core} is already in use and can only be freed after submission \
+                         finalization"
+                    ))
+                })
+        })
     }
 }
 
@@ -170,7 +193,7 @@ async fn client_main_async(cli_args: init::CLIArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_message(message: message::c2i::Message, client: &Client) {
+async fn handle_message(message: message::c2i::Message, client: &Arc<Client>) {
     use message::c2i::*;
 
     println!("{:?}", message);
@@ -179,16 +202,16 @@ async fn handle_message(message: message::c2i::Message, client: &Client) {
         Message::AddSubmission(message) => add_submission(message, client).await,
         Message::PushToJudgementQueue(message) => push_to_judgment_queue(message, client).await,
         Message::CancelJudgementOnTests(message) => {
-            cancel_judgement_on_tests(message, client).await
+            cancel_judgement_on_tests(message, &client).await
         }
-        Message::FinalizeSubmission(message) => finalize_submission(message, client).await,
-        Message::SupplyFile(message) => supply_file(message, client).await,
+        Message::FinalizeSubmission(message) => finalize_submission(message, &client).await,
+        Message::SupplyFile(message) => supply_file(message, &client).await,
     }
 }
 
-async fn add_submission(message: message::c2i::AddSubmission, client: &Client) {
+async fn add_submission(message: message::c2i::AddSubmission, client: &Arc<Client>) {
     match async {
-        let lock = client.try_lock_core(message.compilation_core)?;
+        let core = client.try_lock_core(message.compilation_core)?;
 
         if !client.mounted_image.has_language(&message.language) {
             return Err(errors::ConductorFailure(format!(
@@ -228,18 +251,18 @@ async fn add_submission(message: message::c2i::AddSubmission, client: &Client) {
                 ))
             })?;
 
-        Ok(submission)
+        Ok((core, submission))
     }
     .await
     {
-        Ok(submission) => {
+        Ok((core, submission)) => {
             let communicator = client.communicator.clone();
             tokio::spawn(async move {
                 if let Err(e) = communicator
                     .send_to_conductor(message::i2c::Message::NotifyCompilationStatus(
                         message::i2c::NotifyCompilationStatus {
                             submission_id: message.submission_id,
-                            result: submission.compile_on_core(message.compilation_core).await,
+                            result: submission.compile_on_core(core).await,
                         },
                     ))
                     .await
@@ -265,7 +288,7 @@ async fn add_submission(message: message::c2i::AddSubmission, client: &Client) {
     }
 }
 
-async fn push_to_judgment_queue(message: message::c2i::PushToJudgementQueue, client: &Client) {
+async fn push_to_judgment_queue(message: message::c2i::PushToJudgementQueue, client: &Arc<Client>) {
     if let Err(e) = try {
         let submissions = client.submissions.read().await;
 
@@ -276,11 +299,11 @@ async fn push_to_judgment_queue(message: message::c2i::PushToJudgementQueue, cli
             ))
         })?;
 
-        let lock = client.try_lock_core(message.core)?;
+        let core = client.try_lock_core(message.core)?;
         let submission_id = submission.id.clone();
         let communicator = client.communicator.clone();
 
-        let mut stream = submission.test_on_core(message.core, message.tests).await?;
+        let mut stream = submission.test_on_core(core, message.tests).await?;
 
         tokio::spawn(async move {
             while let Some((test, judgement_result)) = stream.next().await {

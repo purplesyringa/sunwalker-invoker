@@ -1,5 +1,5 @@
 use crate::{
-    errors,
+    client, errors,
     errors::ToResult,
     image::{language, program},
     problem::{problem, verdict},
@@ -67,21 +67,21 @@ impl Submission {
 
     async fn execute_on_core(
         &self,
-        core: u64,
+        core: client::CoreHandle,
         command: Command,
         n_messages: usize,
     ) -> Result<impl futures::stream::Stream<Item = worker::W2IMessage>, errors::Error> {
         use std::collections::hash_map::Entry;
 
         let mut workers = self.workers.write().await;
-        let worker = match workers.entry(core) {
+        let worker = match workers.entry(core.get_core()) {
             Entry::Occupied(occupied) => occupied.get().clone(),
             Entry::Vacant(vacant) => vacant
                 .insert(Arc::new(RwLock::new(
                     worker::Worker::new(
                         self.language.clone(),
                         self.source_files.clone(),
-                        core,
+                        core.get_core(),
                         self.instantiated_dependency_dag.read().await.clone(),
                         self.program.read().await.clone(),
                         self.problem_revision.strategy_factory.clone(),
@@ -98,7 +98,7 @@ impl Submission {
         worker.execute_command(command, n_messages).await
     }
 
-    pub async fn compile_on_core(&self, core: u64) -> Result<String, errors::Error> {
+    pub async fn compile_on_core(&self, core: client::CoreHandle) -> Result<String, errors::Error> {
         if self.program.read().await.is_some() {
             return Err(errors::ConductorFailure(
                 "The submission is already compiled".to_string(),
@@ -124,7 +124,7 @@ impl Submission {
 
     pub async fn test_on_core(
         &self,
-        core: u64,
+        core: client::CoreHandle,
         tests: Vec<u64>,
     ) -> Result<
         impl futures::stream::Stream<Item = (u64, verdict::TestJudgementResult)>,
