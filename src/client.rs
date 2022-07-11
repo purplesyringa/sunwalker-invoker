@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{atomic, Arc};
-use tokio::sync::{oneshot, Mutex, RwLock};
+use tokio::sync::{oneshot, Mutex, MutexGuard, RwLock};
 use tokio_tungstenite::tungstenite;
 
 pub struct Communicator {
@@ -40,6 +40,7 @@ pub struct Client {
     mounted_image: Arc<image::image::Image>,
     ephemeral_disk_space: u64,
     communicator: Arc<Communicator>,
+    core_locks: HashMap<u64, Mutex<()>>,
 }
 
 impl Communicator {
@@ -155,6 +156,24 @@ impl Communicator {
     }
 }
 
+impl Client {
+    fn try_lock_core(&self, core: u64) -> Result<MutexGuard<()>, errors::Error> {
+        self.core_locks
+            .get(&core)
+            .ok_or_else(|| {
+                errors::ConductorFailure(format!(
+                    "Core {core} is not dedicated to the invoker and cannot be used for a task"
+                ))
+            })?
+            .try_lock()
+            .map_err(|_| {
+                errors::ConductorFailure(format!(
+                    "Core {core} is already in use and can only be freed after submission finalization"
+                ))
+            })
+    }
+}
+
 pub fn client_main(cli_args: init::CLIArgs) -> anyhow::Result<()> {
     // Entering the sandbox must be done outside tokio runtime, because otherwise some threads are
     // not sandboxed. See the comments in src/worker.rs for more information.
@@ -248,6 +267,13 @@ async fn client_main_async(cli_args: init::CLIArgs) -> anyhow::Result<()> {
         config.conductor.address
     );
 
+    let core_locks = config
+        .environment
+        .cpu_cores
+        .iter()
+        .map(|core| (*core, Mutex::new(())))
+        .collect();
+
     let client = Arc::new(Client {
         config,
         submissions: RwLock::new(HashMap::new()),
@@ -255,6 +281,7 @@ async fn client_main_async(cli_args: init::CLIArgs) -> anyhow::Result<()> {
         mounted_image,
         ephemeral_disk_space,
         communicator,
+        core_locks,
     });
 
     // Handshake
@@ -327,18 +354,7 @@ async fn add_submission(
         let submission_id = message.submission_id.clone();
 
         let compilation_result = (async move {
-            if !client1
-                .config
-                .environment
-                .cpu_cores
-                .contains(&message.compilation_core)
-            {
-                return Err(errors::ConductorFailure(format!(
-                    "Core {} is not dedicated to the invoker and cannot be scheduled for compilation of a \
-                     new submission",
-                    message.compilation_core
-                )));
-            }
+            let lock = client1.try_lock_core(message.compilation_core)?;
 
             if !client1.mounted_image.has_language(&message.language) {
                 return Err(errors::ConductorFailure(format!(
@@ -417,6 +433,8 @@ async fn push_to_judgment_queue(
         .clone();
 
     let communicator = client.communicator.clone();
+
+    let lock = client.try_lock_core(message.core)?;
 
     tokio::spawn(async move {
         let mut stream = submission.test_on_core(message.core, message.tests).await?;
