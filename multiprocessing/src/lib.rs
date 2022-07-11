@@ -8,6 +8,8 @@
 #![feature(ptr_metadata)]
 #![feature(never_type)]
 #![feature(generic_associated_types)]
+#![feature(try_blocks)]
+#![feature(unwrap_infallible)]
 
 extern crate self as multiprocessing;
 
