@@ -1,4 +1,4 @@
-use crate::{client, errors, errors::ToResult, problem::problem};
+use crate::{communicator, errors, errors::ToResult, problem::problem};
 use anyhow::{bail, Context};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -8,13 +8,13 @@ use tokio::sync::{Mutex, RwLock};
 pub struct ProblemStore {
     local_storage_path: PathBuf,
     locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
-    communicator: Arc<client::Communicator>,
+    communicator: Arc<communicator::Communicator>,
 }
 
 impl ProblemStore {
     pub fn new(
         local_storage_path: PathBuf,
-        communicator: Arc<client::Communicator>,
+        communicator: Arc<communicator::Communicator>,
     ) -> anyhow::Result<ProblemStore> {
         let meta = std::fs::metadata(&local_storage_path)
             .with_context(|| "Problem store cache directory is inaccessible")?;

@@ -30,6 +30,7 @@ multiprocessing = { path = "multiprocessing" }
 rtnetlink = "0.9.1"
 itertools = "0.10.3"
 tokio-stream = "0.1.9"
+async-stream = "0.3.3"
 
 [profile.release]
 strip = true

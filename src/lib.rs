@@ -23,6 +23,8 @@ mod cgroups;
 
 mod client;
 
+mod communicator;
+
 mod config;
 
 mod errors;
