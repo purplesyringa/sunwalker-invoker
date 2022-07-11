@@ -7,6 +7,7 @@ pub enum Message {
     UpdateMode(UpdateMode),
     NotifyCompilationStatus(NotifyCompilationStatus),
     NotifyTestStatus(NotifyTestStatus),
+    NotifySubmissionError(NotifySubmissionError),
     RequestFile(RequestFile),
 }
 
@@ -33,6 +34,12 @@ pub struct NotifyTestStatus {
     pub submission_id: String,
     pub test: u64,
     pub judgement_result: TestJudgementResult,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NotifySubmissionError {
+    pub submission_id: String,
+    pub error: errors::Error,
 }
 
 #[derive(Debug, Serialize)]
