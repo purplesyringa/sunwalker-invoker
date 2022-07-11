@@ -322,94 +322,78 @@ async fn add_submission(
     message: message::c2i::AddSubmission,
     client: Arc<Client>,
 ) -> Result<(), errors::Error> {
-    if !client
-        .config
-        .environment
-        .cpu_cores
-        .contains(&message.compilation_core)
-    {
-        return Err(errors::ConductorFailure(format!(
-            "Core {} is not dedicated to the invoker and cannot be scheduled for compilation of a \
-             new submission",
-            message.compilation_core
-        )));
-    }
-
-    if !client.mounted_image.has_language(&message.language) {
-        return Err(errors::ConductorFailure(format!(
-            "Language {} is not available",
-            message.language
-        )));
-    }
-
-    let closure = async move {
-        let problem = client
-            .problem_store
-            .load_revision(message.problem_id, message.revision_id)
-            .await?;
-
-        let mut submission = submission::Submission::new(
-            message.submission_id.clone(),
-            problem,
-            image::image::Image::get_language(
-                client.mounted_image.clone(),
-                message.language.clone(),
-            )?,
-            message.invocation_limits,
-        )?;
-
-        for (name, content) in message.files.into_iter() {
-            submission.add_source_file(&name, &content)?;
-        }
-
-        let submission = Arc::new(submission);
-
-        {
-            let mut submissions = client.submissions.write().await;
-            submissions
-                .try_insert(message.submission_id.clone(), submission.clone())
-                .map_err(|_| {
-                    errors::ConductorFailure(format!(
-                        "A submission with ID {} cannot be added because it is already in the queue",
-                        message.submission_id
-                    ))
-                })?;
-        }
-
-        let compilation_result = submission.compile_on_core(message.compilation_core).await;
-
-        match compilation_result {
-            Ok(log) => {
-                client
-                    .communicator
-                    .send_to_conductor(message::i2c::Message::NotifyCompilationStatus(
-                        message::i2c::NotifyCompilationStatus {
-                            submission_id: message.submission_id,
-                            success: true,
-                            log,
-                        },
-                    ))
-                    .await
-            }
-            Err(errors::UserFailure(log)) => {
-                client
-                    .communicator
-                    .send_to_conductor(message::i2c::Message::NotifyCompilationStatus(
-                        message::i2c::NotifyCompilationStatus {
-                            submission_id: message.submission_id,
-                            success: false,
-                            log,
-                        },
-                    ))
-                    .await
-            }
-            Err(e) => Err(e),
-        }
-    };
-
     tokio::spawn(async move {
-        if let Err(e) = closure.await {
-            println!("Failed AddSubmission: {:?}", e);
+        let client1 = client.clone();
+        let submission_id = message.submission_id.clone();
+
+        let compilation_result = (async move {
+            if !client1
+                .config
+                .environment
+                .cpu_cores
+                .contains(&message.compilation_core)
+            {
+                return Err(errors::ConductorFailure(format!(
+                    "Core {} is not dedicated to the invoker and cannot be scheduled for compilation of a \
+                     new submission",
+                    message.compilation_core
+                )));
+            }
+
+            if !client1.mounted_image.has_language(&message.language) {
+                return Err(errors::ConductorFailure(format!(
+                    "Language {} is not available",
+                    message.language
+                )));
+            }
+
+            let problem = client1
+                .problem_store
+                .load_revision(message.problem_id, message.revision_id)
+                .await?;
+
+            let mut submission = submission::Submission::new(
+                message.submission_id.clone(),
+                problem,
+                image::image::Image::get_language(
+                    client1.mounted_image.clone(),
+                    message.language.clone(),
+                )?,
+                message.invocation_limits,
+            )?;
+
+            for (name, content) in message.files.into_iter() {
+                submission.add_source_file(&name, &content)?;
+            }
+
+            let submission = Arc::new(submission);
+
+            {
+                let mut submissions = client1.submissions.write().await;
+                submissions
+                    .try_insert(message.submission_id.clone(), submission.clone())
+                    .map_err(|_| {
+                        errors::ConductorFailure(format!(
+                            "A submission with ID {} cannot be added because it is already in the queue",
+                            message.submission_id
+                        ))
+                    })?;
+            }
+
+            submission.compile_on_core(message.compilation_core).await
+        }).await;
+
+        if let Err(e) = client
+            .communicator
+            .send_to_conductor(message::i2c::Message::NotifyCompilationStatus(
+                message::i2c::NotifyCompilationStatus {
+                    submission_id,
+                    result: compilation_result,
+                },
+            ))
+            .await
+        {
+            println!("Failed to send to conductor: {:?}", e);
         }
     });
 

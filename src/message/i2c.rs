@@ -1,4 +1,4 @@
-use crate::problem::verdict::TestJudgementResult;
+use crate::{errors, problem::verdict::TestJudgementResult};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -25,8 +25,7 @@ pub struct UpdateMode {
 #[derive(Debug, Serialize)]
 pub struct NotifyCompilationStatus {
     pub submission_id: String,
-    pub success: bool,
-    pub log: String,
+    pub result: Result<String, errors::Error>,
 }
 
 #[derive(Debug, Serialize)]

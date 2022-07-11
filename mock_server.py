@@ -179,7 +179,7 @@ int main() {
 
                     i += 1
             elif "NotifyCompilationStatus" in message:
-                submission_id, success, log = message["NotifyCompilationStatus"]
+                submission_id, result = message["NotifyCompilationStatus"]
 
                 core = int(submission_id.split("-")[-1])
 
