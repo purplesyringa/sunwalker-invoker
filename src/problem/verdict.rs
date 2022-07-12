@@ -33,6 +33,7 @@ use std::os::unix::process::ExitStatusExt;
 pub enum TestVerdict {
     InQueue,
     Running,
+    Ignored,
 
     Accepted,
     PartialSolution(u64), // in 10000 increments
@@ -159,6 +160,7 @@ impl TestVerdict {
         match self {
             Self::InQueue => "PD".to_string(),
             Self::Running => "RU".to_string(),
+            Self::Ignored => "IG".to_string(),
 
             Self::Accepted => "AC".to_string(),
             Self::PartialSolution(points) => format!("PT {}", (*points as f64) / 10000.0),
@@ -172,6 +174,27 @@ impl TestVerdict {
             Self::PresentationError => "PE".to_string(),
             Self::IdlenessLimitExceeded => "IL".to_string(),
             Self::CheckerFailed => "FL".to_string(),
+        }
+    }
+
+    pub fn is_successful(&self) -> bool {
+        match self {
+            Self::InQueue => panic!("Unexpected verdict"),
+            Self::Running => panic!("Unexpected verdict"),
+            Self::Ignored => false,
+
+            Self::Accepted => true,
+            Self::PartialSolution(_) => true,
+
+            Self::Bug(_) => false,
+
+            Self::WrongAnswer => false,
+            Self::RuntimeError(_) => false,
+            Self::TimeLimitExceeded => false,
+            Self::MemoryLimitExceeded => false,
+            Self::PresentationError => false,
+            Self::IdlenessLimitExceeded => false,
+            Self::CheckerFailed => false,
         }
     }
 

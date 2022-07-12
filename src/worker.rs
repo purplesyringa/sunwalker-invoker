@@ -26,7 +26,6 @@ pub enum W2IMessage {
     TestResult(verdict::TestJudgementResult),
     Finalized,
     Failure(errors::Error),
-    Aborted,
 }
 
 pub struct Worker {
@@ -340,7 +339,11 @@ impl Subprocess {
                         .is_test_enabled(test)
                     {
                         main.tx_w2i
-                            .send(&W2IMessage::Aborted)
+                            .send(&W2IMessage::TestResult(verdict::TestJudgementResult {
+                                verdict: verdict::TestVerdict::Ignored,
+                                logs: HashMap::new(),
+                                invocation_stats: HashMap::new(),
+                            }))
                             .await
                             .context_invoker("Failed to send command result to invoker")?;
                         continue;
@@ -361,7 +364,15 @@ impl Subprocess {
                                 )
                                 .await
                             {
-                                Ok(result) => W2IMessage::TestResult(result),
+                                Ok(result) => {
+                                    if !result.verdict.is_successful() {
+                                        self.instantiated_dependency_dag
+                                            .write()
+                                            .await
+                                            .fail_test(test);
+                                    }
+                                    W2IMessage::TestResult(result)
+                                }
                                 Err(e) => W2IMessage::Failure(e),
                             }
                         },
@@ -371,7 +382,13 @@ impl Subprocess {
 
                     *self.current_test.lock().await = None;
 
-                    let message = result.unwrap_or(W2IMessage::Aborted);
+                    let message = result.unwrap_or_else(|_| {
+                        W2IMessage::TestResult(verdict::TestJudgementResult {
+                            verdict: verdict::TestVerdict::Ignored,
+                            logs: HashMap::new(),
+                            invocation_stats: HashMap::new(),
+                        })
+                    });
 
                     main.tx_w2i
                         .send(&message)
