@@ -40,7 +40,7 @@ impl Worker {
         language: language::Language,
         source_files: Vec<String>,
         core: u64,
-        instantiated_dependency_dag: problem::InstantiatedDependencyDAG,
+        instantiated_dependency_graph: problem::InstantiatedDependencyGraph,
         program: Option<program::Program>,
         strategy_factory: strategy::StrategyFactory,
         problem_revision_data: problem::ProblemRevisionData,
@@ -60,7 +60,7 @@ impl Worker {
                 language,
                 source_files,
                 core,
-                instantiated_dependency_dag,
+                instantiated_dependency_graph,
                 program,
                 strategy_factory,
                 problem_revision_data,
@@ -190,7 +190,7 @@ struct Subprocess {
     current_test: Mutex<Option<(u64, AbortHandle)>>,
     language: language::Language,
     source_files: Vec<String>,
-    instantiated_dependency_dag: RwLock<problem::InstantiatedDependencyDAG>,
+    instantiated_dependency_graph: RwLock<problem::InstantiatedDependencyGraph>,
     core: u64,
 }
 
@@ -216,7 +216,7 @@ pub async fn subprocess_main(
     language: language::Language,
     source_files: Vec<String>,
     core: u64,
-    instantiated_dependency_dag: problem::InstantiatedDependencyDAG,
+    instantiated_dependency_graph: problem::InstantiatedDependencyGraph,
     program: Option<program::Program>,
     strategy_factory: strategy::StrategyFactory,
     problem_revision_data: problem::ProblemRevisionData,
@@ -245,7 +245,7 @@ pub async fn subprocess_main(
             current_test: Mutex::new(None),
             language,
             source_files,
-            instantiated_dependency_dag: RwLock::new(instantiated_dependency_dag),
+            instantiated_dependency_graph: RwLock::new(instantiated_dependency_graph),
             core,
         });
 
@@ -343,7 +343,7 @@ impl Subprocess {
 
                 for test in tests {
                     if !self
-                        .instantiated_dependency_dag
+                        .instantiated_dependency_graph
                         .read()
                         .await
                         .is_test_enabled(test)
@@ -373,15 +373,7 @@ impl Subprocess {
                                 )
                                 .await
                             {
-                                Ok(result) => {
-                                    if !result.verdict.is_successful() {
-                                        self.instantiated_dependency_dag
-                                            .write()
-                                            .await
-                                            .fail_test(test);
-                                    }
-                                    W2IMessage::TestResult(result)
-                                }
+                                Ok(result) => W2IMessage::TestResult(result),
                                 Err(e) => W2IMessage::Failure(e),
                             }
                         },
@@ -390,6 +382,17 @@ impl Subprocess {
                     .await;
 
                     *self.current_test.lock().await = None;
+
+                    // As the dependency graph may have cycles, fail_test has to be called after
+                    // result is evaluated and the abortable finishes.
+                    if let Ok(W2IMessage::TestResult(ref result)) = result {
+                        if !result.verdict.is_successful() {
+                            self.instantiated_dependency_graph
+                                .write()
+                                .await
+                                .fail_test(test);
+                        }
+                    }
 
                     let message = result.unwrap_or_else(|_| {
                         W2IMessage::TestResult(verdict::TestJudgementResult {
@@ -419,13 +422,13 @@ impl Subprocess {
     async fn handle_urgent_command(&self, command: I2WUrgentCommand) -> Result<(), errors::Error> {
         match command {
             I2WUrgentCommand::AddFailedTests(tests) => {
-                let mut dag = self.instantiated_dependency_dag.write().await;
+                let mut graph = self.instantiated_dependency_graph.write().await;
                 for test in tests.into_iter() {
-                    dag.fail_test(test);
+                    graph.fail_test(test);
                 }
                 let current_test = self.current_test.lock().await;
                 if let Some((test, ref handle)) = *current_test {
-                    if !dag.is_test_enabled(test) {
+                    if !graph.is_test_enabled(test) {
                         handle.abort();
                     }
                 }

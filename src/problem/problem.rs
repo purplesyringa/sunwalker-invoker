@@ -6,19 +6,19 @@ use std::path::Path;
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct ProblemRevision {
-    pub dependency_dag: DependencyDAG,
+    pub dependency_graph: DependencyGraph,
     pub strategy_factory: strategy::StrategyFactory,
     pub data: ProblemRevisionData,
 }
 
 #[derive(Object, Clone, Deserialize, Serialize)]
-pub struct DependencyDAG {
+pub struct DependencyGraph {
     pub dependents_of: HashMap<u64, Vec<u64>>,
 }
 
 #[derive(Object, Clone)]
-pub struct InstantiatedDependencyDAG {
-    pub dag: DependencyDAG,
+pub struct InstantiatedDependencyGraph {
+    pub graph: DependencyGraph,
     pub disabled_tests: HashSet<u64>,
 }
 
@@ -43,35 +43,19 @@ impl ProblemRevision {
         config.strategy_factory.root = path.to_owned();
 
         Ok(config)
-
-        // Ok(Self {
-        //     dependency_dag: DependencyDAG {
-        //         dependents_of: HashMap::from([(1, vec![2]), (2, vec![3])]),
-        //     },
-        //     invocation_strategy_factory: Box::new(strategies::io::InputOutputStrategyFactory {
-        //         checker: program::Program::load_from_cache(
-        //             &format!("{path}/bin/checker"),
-        //             image,
-        //         )?,
-        //     }),
-        //     data: problem::ProblemRevisionData {
-        //         problem_id,
-        //         revision_id,
-        //     },
-        // })
     }
 }
 
-impl DependencyDAG {
-    pub fn instantiate(self) -> InstantiatedDependencyDAG {
-        InstantiatedDependencyDAG {
-            dag: self,
+impl DependencyGraph {
+    pub fn instantiate(self) -> InstantiatedDependencyGraph {
+        InstantiatedDependencyGraph {
+            graph: self,
             disabled_tests: HashSet::new(),
         }
     }
 }
 
-impl InstantiatedDependencyDAG {
+impl InstantiatedDependencyGraph {
     fn _fail_test(
         dependents_of: &HashMap<u64, Vec<u64>>,
         disabled_tests: &mut HashSet<u64>,
@@ -86,7 +70,7 @@ impl InstantiatedDependencyDAG {
     }
 
     pub fn fail_test(&mut self, test: u64) {
-        Self::_fail_test(&self.dag.dependents_of, &mut self.disabled_tests, test)
+        Self::_fail_test(&self.graph.dependents_of, &mut self.disabled_tests, test)
     }
 
     pub fn is_test_enabled(&self, test: u64) -> bool {

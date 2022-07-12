@@ -21,7 +21,7 @@ pub enum Command {
 
 pub struct Submission {
     pub id: String,
-    instantiated_dependency_dag: RwLock<problem::InstantiatedDependencyDAG>,
+    instantiated_dependency_graph: RwLock<problem::InstantiatedDependencyGraph>,
     language: language::Language,
     source_files: Vec<String>,
     program: RwLock<Option<program::Program>>,
@@ -44,8 +44,8 @@ impl Submission {
 
         Ok(Submission {
             id,
-            instantiated_dependency_dag: RwLock::new(
-                problem_revision.dependency_dag.clone().instantiate(),
+            instantiated_dependency_graph: RwLock::new(
+                problem_revision.dependency_graph.clone().instantiate(),
             ),
             language,
             source_files: Vec::new(),
@@ -82,7 +82,7 @@ impl Submission {
                         self.language.clone(),
                         self.source_files.clone(),
                         core.get_core(),
-                        self.instantiated_dependency_dag.read().await.clone(),
+                        self.instantiated_dependency_graph.read().await.clone(),
                         self.program.read().await.clone(),
                         self.problem_revision.strategy_factory.clone(),
                         self.problem_revision.data.clone(),
@@ -167,9 +167,10 @@ impl Submission {
 
     pub async fn add_failed_tests(&self, tests: &[u64]) -> Result<(), errors::Error> {
         {
-            let mut instantiated_dependency_dag = self.instantiated_dependency_dag.write().await;
+            let mut instantiated_dependency_graph =
+                self.instantiated_dependency_graph.write().await;
             for test in tests {
-                instantiated_dependency_dag.fail_test(*test);
+                instantiated_dependency_graph.fail_test(*test);
             }
         }
         for (_, worker) in self.workers.read().await.iter() {
