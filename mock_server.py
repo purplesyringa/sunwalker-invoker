@@ -5,7 +5,7 @@ import websockets
 
 
 PACKAGES = {
-    "problems/mock-problem/rev13"
+    "problems/mock-problem/rev16"
 }
 
 
@@ -19,7 +19,7 @@ tests/
 """.strip() + "".join(f"\nt{i} tests/{i}\na{i} tests/{i}.a" for i in range(1, 1001))
 
 FILES = {
-    "manifest/problems/mock-problem/rev13": MANIFEST.encode(),
+    "manifest/problems/mock-problem/rev16": MANIFEST.encode(),
     "judging": msgpack.packb([
         [  # dependency_dag
             {  # dependents_of
@@ -92,11 +92,6 @@ FILES = {
             },
 
             ""  # root
-        ],
-
-        [  # data
-            "mock-problem",  # problem_id
-            "rev13"  # revision_id
         ]
     ]),
 
@@ -149,7 +144,7 @@ async def echo(websocket):
                             core,  # compilation_core
                             submission_id,  # submission_id
                             "mock-problem",  # problem_id
-                            "rev13",  # revision_id
+                            "rev16",  # revision_id
                             {  # files
                                 "hello.cpp": list("""
 #include <bits/stdc++.h>

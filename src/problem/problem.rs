@@ -8,7 +8,6 @@ use std::path::Path;
 pub struct ProblemRevision {
     pub dependency_graph: DependencyGraph,
     pub strategy_factory: strategy::StrategyFactory,
-    pub data: ProblemRevisionData,
 }
 
 #[derive(Object, Clone, Deserialize, Serialize)]
@@ -20,12 +19,6 @@ pub struct DependencyGraph {
 pub struct InstantiatedDependencyGraph {
     pub graph: DependencyGraph,
     pub disabled_tests: HashSet<u64>,
-}
-
-#[derive(Object, Clone, Deserialize, Serialize)]
-pub struct ProblemRevisionData {
-    pub problem_id: String,
-    pub revision_id: String,
 }
 
 impl ProblemRevision {

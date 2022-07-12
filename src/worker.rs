@@ -43,7 +43,6 @@ impl Worker {
         instantiated_dependency_graph: problem::InstantiatedDependencyGraph,
         program: Option<program::Program>,
         strategy_factory: strategy::StrategyFactory,
-        problem_revision_data: problem::ProblemRevisionData,
         invocation_limits: HashMap<String, verdict::InvocationLimit>,
     ) -> Result<Worker, errors::Error> {
         let (tx_i2w_command, rx_i2w_command) =
@@ -63,7 +62,6 @@ impl Worker {
                 instantiated_dependency_graph,
                 program,
                 strategy_factory,
-                problem_revision_data,
                 invocation_limits,
             )
             .await
@@ -198,7 +196,6 @@ struct SubprocessMain {
     tx_w2i: Sender<W2IMessage>,
     strategy_factory: strategy::StrategyFactory,
     strategy: Option<strategy::Strategy>,
-    problem_revision_data: problem::ProblemRevisionData,
     invocation_limits: Option<HashMap<String, verdict::InvocationLimit>>,
 }
 
@@ -219,7 +216,6 @@ pub async fn subprocess_main(
     instantiated_dependency_graph: problem::InstantiatedDependencyGraph,
     program: Option<program::Program>,
     strategy_factory: strategy::StrategyFactory,
-    problem_revision_data: problem::ProblemRevisionData,
     invocation_limits: HashMap<String, verdict::InvocationLimit>,
 ) -> Result<(), errors::Error> {
     let mut tx_w2i = {
@@ -255,7 +251,6 @@ pub async fn subprocess_main(
                 tx_w2i,
                 strategy_factory,
                 strategy,
-                problem_revision_data,
                 invocation_limits,
             };
 

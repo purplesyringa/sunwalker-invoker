@@ -85,7 +85,6 @@ impl Submission {
                         self.instantiated_dependency_graph.read().await.clone(),
                         self.program.read().await.clone(),
                         self.problem_revision.strategy_factory.clone(),
-                        self.problem_revision.data.clone(),
                         self.invocation_limits.clone(),
                     )
                     .await?,
