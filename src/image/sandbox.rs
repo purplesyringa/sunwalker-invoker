@@ -833,6 +833,12 @@ async fn isolated_entry<T: Object + 'static>(
     std::env::set_current_dir("/root").context_invoker("Failed to chdir to /root")?;
     nix::unistd::chroot(".").context_invoker("Failed to chroot into /root")?;
 
+    // Clean up environment
+    let keys: Vec<_> = std::env::vars_os().map(|(key, _value)| key).collect();
+    for key in keys {
+        std::env::remove_var(key);
+    }
+
     // Expose defaults for environment variables
     std::env::set_var(
         "LD_LIBRARY_PATH",
