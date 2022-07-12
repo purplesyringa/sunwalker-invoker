@@ -20,7 +20,7 @@ pub struct LanguageImpl {
 }
 
 impl LanguageImpl {
-    pub async fn identify(&self) -> Result<String, errors::Error> {
+    pub async fn identify(&self, build_id: String) -> Result<String, errors::Error> {
         let package = self.borrow_package();
 
         // Make sandbox
@@ -32,7 +32,7 @@ impl LanguageImpl {
                 space: 4096,
                 max_inodes: 16,
             },
-            "identify".to_string(),
+            format!("identify-{build_id}"),
         )
         .await
         .context_invoker("Failed to make sandbox for identification")?;
@@ -143,7 +143,7 @@ impl LanguageImpl {
                 space: 32 * 1024 * 1024, // TODO: make this configurable
                 max_inodes: 1024,
             },
-            "build".to_string(),
+            format!("build-{build_id}"),
         )
         .await
         .context_invoker("Failed to make sandbox for build")?;
@@ -261,8 +261,8 @@ impl Language {
         })
     }
 
-    pub async fn identify(&self) -> Result<String, errors::Error> {
-        self.nested.identify().await
+    pub async fn identify(&self, build_id: String) -> Result<String, errors::Error> {
+        self.nested.identify(build_id).await
     }
 
     pub async fn build(

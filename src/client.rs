@@ -438,8 +438,12 @@ fn enter_sandbox() -> anyhow::Result<()> {
         .with_context(|| "Mounting tmpfs on /tmp/sunwalker_invoker failed")?;
 
     // Make various temporary directories
-    std::fs::create_dir("/tmp/sunwalker_invoker/worker")
-        .with_context(|| "Creating /tmp/sunwalker_invoker/worker failed")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/rootfs")
+        .with_context(|| "Creating /tmp/sunwalker_invoker/rootfs failed")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/ns")
+        .with_context(|| "Creating /tmp/sunwalker_invoker/ns failed")?;
+    std::fs::create_dir("/tmp/sunwalker_invoker/aux")
+        .with_context(|| "Creating /tmp/sunwalker_invoker/aux failed")?;
     std::fs::create_dir("/tmp/sunwalker_invoker/submissions")
         .with_context(|| "Creating /tmp/sunwalker_invoker/submissions failed")?;
     std::fs::create_dir("/tmp/sunwalker_invoker/artifacts")

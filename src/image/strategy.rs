@@ -30,6 +30,7 @@ pub struct Strategy {
     written_files_by_block: Vec<Vec<String>>,
     invocation_limits: HashMap<String, verdict::InvocationLimit>,
     core: u64,
+    build_id: String,
 }
 
 #[derive(Clone, Object, Deserialize, Serialize)]
@@ -83,6 +84,7 @@ impl StrategyFactory {
         user_program: &'a program::Program,
         invocation_limits: HashMap<String, verdict::InvocationLimit>,
         core: u64,
+        build_id: String,
     ) -> Result<Strategy, errors::Error> {
         // Sanity checks
         let mut seen_block_names = HashSet::new();
@@ -446,7 +448,11 @@ impl StrategyFactory {
                     user_program.package.image.clone(),
                 )?;
             }
-            invocable_programs.push(program.into_invocable(format!("block-{i}")).await?);
+            invocable_programs.push(
+                program
+                    .into_invocable(format!("{build_id}-block-{i}"))
+                    .await?,
+            );
         }
 
         // Create cgroups
@@ -498,6 +504,7 @@ impl StrategyFactory {
             written_files_by_block,
             invocation_limits,
             core,
+            build_id,
         })
     }
 }
@@ -505,10 +512,9 @@ impl StrategyFactory {
 impl Strategy {
     pub async fn invoke(
         &mut self,
-        build_id: String,
         test_path: PathBuf,
     ) -> Result<verdict::TestJudgementResult, errors::Error> {
-        let aux = format!("/tmp/sunwalker_invoker/worker/aux/{build_id}");
+        let aux = format!("/tmp/sunwalker_invoker/aux/{}", self.build_id);
 
         std::fs::create_dir(&aux).with_context_invoker(|| {
             format!("Failed to create directory {aux} to start running a strategy")

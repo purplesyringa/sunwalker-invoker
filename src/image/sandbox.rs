@@ -58,25 +58,6 @@ fn unmount_recursively(prefix: &str, inclusive: bool) -> Result<(), errors::Erro
 }
 
 pub fn enter_worker_space(core: u64) -> Result<(), errors::Error> {
-    // Unshare namespaces
-    unsafe {
-        if libc::unshare(CLONE_NEWNS) != 0 {
-            return Err(std::io::Error::last_os_error()
-                .context_invoker("Failed to unshare mount namespace"));
-        }
-    }
-
-    // Create per-worker tmpfs
-    system::mount("none", "/tmp/sunwalker_invoker/worker", "tmpfs", 0, None)
-        .context_invoker("Failed to mount tmpfs on /tmp/sunwalker_invoker/worker")?;
-
-    std::fs::create_dir("/tmp/sunwalker_invoker/worker/rootfs")
-        .context_invoker("Failed to create /tmp/sunwalker_invoker/worker/rootfs")?;
-    std::fs::create_dir("/tmp/sunwalker_invoker/worker/ns")
-        .context_invoker("Failed to create /tmp/sunwalker_invoker/worker/ns")?;
-    std::fs::create_dir("/tmp/sunwalker_invoker/worker/aux")
-        .context_invoker("Failed to create /tmp/sunwalker_invoker/worker/aux")?;
-
     // Switch to core
     let pid = unsafe { libc::getpid() };
     cgroups::move_process_to_cgroup(pid, format!("cpu_{core}/invoker")).with_context_invoker(
@@ -118,7 +99,7 @@ pub async fn make_rootfs(
     // /space and /dev are in the *second* lowerdir, so that the tmpfs doesn't have to handle all
     // the accesses to the permanent files just to return ENOENT.
 
-    let prefix = format!("/tmp/sunwalker_invoker/worker/rootfs/{id}");
+    let prefix = format!("/tmp/sunwalker_invoker/rootfs/{id}");
 
     std::fs::create_dir(&prefix).context_invoker("Failed to create directory <prefix>")?;
 
@@ -341,7 +322,7 @@ impl RootFS {
 
         self.removed = true;
 
-        let prefix = format!("/tmp/sunwalker_invoker/worker/rootfs/{}", self.id);
+        let prefix = format!("/tmp/sunwalker_invoker/rootfs/{}", self.id);
         unmount_recursively(&prefix, false)?;
         std::fs::remove_dir_all(&prefix)
             .with_context_invoker(|| format!("Failed to remove {prefix} recursively"))?;
@@ -350,10 +331,7 @@ impl RootFS {
     }
 
     pub fn overlay(&self) -> String {
-        format!(
-            "/tmp/sunwalker_invoker/worker/rootfs/{}/overlay/root",
-            self.id
-        )
+        format!("/tmp/sunwalker_invoker/rootfs/{}/overlay/root", self.id)
     }
 
     pub fn read(&self, path: &str) -> Result<Vec<u8>, errors::Error> {
@@ -517,13 +495,13 @@ async fn isolated_entry<T: Object + 'static>(
     f: Box<dyn multiprocessing::FnOnce<(), Output = Result<T, errors::Error>> + Send + Sync>,
     rootfs_id: String,
 ) -> Result<T, errors::Error> {
-    let overlay = format!("/tmp/sunwalker_invoker/worker/rootfs/{rootfs_id}/overlay");
+    let overlay = format!("/tmp/sunwalker_invoker/rootfs/{rootfs_id}/overlay");
 
     // Join prepared namespaces. They are old in the sense that they may contain stray information
     // from previous runs. It's necessary to clean it up to prevent communication between runs. The
     // user namespace is joined later.
     for name in ["ipc", "uts", "net"] {
-        let path = format!("/tmp/sunwalker_invoker/worker/rootfs/{rootfs_id}/ns/{name}");
+        let path = format!("/tmp/sunwalker_invoker/rootfs/{rootfs_id}/ns/{name}");
         let file =
             std::fs::File::open(&path).with_context_invoker(|| format!("Failed to open {path}"))?;
         nix::sched::setns(file.as_raw_fd(), nix::sched::CloneFlags::empty())
