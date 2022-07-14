@@ -54,8 +54,7 @@ enum Tactic {
 #[derive(Clone, Copy, Debug, Object, Deserialize, Serialize)]
 enum FileType {
     Regular,
-    Fifo, // like Pipe, but with a path on filesystem
-    Pipe, // like Fifo, but purely a fd
+    Pipe,
 }
 
 #[derive(Clone, Object, Deserialize, Serialize)]
@@ -121,7 +120,7 @@ impl StrategyFactory {
                     },
                     Pattern::VariableText(ref text) => {
                         // Binding from the sandbox into the sandbox is not supported
-                        if !text.contains('$') {
+                        if !text.contains('\0') {
                             return Err(errors::ConfigurationFailure(
                                 "A name cannot be bound to a file inside the sandbox, but only to \
                                  %* or $test*"
@@ -131,7 +130,8 @@ impl StrategyFactory {
                         // External files cannot be written to
                         if binding.writable {
                             return Err(errors::ConfigurationFailure(format!(
-                                "External file {text} is written to; this is not allowed"
+                                "External file {} is written to; this is not allowed",
+                                format_vars(text)
                             )));
                         }
                     }
@@ -176,11 +176,12 @@ impl StrategyFactory {
                         }
                     }
                     Some(Pattern::VariableText(ref text)) => {
-                        if text.contains('$') {
+                        if text.contains('\0') {
                             if *writable {
                                 return Err(errors::ConfigurationFailure(format!(
-                                    "{name} is redirected to an external file {text}; this is not \
-                                     allowed"
+                                    "{name} is redirected to an external file {}; this is not \
+                                     allowed",
+                                    format_vars(text)
                                 )));
                             }
                         } else {
@@ -399,7 +400,7 @@ impl StrategyFactory {
                         }
                     }
                 }
-                FileType::Fifo | FileType::Pipe => {
+                FileType::Pipe => {
                     if readers.is_empty() {
                         return Err(errors::ConfigurationFailure(format!(
                             "Pipe %{name} is never read from; this is not allowed, because pipes \
@@ -540,7 +541,7 @@ impl<'a> StrategyRun<'a> {
                 FileType::Regular => {
                     // Handled later
                 }
-                FileType::Fifo => {
+                FileType::Pipe => {
                     let path = format!("{}/{name}", self.aux);
                     nix::unistd::mkfifo::<str>(
                         &path,
@@ -558,17 +559,6 @@ impl<'a> StrategyRun<'a> {
                         Some(ids::EXTERNAL_USER_GID),
                     )
                     .with_context_invoker(|| format!("Failed to chown {path}"))?;
-                }
-                FileType::Pipe => {
-                    let (rx, tx) = nix::unistd::pipe()
-                        .context_invoker("Failed to create a pipe to start running a strategy")?;
-                    nix::sys::stat::fchmod(rx, nix::sys::stat::Mode::from_bits_truncate(0444))
-                        .context_invoker("Failed to make a pipe world-readable")?;
-                    nix::sys::stat::fchmod(tx, nix::sys::stat::Mode::from_bits_truncate(0222))
-                        .context_invoker("Failed to make a pipe world-writable")?;
-                    pipes.insert(name.to_string(), unsafe {
-                        (OwnedFd::from_raw_fd(rx), OwnedFd::from_raw_fd(tx))
-                    });
                 }
             }
         }
@@ -633,7 +623,7 @@ impl<'a> StrategyRun<'a> {
                 let mut patched_argv = program.program.argv.clone();
                 for (i, arg) in block.argv.iter().enumerate() {
                     if let Pattern::VariableText(ref text) = arg {
-                        if !text.contains('$') {
+                        if !text.contains('\0') {
                             patched_argv.push(text.clone());
                             continue;
                         }
@@ -852,10 +842,11 @@ impl<'a> StrategyRun<'a> {
                 }
             }
             Pattern::VariableText(ref text) => {
-                if text.contains('$') {
-                    if !text.starts_with("$test") || text.matches('$').count() > 1 {
+                if text.contains('\0') {
+                    if !text.starts_with("\0test\0") || text.matches('\0').count() > 2 {
                         return Err(errors::ConfigurationFailure(format!(
-                            "Path {text} is invalid: it must start with $test"
+                            "Path {} is invalid: it must start with $test",
+                            format_vars(text)
                         )));
                     }
                     let mut path = self.test_path.as_os_str().to_owned();
@@ -877,6 +868,30 @@ impl Drop for StrategyRun<'_> {
             }
         }
     }
+}
+
+fn format_vars(mut s: &str) -> String {
+    let mut result = String::new();
+
+    while let Some(pos) = s.find('\0') {
+        result += &s[..pos];
+        s = &s[pos + 1..];
+        match s.find('\0') {
+            Some(pos) => {
+                result += "$";
+                result += &s[..pos];
+                s = &s[pos + 1..];
+            }
+            None => {
+                result += "<MALFORMED STRING>";
+                break;
+            }
+        }
+    }
+
+    result += s;
+
+    result
 }
 
 #[derive(Clone, Copy)]
